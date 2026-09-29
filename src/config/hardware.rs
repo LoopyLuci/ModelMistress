@@ -69,9 +69,17 @@ impl Microarchitecture {
             Self::Zen5
         } else if lower.contains("zen 4") || lower.contains("zen4") {
             Self::Zen4
-        } else if lower.contains("zen 3") || lower.contains("zen3") || lower.contains("vermeer") || lower.contains("cezanne") {
+        } else if lower.contains("zen 3")
+            || lower.contains("zen3")
+            || lower.contains("vermeer")
+            || lower.contains("cezanne")
+        {
             Self::Zen3
-        } else if lower.contains("zen 2") || lower.contains("zen2") || lower.contains("matisse") || lower.contains("rome") {
+        } else if lower.contains("zen 2")
+            || lower.contains("zen2")
+            || lower.contains("matisse")
+            || lower.contains("rome")
+        {
             Self::Zen2
         } else if lower.contains("zen") {
             Self::Zen
@@ -204,17 +212,25 @@ impl SimdFeatures {
 
     /// Returns the highest AVX level available (0, 2, or 512)
     pub fn max_avx_level(&self) -> u16 {
-        if self.avx512f { 512 } else if self.avx2 { 2 } else if self.avx { 1 } else { 0 }
+        if self.avx512f {
+            512
+        } else if self.avx2 {
+            2
+        } else if self.avx {
+            1
+        } else {
+            0
+        }
     }
 
     /// Recommended SIMD width in 256-bit lanes
     pub fn recommended_simd_width(&self) -> usize {
         if self.avx512f {
-            2  // 512-bit = 2x256-bit logical lanes
+            2 // 512-bit = 2x256-bit logical lanes
         } else if self.avx2 {
-            1  // 256-bit
+            1 // 256-bit
         } else {
-            0  // fallback to scalar/SSE
+            0 // fallback to scalar/SSE
         }
     }
 }
@@ -263,8 +279,8 @@ impl MemoryBudget {
         // GPU: reserve 1GB overhead, rest split between weights and active memory
         let gpu_overhead = 1 * 1024 * 1024 * 1024;
         let gpu_usable = total_gpu_vram.saturating_sub(gpu_overhead);
-        let gpu_vram_weights = (gpu_usable as f64 * 0.75) as u64;  // 75% for model weights
-        let gpu_vram_active = (gpu_usable as f64 * 0.25) as u64;   // 25% for KV cache/activations
+        let gpu_vram_weights = (gpu_usable as f64 * 0.75) as u64; // 75% for model weights
+        let gpu_vram_active = (gpu_usable as f64 * 0.25) as u64; // 25% for KV cache/activations
 
         Self {
             total_system_ram,
@@ -322,7 +338,7 @@ impl ThreadPoolConfig {
 
         // Zen 3 optimal: leave 2 threads for OS, use the rest
         let compute_threads = physical_cores.saturating_sub(2).max(1);
-        let tokio_workers = cpus.min(16);  // Tokio: cap at 16 for diminishing returns
+        let tokio_workers = cpus.min(16); // Tokio: cap at 16 for diminishing returns
         let io_threads = (cpus / 4).max(2);
         let prefill_threads = physical_cores.saturating_sub(1).max(1);
 
@@ -346,12 +362,12 @@ impl ThreadPoolConfig {
         // For latency-sensitive: pin to one CCX (6 cores)
         // For throughput: spread across all 12 cores
         Self {
-            tokio_workers: 12,           // Match physical cores
+            tokio_workers: 12,                                 // Match physical cores
             compute_threads: physical_cores.saturating_sub(1), // 11 (reserve 1 for I/O)
             io_threads: 4,
             prefill_threads: physical_cores, // 12
-            batch_size: 32,              // Zen 3 sweet spot
-            numa_nodes: 1,              // Single socket
+            batch_size: 32,                  // Zen 3 sweet spot
+            numa_nodes: 1,                   // Single socket
             core_affinity: None,
             thread_pinning: false,
         }
@@ -432,15 +448,9 @@ impl PerformanceConfig {
         );
 
         let threads = match (hw.cpu.microarchitecture, profile) {
-            (Microarchitecture::Zen3, PerformanceProfile::LowLatency) => {
-                Self::zen3_low_latency(&hw.cpu)
-            }
-            (Microarchitecture::Zen3, PerformanceProfile::Throughput) => {
-                Self::zen3_throughput(&hw.cpu)
-            }
-            (Microarchitecture::Zen3, PerformanceProfile::Balanced) => {
-                Self::zen3_balanced(&hw.cpu)
-            }
+            (Microarchitecture::Zen3, PerformanceProfile::LowLatency) => Self::zen3_low_latency(&hw.cpu),
+            (Microarchitecture::Zen3, PerformanceProfile::Throughput) => Self::zen3_throughput(&hw.cpu),
+            (Microarchitecture::Zen3, PerformanceProfile::Balanced) => Self::zen3_balanced(&hw.cpu),
             _ => ThreadPoolConfig::auto_detect(),
         };
 
@@ -503,9 +513,9 @@ impl PerformanceConfig {
         // Pin to one CCX (first 6 cores) for L3 cache locality
         ThreadPoolConfig {
             tokio_workers: 4,
-            compute_threads: 5,  // 5 compute + 1 async
+            compute_threads: 5, // 5 compute + 1 async
             io_threads: 2,
-            prefill_threads: 6,  // One full CCX
+            prefill_threads: 6, // One full CCX
             batch_size: 8,
             numa_nodes: cpu.numa_nodes,
             core_affinity: Some((0..6).collect()),
@@ -530,10 +540,10 @@ impl PerformanceConfig {
     fn zen3_balanced(cpu: &CpuInfoDetected) -> ThreadPoolConfig {
         // Spread across both CCXes but respect cache boundaries
         ThreadPoolConfig {
-            tokio_workers: cpu.physical_cores / 2,  // 6
-            compute_threads: cpu.physical_cores.saturating_sub(2),  // 10
+            tokio_workers: cpu.physical_cores / 2,                 // 6
+            compute_threads: cpu.physical_cores.saturating_sub(2), // 10
             io_threads: 3,
-            prefill_threads: cpu.physical_cores.saturating_sub(1),  // 11
+            prefill_threads: cpu.physical_cores.saturating_sub(1), // 11
             batch_size: 32,
             numa_nodes: cpu.numa_nodes,
             core_affinity: None,
@@ -663,9 +673,7 @@ impl HardwareInfo {
 
 /// Detect number of logical CPUs
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Parse /proc/cpuinfo for model name, core count, and cache info
@@ -712,7 +720,11 @@ fn detect_microarchitecture(model: &str) -> Microarchitecture {
         Microarchitecture::Zen5
     } else if lower.contains("zen 4") || lower.contains("zen4") || lower.contains("family 0x19") {
         Microarchitecture::Zen4
-    } else if lower.contains("zen 3") || lower.contains("zen3") || lower.contains("vermeer") || lower.contains("cezanne") {
+    } else if lower.contains("zen 3")
+        || lower.contains("zen3")
+        || lower.contains("vermeer")
+        || lower.contains("cezanne")
+    {
         Microarchitecture::Zen3
     } else if lower.contains("zen 2") || lower.contains("zen2") || lower.contains("matisse") || lower.contains("rome") {
         Microarchitecture::Zen2
@@ -788,11 +800,7 @@ fn detect_system_ram() -> u64 {
         .and_then(|content| {
             content.lines().find_map(|line| {
                 if line.starts_with("MemTotal:") {
-                    let kb: u64 = line
-                        .split_whitespace()
-                        .nth(1)?
-                        .parse()
-                        .ok()?;
+                    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
                     Some(kb * 1024) // Convert KB to bytes
                 } else {
                     None
@@ -1007,17 +1015,30 @@ impl HardwareConfigBuilder {
 impl std::fmt::Display for HardwareInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Hardware Configuration ===")?;
-        writeln!(f, "CPU: {} ({} cores, {} threads)", self.cpu.model_name, self.cpu.physical_cores, self.cpu.logical_threads)?;
+        writeln!(
+            f,
+            "CPU: {} ({} cores, {} threads)",
+            self.cpu.model_name, self.cpu.physical_cores, self.cpu.logical_threads
+        )?;
         writeln!(f, "Architecture: {}", self.cpu.microarchitecture)?;
         if let Some(ref gpu) = self.gpu {
-            writeln!(f, "GPU: {} ({} GB VRAM)", gpu.device_name, gpu.vram_total_bytes / (1024 * 1024 * 1024))?;
+            writeln!(
+                f,
+                "GPU: {} ({} GB VRAM)",
+                gpu.device_name,
+                gpu.vram_total_bytes / (1024 * 1024 * 1024)
+            )?;
             if let Some(ref ver) = gpu.rocm_version {
                 writeln!(f, "ROCm: {}", ver)?;
             }
         } else {
             writeln!(f, "GPU: Not detected")?;
         }
-        writeln!(f, "SIMD: AVX2={} AVX-512={} FMA={}", self.simd.avx2, self.simd.avx512f, self.simd.fma)?;
+        writeln!(
+            f,
+            "SIMD: AVX2={} AVX-512={} FMA={}",
+            self.simd.avx2, self.simd.avx512f, self.simd.fma
+        )?;
         Ok(())
     }
 }

@@ -1,0 +1,37 @@
+{
+ "passed": true,
+ "at": "20260929-185908",
+ "seconds": 4.3,
+ "stages": [
+  {
+   "stage": "preflight",
+   "ok": null,
+   "seconds": 0.0,
+   "message": ""
+  },
+  {
+   "stage": "static",
+   "ok": null,
+   "seconds": 0.0,
+   "message": ""
+  },
+  {
+   "stage": "tests",
+   "ok": null,
+   "seconds": 0.0,
+   "message": ""
+  },
+  {
+   "stage": "build",
+   "ok": null,
+   "seconds": 0.0,
+   "message": ""
+  },
+  {
+   "stage": "smoke",
+   "ok": true,
+   "seconds": 4.3,
+   "message": ""
+  }
+ ]
+}

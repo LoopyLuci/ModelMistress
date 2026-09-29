@@ -20,7 +20,10 @@ impl Default for McpClient {
 impl McpClient {
     pub fn new() -> Self {
         Self {
-            agent_id: format!("model-mistress-{}", uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>()),
+            agent_id: format!(
+                "model-mistress-{}",
+                uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>()
+            ),
             connected_agents: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -32,7 +35,12 @@ impl McpClient {
     }
 
     /// Call a tool on a connected agent
-    pub async fn call_agent_tool(&self, agent_id: &str, tool_name: &str, params: serde_json::Value) -> Result<serde_json::Value, McpClientError> {
+    pub async fn call_agent_tool(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, McpClientError> {
         // In a real implementation, this would make HTTP/WS request to the agent
         // For now, return a stub response
         Ok(serde_json::json!({
@@ -52,7 +60,12 @@ impl McpClient {
 
     /// Get all connected agent IDs
     pub async fn list_connected_agents(&self) -> Vec<String> {
-        self.connected_agents.read().await.iter().map(|a| a.id.clone()).collect()
+        self.connected_agents
+            .read()
+            .await
+            .iter()
+            .map(|a| a.id.clone())
+            .collect()
     }
 }
 

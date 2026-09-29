@@ -1,11 +1,11 @@
 //! MCP (Model Context Protocol) integration for ModelMistress
-//! 
+//!
 //! Enables bidirectional agent communication and control between
 //! ModelMistress and Hermes Agent, as well as other agents.
 
-pub mod server;
 pub mod client;
+pub mod server;
 
-pub use server::{McpServer, McpTool, McpToolResponse, McpError, init_default_tools};
 pub use client::{McpClient, McpClientHandle};
-pub use server::{ModelMistressState, ModelInfo, AgentInfo, InferenceInfo, MemoryUsage};
+pub use server::{init_default_tools, McpError, McpServer, McpTool, McpToolResponse};
+pub use server::{AgentInfo, InferenceInfo, MemoryUsage, ModelInfo, ModelMistressState};

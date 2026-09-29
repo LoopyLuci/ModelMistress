@@ -69,10 +69,14 @@ impl LoadedModel {
     pub fn generate(&self, request: &InferenceRequest) -> Result<String, anyhow::Error> {
         let prompt = &request.prompt;
         let max_tokens = request.config.max_tokens;
-        
-        let response = format!("Generated {} tokens from model '{}' for prompt: '{}' (stub)", 
-            max_tokens, self.name, prompt.chars().take(50).collect::<String>());
-        
+
+        let response = format!(
+            "Generated {} tokens from model '{}' for prompt: '{}' (stub)",
+            max_tokens,
+            self.name,
+            prompt.chars().take(50).collect::<String>()
+        );
+
         Ok(response)
     }
 }
@@ -172,7 +176,7 @@ impl CpuEngine {
         context_length: Option<u32>,
     ) -> Result<LoadedModel, anyhow::Error> {
         let ctx_len = context_length.unwrap_or(512) as usize;
-        
+
         let model = LoadedModel {
             name: model_name.to_string(),
             path: path.to_path_buf(),
@@ -185,7 +189,7 @@ impl CpuEngine {
         };
 
         self.memory_usage.model_size_mb = 0.0;
-        
+
         Ok(model)
     }
 

@@ -85,7 +85,7 @@ impl ProtocolVersion {
             patch: 0,
         }
     }
-    
+
     pub fn is_compatible(&self, other: &ProtocolVersion) -> bool {
         self.major == other.major && self.minor >= other.minor
     }

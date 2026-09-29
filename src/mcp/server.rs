@@ -128,20 +128,29 @@ impl McpServer {
 
 pub fn init_default_tools() -> HashMap<String, McpTool> {
     let mut tools = HashMap::new();
-    tools.insert("list_models".into(), McpTool {
-        name: "list_models".into(),
-        description: "List available models".into(),
-        parameters: serde_json::json!({}),
-    });
-    tools.insert("chat".into(), McpTool {
-        name: "chat".into(),
-        description: "Run a chat completion".into(),
-        parameters: serde_json::json!({"model": "string", "messages": "array"}),
-    });
-    tools.insert("health".into(), McpTool {
-        name: "health".into(),
-        description: "Health check".into(),
-        parameters: serde_json::json!({}),
-    });
+    tools.insert(
+        "list_models".into(),
+        McpTool {
+            name: "list_models".into(),
+            description: "List available models".into(),
+            parameters: serde_json::json!({}),
+        },
+    );
+    tools.insert(
+        "chat".into(),
+        McpTool {
+            name: "chat".into(),
+            description: "Run a chat completion".into(),
+            parameters: serde_json::json!({"model": "string", "messages": "array"}),
+        },
+    );
+    tools.insert(
+        "health".into(),
+        McpTool {
+            name: "health".into(),
+            description: "Health check".into(),
+            parameters: serde_json::json!({}),
+        },
+    );
     tools
 }

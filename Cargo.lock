@@ -113,7 +113,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -2830,12 +2830,14 @@ dependencies = [
  "blake3",
  "byteorder",
  "chrono",
+ "clap",
  "futures",
  "half",
  "http 1.4.2",
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
+ "libc",
  "libloading",
  "memmap2",
  "nix 0.29.0",
@@ -2865,6 +2867,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6879,6 +6882,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
