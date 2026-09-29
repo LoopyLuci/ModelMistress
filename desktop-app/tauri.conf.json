@@ -1,0 +1,26 @@
+{
+  "tauri": {
+    "windows": [
+      {
+        "title": "Model Mistress",
+        "width": 1200,
+        "height": 800
+      }
+    ],
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.model.mistress",
+      "icon": [
+        "icons/32x32.png"
+      ]
+    },
+    "allowlist": {
+      "all": true
+    }
+  },
+  "package": {
+    "productName": "Model Mistress",
+    "version": "0.1.0"
+  }
+}

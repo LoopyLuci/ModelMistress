@@ -1,0 +1,28 @@
+# Model Mistress - PodMonitor for Model Mistress
+# Enables automatic scraping of Model Mistress pods
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: model-mistress
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: monitoring
+    release: model-mistress
+spec:
+  selector:
+    matchLabels:
+      model-mistress/scrape: "true"
+  namespaceSelector:
+    matchNames:
+      - model-mistress
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: component
+        - sourceLabels: [__meta_kubernetes_pod_label_model_mistress_workload_type]
+          targetLabel: workload_type

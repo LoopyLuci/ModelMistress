@@ -1,0 +1,77 @@
+# Model Mistress - Single-node AMD GPU Overlay
+# Optimized for single AMD RX 7900 XTX node (your workstation)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: model-mistress
+
+resources:
+  - ../base
+  - ../gpu-node-discovery
+
+patches:
+  # Reduce replicas for single-node
+  - target:
+      kind: Deployment
+      name: model-mistress-cpu
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "4"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "12"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "8Gi"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "32Gi"
+  - target:
+      kind: Deployment
+      name: model-mistress-gpu
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "16Gi"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "48Gi"
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: model-mistress-gpu-hpa
+    patch: |
+      - op: replace
+        path: /spec/maxReplicas
+        value: 1
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: model-mistress-cpu-hpa
+    patch: |
+      - op: replace
+        path: /spec/maxReplicas
+        value: 2
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+  - target:
+      kind: PersistentVolumeClaim
+      name: model-mistress-models-pvc
+    patch: |
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 50Gi
+
+images:
+  - name: model-mistress
+    newName: model-mistress
+    newTag: rocm-latest

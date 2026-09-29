@@ -1,0 +1,6 @@
+PNG_SIGNATURE=b'\x89PNG\r\n\x1a\n'
+IHDR_DATA=b'\x00\x00\x00\x20\x00\x00\x00\x20\x08\x02\x00\x00\x00'
+IDAT_DATA=b'CompressedWhitePixelData'
+IEND_DATA=b''
+
+file.write(PNG_SIGNATURE + IHDR_DATA + IDAT_DATA + IEND_DATA)

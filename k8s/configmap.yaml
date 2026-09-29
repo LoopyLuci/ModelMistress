@@ -1,0 +1,84 @@
+# Model Mistress - ConfigMap
+# Hardware-specific and runtime settings injected as environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-mistress-config
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: config
+data:
+  # Server configuration
+  MODEL_MISTRESS_CONFIG: "/etc/model-mistress/config.toml"
+  RUST_LOG: "model_mistress=info,tower_http=debug"
+  RUST_BACKTRACE: "1"
+
+  # Worker thread configuration (CPU workers)
+  WORKER_THREADS: "8"
+  MAX_CONNECTIONS: "10000"
+  REQUEST_TIMEOUT_MS: "30000"
+
+  # Model serving
+  DEFAULT_MODEL: "llama-3-8b"
+  FALLBACK_MODEL: "llama-3-8b"
+
+  # Observability
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "9090"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+
+  # AMD ROCm GPU configuration
+  ROCM_PATH: "/opt/rocm"
+  HIP_VISIBLE_DEVICES: "0"
+  HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+  PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+
+  # Networking
+  LISTEN_ADDR: "0.0.0.0:8000"
+
+  # Plugin configuration
+  ENABLE_AUTH: "false"
+  ENABLE_RATE_LIMITER: "true"
+  RATE_LIMIT_RPM: "1000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-mistress-config-gpu
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: config
+    model-mistress/workload-type: gpu
+data:
+  # GPU-specific overrides
+  WORKER_THREADS: "4"
+  HIP_VISIBLE_DEVICES: "0"
+  HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+  PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+  MAX_VRAM_USAGE_GB: "22"
+  GPU_MEMORY_FRACTION: "0.92"
+  BATCH_SIZE: "32"
+  MODEL_QUANTIZATION: "q4_k_m"
+  CONTEXT_LENGTH: "8192"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-mistress-config-cpu
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: config
+    model-mistress/workload-type: cpu
+data:
+  # CPU-specific overrides
+  WORKER_THREADS: "12"
+  MAX_CONNECTIONS: "5000"
+  REQUEST_TIMEOUT_MS: "60000"
+  BATCH_SIZE: "8"
+  MODEL_QUANTIZATION: "q8_0"
+  CONTEXT_LENGTH: "4096"

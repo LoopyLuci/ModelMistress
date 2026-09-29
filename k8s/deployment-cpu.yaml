@@ -1,0 +1,149 @@
+# Model Mistress - CPU Worker Deployment
+# CPU-only inference workers for models that fit in system RAM or for fallback
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-mistress-cpu
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: cpu-worker
+    model-mistress/workload-type: cpu
+  annotations:
+    model-mistress/description: "CPU-only inference workers"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-mistress
+      app.kubernetes.io/component: cpu-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-mistress
+        app.kubernetes.io/component: cpu-worker
+        model-mistress/workload-type: cpu
+      annotations:
+        model-mistress/scrape: "true"
+        model-mistress/port: "9090"
+        model-mistress/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      # CPU affinity — avoid GPU nodes for CPU workloads
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: model-mistress/node-type
+                    operator: NotIn
+                    values:
+                      - gpu
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/component
+                      operator: In
+                      values:
+                        - cpu-worker
+                topologyKey: kubernetes.io/hostname
+      # Spread across nodes
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: cpu-worker
+      containers:
+        - name: model-mistress
+          image: model-mistress:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: model-mistress-config
+            - configMapRef:
+                name: model-mistress-config-cpu
+          env:
+            - name: NODE_TYPE
+              value: "cpu"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CPU_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+            - name: MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/model-mistress
+              readOnly: true
+            - name: cache-volume
+              mountPath: /cache
+            - name: models-volume
+              mountPath: /models
+      volumes:
+        - name: config-volume
+          configMap:
+            name: model-mistress-config
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: models-volume
+          persistentVolumeClaim:
+            claimName: model-mistress-models-pvc
+      restartPolicy: Always

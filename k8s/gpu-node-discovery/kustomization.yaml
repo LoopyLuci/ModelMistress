@@ -1,0 +1,13 @@
+# Model Mistress - GPU Node Discovery Overlay
+# Applies the GPU discovery DaemonSet on top of the base
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: model-mistress
+
+resources:
+  - ../base
+  - daemonset.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: model-mistress

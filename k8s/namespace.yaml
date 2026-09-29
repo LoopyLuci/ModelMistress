@@ -1,0 +1,10 @@
+# Model Mistress - Namespace
+# Dedicated namespace for all Model Mistress resources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/part-of: model-mistress
+    app.kubernetes.io/managed-by: kustomize

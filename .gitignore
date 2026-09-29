@@ -1,0 +1,9 @@
+ProjectData.md
+target/
+node_modules/
+dist/
+*.pdb
+*.log
+.env
+.env.*
+!.env.example
