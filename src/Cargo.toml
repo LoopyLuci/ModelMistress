@@ -1,0 +1,67 @@
+[package]
+name = "model-mistress"
+version = "0.1.0"
+edition = "2021"
+authors = ["Model Mistress Team"]
+license = "Apache-2.0"
+description = "Next-generation enterprise-grade model serving platform"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+axum = { version = "0.7", features = ["json", "macros"] }
+http = "1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "timeout"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+utoipa = { version = "4", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "4", features = ["axum"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tracing-appender = "0.2"
+libloading = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+prometheus = "0.13"
+thiserror = "1"
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+byteorder = "1"
+memmap2 = "0.9"
+sysinfo = "0.30"
+num_cpus = "1.16"
+half = "2.4"
+rayon = "1.10"
+parking_lot = "0.12"
+nix = { version = "0.29", features = ["signal"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+async-stream = "0.3"
+num_enum = "0.7"
+opentelemetry = { version = "0.22", optional = true }
+opentelemetry-otlp = { version = "0.13", optional = true, features = ["reqwest-client"] }
+tracing-opentelemetry = { version = "0.21", optional = true }
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "model-mistress"
+path = "bin/model-mistress/main.rs"
+
+[features]
+default = ["cpu-backend"]
+cpu-backend = []
+gpu-backend = []
+cuda = []
+metal = []
+rocm = ["gpu-backend"]
+otel = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]

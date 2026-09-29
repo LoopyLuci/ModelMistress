@@ -1,0 +1,32 @@
+# Model Mistress - PodDisruptionBudget
+# Prevent voluntary disruptions during node maintenance
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: model-mistress-cpu-pdb
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: cpu-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-mistress
+      app.kubernetes.io/component: cpu-worker
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: model-mistress-gpu-pdb
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-mistress
+      app.kubernetes.io/component: gpu-worker

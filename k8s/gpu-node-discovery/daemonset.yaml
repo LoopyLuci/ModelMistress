@@ -1,0 +1,148 @@
+# Model Mistress - GPU Node Discovery DaemonSet
+# Runs on every GPU node to discover AMD GPUs, label nodes, and export metrics.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: model-mistress-gpu-discovery
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-discovery
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-mistress
+      app.kubernetes.io/component: gpu-discovery
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-mistress
+        app.kubernetes.io/component: gpu-discovery
+      annotations:
+        model-mistress/scrape: "true"
+        model-mistress/port: "9091"
+        model-mistress/path: "/metrics"
+    spec:
+      serviceAccountName: model-mistress-gpu-discovery
+      terminationGracePeriodSeconds: 30
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: amd.com/gpu
+                    operator: Exists
+      tolerations:
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: amd.com/rocm
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        # Sidecar: lightweight metrics exporter
+        - name: metrics-exporter
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                GPU_COUNT=0
+                for card in /sys/class/drm/card[0-9]*; do
+                  if [ -f "$card/device/vendor" ]; then
+                    VENDOR=$(cat "$card/device/vendor" 2>/dev/null)
+                    if [ "$VENDOR" = "0x1002" ]; then
+                      GPU_COUNT=$((GPU_COUNT + 1))
+                    fi
+                  fi
+                done
+                cat > /tmp/metrics <<EOF
+              # HELP amd_gpu_count Number of AMD GPUs detected on this node
+              # TYPE amd_gpu_count gauge
+              amd_gpu_count{node="$NODE_NAME"} $GPU_COUNT
+              # HELP amd_gpu_available Whether AMD GPUs are available
+              # TYPE amd_gpu_available gauge
+              amd_gpu_available{node="$NODE_NAME"} 1
+              EOF
+                sleep 15
+              done &
+              # Simple HTTP server for metrics
+              while true; do
+                echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n$(cat /tmp/metrics 2>/dev/null)" | busybox nc -l -p 9091
+              done
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: sysfs
+              mountPath: /sys/class/drm
+              readOnly: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+      volumes:
+        - name: sysfs
+          hostPath:
+            path: /sys/class/drm
+            type: Directory
+---
+# ServiceAccount for GPU discovery
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-mistress-gpu-discovery
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-discovery
+---
+# ClusterRole for node labeling
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: model-mistress-gpu-discovery
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["patch", "update"]
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: model-mistress-gpu-discovery
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: model-mistress-gpu-discovery
+subjects:
+  - kind: ServiceAccount
+    name: model-mistress-gpu-discovery
+    namespace: model-mistress

@@ -1,0 +1,30 @@
+# Model Mistress - Kustomize Base
+# Common resources applied to all overlays
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: model-mistress
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - deployment-cpu.yaml
+  - deployment-gpu.yaml
+  - services.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - pvc.yaml
+  - networkpolicy.yaml
+  - monitoring.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: model-mistress
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: model-mistress
+    newName: model-mistress
+    newTag: latest
+  - name: model-mistress:rocm-latest
+    newName: model-mistress
+    newTag: rocm-latest

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Model Mistress</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  <div id="app">
+    <h1>Model Mistress</h1>
+    <p>Welcome to the enterprise-grade model serving platform!</p>
+  </div>
+  <script>
+    const { createApp, ref, reactive } = Vue;
+    
+    createApp({
+      setup() {
+        const message = ref('Hello from Model Mistress!');
+        return { message };
+      },
+      template: `
+        <div>
+          <h1>{{ message }}</h1>
+        </div>
+      `
+    }).mount('#app');
+  </script>
+</body>
+</html>

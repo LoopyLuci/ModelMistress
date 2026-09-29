@@ -1,0 +1,125 @@
+# Model Mistress - HorizontalPodAutoscaler
+# Scales GPU and CPU workers based on GPU utilization and request metrics
+---
+# GPU Worker HPA — scales based on GPU utilization via custom metrics
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: model-mistress-gpu-hpa
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: gpu-worker
+  annotations:
+    model-mistress/description: "Scales GPU workers based on GPU utilization and request load"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-mistress-gpu
+  minReplicas: 1
+  maxReplicas: 4
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120  # Conservative: don't scale GPU pods too fast
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 min cooldown before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+      selectPolicy: Min
+  metrics:
+    # Scale on GPU utilization (custom metric from GPU discovery DaemonSet)
+    - type: Pods
+      pods:
+        metric:
+          name: amd_gpu_utilization_percent
+        target:
+          type: AverageValue
+          averageValue: "75"  # Scale up when avg GPU util > 75%
+    # Scale on request rate (requests per second)
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "50"  # Scale up when avg RPS > 50 per pod
+    # Scale on memory pressure (VRAM usage)
+    - type: Pods
+      pods:
+        metric:
+          name: amd_gpu_memory_used_bytes
+        target:
+          type: AverageValue
+          averageValue: "20000000000"  # 20GB VRAM threshold
+    # Fallback: CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+# CPU Worker HPA — scales based on CPU metrics and request load
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: model-mistress-cpu-hpa
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: cpu-worker
+  annotations:
+    model-mistress/description: "Scales CPU workers based on CPU and memory utilization"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-mistress-cpu
+  minReplicas: 2
+  maxReplicas: 8
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min
+  metrics:
+    # CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+    # Request rate
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"

@@ -1,0 +1,49 @@
+# Model Mistress - Persistent Storage for Models
+# Shared PVC for model weights (read-write-many for multi-pod access)
+---
+# StorageClass for local SSD / fast storage
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: model-mistress-fast
+  labels:
+    app.kubernetes.io/name: model-mistress
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+# PVC for model weights — adjust size based on models to serve
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-mistress-models-pvc
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: storage
+  annotations:
+    model-mistress/description: "Shared storage for model weights and artifacts"
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: model-mistress-fast
+  resources:
+    requests:
+      storage: 100Gi
+---
+# PVC for KV cache (high-speed temporary storage)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-mistress-cache-pvc
+  namespace: model-mistress
+  labels:
+    app.kubernetes.io/name: model-mistress
+    app.kubernetes.io/component: cache
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: model-mistress-fast
+  resources:
+    requests:
+      storage: 50Gi
