@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use crate::models::ModelInfo;
 
@@ -213,28 +213,25 @@ impl Router {
         match condition {
             RouteCondition::ModelEquals(model) => ctx.model == *model,
             RouteCondition::ModelPrefix(prefix) => ctx.model.starts_with(prefix),
-            RouteCondition::TagEquals(key, value) => {
-                ctx.tags.get(key).map(|v| v == value).unwrap_or(false)
-            }
+            RouteCondition::TagEquals(key, value) => ctx.tags.get(key).map(|v| v == value).unwrap_or(false),
             RouteCondition::Always => true,
         }
     }
 
     async fn apply_action(&self, action: &RouteAction, ctx: &RoutingContext) -> Result<BackendEndpoint, RoutingError> {
         match action {
-            RouteAction::ForwardTo(backend_id) => {
-                self.registry
-                    .get_healthy_backends(&ctx.model)
-                    .await
-                    .into_iter()
-                    .find(|b| b.id == *backend_id)
-                    .ok_or(RoutingError::NoHealthyBackend)
-            }
+            RouteAction::ForwardTo(backend_id) => self
+                .registry
+                .get_healthy_backends(&ctx.model)
+                .await
+                .into_iter()
+                .find(|b| b.id == *backend_id)
+                .ok_or(RoutingError::NoHealthyBackend),
             RouteAction::WeightedSplit(splits) => {
                 let total_weight: u32 = splits.iter().map(|(_, w)| w).sum();
                 let mut rng = rand::rngs::OsRng;
                 let roll: u32 = rand::Rng::gen_range(&mut rng, 0..total_weight);
-                
+
                 let target_backend_id = {
                     let mut acc = 0u32;
                     let mut found = None;
@@ -247,7 +244,7 @@ impl Router {
                     }
                     found.ok_or(RoutingError::NoHealthyBackend)?
                 };
-                
+
                 self.registry
                     .get_healthy_backends(&ctx.model)
                     .await
@@ -258,7 +255,7 @@ impl Router {
             RouteAction::Canary(backend_id, percentage) => {
                 let mut rng = rand::rngs::OsRng;
                 let roll: f64 = rand::Rng::gen(&mut rng);
-                
+
                 if roll < *percentage {
                     self.registry
                         .get_healthy_backends(&ctx.model)
@@ -274,15 +271,13 @@ impl Router {
                 warn!("Cloud burst requested but not implemented in this build");
                 self.default_route(ctx).await
             }
-            RouteAction::Reject(reason) => {
-                Err(RoutingError::Rejected(reason.clone()))
-            }
+            RouteAction::Reject(reason) => Err(RoutingError::Rejected(reason.clone())),
         }
     }
 
     async fn default_route(&self, ctx: &RoutingContext) -> Result<BackendEndpoint, RoutingError> {
         let backends = self.registry.get_healthy_backends(&ctx.model).await;
-        
+
         if backends.is_empty() {
             return Err(RoutingError::NoHealthyBackend);
         }
@@ -298,7 +293,7 @@ impl Router {
                 let total_weight: u32 = backends.iter().map(|b| b.weight).sum();
                 let mut rng = rand::rngs::OsRng;
                 let roll: u32 = rand::Rng::gen_range(&mut rng, 0..total_weight);
-                
+
                 let mut acc = 0u32;
                 for backend in &backends {
                     acc += backend.weight;
@@ -306,18 +301,12 @@ impl Router {
                         return Ok(backend.clone());
                     }
                 }
-                
+
                 Ok(backends[0].clone())
             }
-            LoadBalancingStrategy::LeastConnections => {
-                Ok(backends[0].clone())
-            }
-            LoadBalancingStrategy::LatencyBased => {
-                Ok(backends[0].clone())
-            }
-            LoadBalancingStrategy::CostOptimized => {
-                Ok(backends[0].clone())
-            }
+            LoadBalancingStrategy::LeastConnections => Ok(backends[0].clone()),
+            LoadBalancingStrategy::LatencyBased => Ok(backends[0].clone()),
+            LoadBalancingStrategy::CostOptimized => Ok(backends[0].clone()),
         }
     }
 
@@ -338,16 +327,16 @@ impl Router {
 pub enum RoutingError {
     #[error("No healthy backend available for model")]
     NoHealthyBackend,
-    
+
     #[error("Request rejected: {0}")]
     Rejected(String),
-    
+
     #[error("Backend not found: {0}")]
     BackendNotFound(String),
-    
+
     #[error("Timeout connecting to backend")]
     Timeout,
-    
+
     #[error("Internal routing error: {0}")]
     Internal(String),
 }

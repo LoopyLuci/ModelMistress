@@ -11,23 +11,23 @@ use tracing::{info, warn};
 pub trait Plugin: Send + Sync + 'static {
     /// Unique identifier for this plugin
     fn id(&self) -> &str;
-    
+
     /// Human-readable name
     fn name(&self) -> &str;
-    
+
     /// Version of this plugin
     fn version(&self) -> &str;
-    
+
     /// Capabilities this plugin provides
     fn capabilities(&self) -> Vec<Capability>;
-    
+
     /// Initialize the plugin with configuration
     fn init(&mut self, config: &PluginConfig) -> Result<(), PluginError>;
-    
+
     /// Handle a request if this plugin can
     /// Returns Some(response) if handled, None to pass to next handler
     fn handle_request(&self, request: &PluginRequest) -> Option<PluginResponse>;
-    
+
     /// Cleanup when plugin is unloaded
     fn shutdown(&mut self) -> Result<(), PluginError>;
 }
@@ -72,13 +72,13 @@ pub enum Capability {
 pub enum PluginError {
     #[error("Plugin initialization failed: {0}")]
     InitFailed(String),
-    
+
     #[error("Plugin execution error: {0}")]
     ExecutionError(String),
-    
+
     #[error("Plugin not found: {0}")]
     NotFound(String),
-    
+
     #[error("Plugin version mismatch: {0}")]
     VersionMismatch(String),
 }
@@ -111,11 +111,11 @@ impl PluginRegistry {
         let mut plugins = self.plugins.write().await;
         let initial_len = plugins.len();
         plugins.retain(|p| p.id() != plugin_id);
-        
+
         if plugins.len() == initial_len {
             return Err(PluginError::NotFound(plugin_id.to_string()));
         }
-        
+
         info!(plugin_id = %plugin_id, "Unregistered plugin");
         Ok(())
     }
@@ -182,7 +182,7 @@ impl Plugin for ApiKeyAuthPlugin {
                 return None; // Allow request to continue
             }
         }
-        
+
         Some(PluginResponse {
             status: 401,
             body: serde_json::json!({
@@ -240,10 +240,12 @@ impl Plugin for RateLimiterPlugin {
     }
 
     fn handle_request(&self, request: &PluginRequest) -> Option<PluginResponse> {
-        let _client_id = request.metadata.get("x-client-id")
+        let _client_id = request
+            .metadata
+            .get("x-client-id")
             .unwrap_or(&"anonymous".to_string())
             .clone();
-        
+
         // In production, this would use a sliding window
         None
     }

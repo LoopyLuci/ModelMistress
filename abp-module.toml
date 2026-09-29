@@ -1,0 +1,39 @@
+# How AgenticBotPlatform (ABP) installs, builds, runs and drives ModelMistress as a module.
+# ModelMistress stays its own program: ABP only reads this file, runs the commands below, and talks to the hub.
+# The format is described in ABP's docs/modules/README.md.
+
+[module]
+id = "modelmistress"
+name = "ModelMistress"
+repo = "https://github.com/LoopyLuci/ModelMistress.git"
+branch = "main"
+api = 1
+area = "models"
+description = "Loads and serves local models (GGUF through llama.cpp, plus Ollama pass-through) behind one OpenAI-compatible API."
+
+[checkout]
+marker = ["Cargo.toml", "src/Cargo.toml", "src/hub.rs"]
+
+[toolchain]
+require = [{ tool = "cargo", min = "1.85", url = "https://rustup.rs" }]
+
+[build]
+steps = [["cargo", "build", "--release", "-p", "model-mistress"]]
+outputs = ["{target}/release/model-mistress{exe}"]
+
+[hub]
+start = ["{target}/release/model-mistress{exe}", "--home", "{data}", "serve"]
+control_file = "{data}/control.json"
+start_timeout_s = 60
+
+[mcp]
+stdio = ["{target}/release/model-mistress{exe}", "--home", "{data}", "mcp"]
+
+[ui]
+panel = "operations"
+
+[host]
+os = ["windows", "linux", "macos"]
+
+[pipeline]
+run = ["python", "ci/pipeline.py"]

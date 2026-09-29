@@ -37,11 +37,11 @@ impl ThreadPool {
     pub fn new(thread_count: usize) -> Self {
         Self { thread_count }
     }
-    
+
     pub fn thread_count(&self) -> usize {
         self.thread_count
     }
-    
+
     pub fn execute<F, T>(&self, f: F) -> T
     where
         F: FnOnce() -> T + Send + 'static,
@@ -73,15 +73,15 @@ impl WorkStealingScheduler {
             active_tasks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
-    
+
     pub fn num_workers(&self) -> usize {
         self.num_workers
     }
-    
+
     pub fn active_task_count(&self) -> usize {
         self.active_tasks.load(std::sync::atomic::Ordering::Relaxed)
     }
-    
+
     pub fn submit<F, T>(&self, task: F) -> std::sync::mpsc::Receiver<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -89,12 +89,12 @@ impl WorkStealingScheduler {
     {
         let (tx, rx) = std::sync::mpsc::channel();
         self.active_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+
         std::thread::spawn(move || {
             let result = task();
             let _ = tx.send(result);
         });
-        
+
         rx
     }
 }
@@ -115,38 +115,39 @@ impl MemoryPool {
             used_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
-    
+
     pub fn total_budget(&self) -> usize {
         self.total_budget
     }
-    
+
     pub fn used_bytes(&self) -> usize {
         self.used_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
-    
+
     pub fn available_bytes(&self) -> usize {
         self.total_budget - self.used_bytes()
     }
-    
+
     pub fn usage_percent(&self) -> f64 {
         (self.used_bytes() as f64 / self.total_budget as f64) * 100.0
     }
-    
+
     pub fn allocate(&self, size: usize) -> Option<MemoryBlock> {
         let current = self.used_bytes.load(std::sync::atomic::Ordering::Relaxed);
         let new_used = current + size;
-        
+
         if new_used > self.total_budget {
             return None;
         }
-        
+
         self.used_bytes.store(new_used, std::sync::atomic::Ordering::Relaxed);
-        
+
         Some(MemoryBlock { size, offset: current })
     }
-    
+
     pub fn free(&self, block: &MemoryBlock) {
-        self.used_bytes.fetch_sub(block.size, std::sync::atomic::Ordering::Relaxed);
+        self.used_bytes
+            .fetch_sub(block.size, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -181,14 +182,14 @@ impl SimdMatrixOps {
             }
         }
     }
-    
+
     /// Vector addition
     pub fn vec_add(a: &[f32], b: &[f32], c: &mut [f32]) {
         for i in 0..a.len() {
             c[i] = a[i] + b[i];
         }
     }
-    
+
     /// Dot product
     pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()

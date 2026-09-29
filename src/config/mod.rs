@@ -1,13 +1,12 @@
 pub mod hardware;
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::info;
 
 pub use hardware::{
-    CpuInfo, CpuInfoDetected, GpuInfo, GpuInfoDetected, HardwareConfigBuilder,
-    HardwareInfo, Microarchitecture, MemoryBudget, PerformanceConfig,
-    PerformanceProfile, SimdFeatures, ThreadPoolConfig,
+    CpuInfo, CpuInfoDetected, GpuInfo, GpuInfoDetected, HardwareConfigBuilder, HardwareInfo, MemoryBudget,
+    Microarchitecture, PerformanceConfig, PerformanceProfile, SimdFeatures, ThreadPoolConfig,
 };
 
 // ============================================================================
@@ -151,7 +150,7 @@ impl Default for ModelMistressConfig {
 pub enum ConfigError {
     #[error("Failed to read config file: {0}")]
     ReadError(String),
-    
+
     #[error("Failed to parse config: {0}")]
     ParseError(String),
 }
@@ -160,8 +159,7 @@ impl ModelMistressConfig {
     /// Resolve the effective hardware/performance configuration.
     /// Uses the config's hardware section + auto-detection.
     pub fn resolve_performance(&self) -> PerformanceConfig {
-        let mut builder = HardwareConfigBuilder::new()
-            .with_profile(self.hardware.profile);
+        let mut builder = HardwareConfigBuilder::new().with_profile(self.hardware.profile);
 
         if self.hardware.cpu_only {
             builder = builder.cpu_only();
@@ -175,14 +173,12 @@ impl ModelMistressConfig {
 
     pub fn load() -> Result<Self, ConfigError> {
         // Try to load from file, fall back to defaults
-        let config_path = std::env::var("MODEL_MISTRESS_CONFIG")
-            .unwrap_or_else(|_| "model-mistress.toml".to_string());
-        
+        let config_path = std::env::var("MODEL_MISTRESS_CONFIG").unwrap_or_else(|_| "model-mistress.toml".to_string());
+
         if std::path::Path::new(&config_path).exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| ConfigError::ReadError(e.to_string()))?;
-            let config: ModelMistressConfig = toml::from_str(&content)
-                .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+            let content = std::fs::read_to_string(&config_path).map_err(|e| ConfigError::ReadError(e.to_string()))?;
+            let config: ModelMistressConfig =
+                toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
             info!(path = %config_path, "Loaded configuration");
             Ok(config)
         } else {

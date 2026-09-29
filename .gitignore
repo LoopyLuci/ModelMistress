@@ -7,3 +7,5 @@ dist/
 .env
 .env.*
 !.env.example
+ci/logs/
+ci/.pipeline.lock
