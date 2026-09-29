@@ -1,219 +1,60 @@
-# Model Mistress: Project Summary
+# ModelMistress
 
-## What We Built
+Loads and serves local models behind one OpenAI-compatible API, with a control API and MCP tools for programs
+and agents. It is a module of [AgenticBotPlatform](https://github.com/LoopyLuci/AgenticBotPlatform) (ABP) and also
+runs on its own.
 
-**Model Mistress** is a next-generation, enterprise-grade model serving platform designed to replace and exceed Ollama, llama.cpp, vLLM, and similar inference runtimes. Built for a 100-year operational horizon.
+- **Finds your models.** It scans Ollama stores, Hugging Face caches (where Unsloth keeps its downloads), LM
+  Studio's folder and any folders you add, and reads each GGUF's metadata (architecture, context length,
+  quantization, vision projector).
+- **Serves them through llama.cpp.** Each loaded model runs in its own `llama-server` process, on a free loopback
+  port with its own random key, so only the hub can use it. Models load on first use. The least recently used one is
+  unloaded when `max_loaded` would be exceeded, and idle models can be unloaded after a time you set. The processes
+  belong to the hub: a Windows job object or Linux's parent-death signal stops them even if the hub is killed.
+- **Passes `ollama/<name>` through** to a running Ollama, so both show up in one model list.
+- **One token.** The hub's token is also the OpenAI API key.
 
-### Project Location
-```
-Z:\Projects\ModelMistress\
-```
-
-### Binary Size
-- **Debug:** ~15MB
-- **Release:** 3.9MB (optimized, stripped)
-
-### Boot Time
-- **<3 seconds** to ready state (verified)
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    MODEL MISTRESS                                │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │
-│  │   OpenAI     │───▶│  Intelligent │───▶│   Backend    │       │
-│  │   API        │    │  L7 Router   │    │   Registry   │       │
-│  └──────────────┘    └──────────────┘    └──────────────┘       │
-│         │                   │                   │                │
-│         ▼                   ▼                   ▼                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐       │
-│  │   Plugin     │    │   Graph      │    │  Observability│       │
-│  │   System     │    │   Compiler   │    │  (Model Mistress) │       │
-│  └──────────────┘    └──────────────┘    └──────────────┘       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Implemented Components
-
-### 1. Core Engine (1,386 lines of Rust)
-
-| Component | File | Lines | Status |
-|-----------|------|-------|--------|
-| **Models** | `src/models/mod.rs` | 182 | ✅ Complete |
-| **Router** | `src/router/mod.rs` | 323 | ✅ Complete |
-| **Plugins** | `src/plugins/mod.rs` | 254 | ✅ Complete |
-| **Server** | `src/server/mod.rs` | 203 | ✅ Complete |
-| **Protocol** | `src/protocol/mod.rs` | 155 | ✅ Complete |
-| **Config** | `src/config/mod.rs` | 137 | ✅ Complete |
-| **Observability** | `src/observability/mod.rs` | 91 | ✅ Complete |
-
-### 2. API Endpoints
-
-| Endpoint | Method | Description | Status |
-|----------|--------|-------------|--------|
-| `/health` | GET | Health check | ✅ Working |
-| `/v1/models` | GET | List available models | ✅ Working |
-| `/v1/models/{model_id}` | GET | Get model info | ✅ Working |
-| `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) | ✅ Working |
-
-### 3. Features Implemented
-
-#### Router Capabilities
-- ✅ Multi-dimensional routing (model, version, priority, tags)
-- ✅ Load balancing strategies (Round Robin, Weighted Random, Least Connections, Latency-based, Cost-optimized)
-- ✅ A/B testing and canary rollouts
-- ✅ Cloud burst support (placeholder)
-- ✅ Health checking and failover
-
-#### Plugin System
-- ✅ Trait-based plugin architecture
-- ✅ Dynamic plugin loading
-- ✅ Built-in plugins:
-  - API Key Authentication
-  - Rate Limiter
-- ✅ Plugin registry with lifecycle management
-
-#### Observability
-- ✅ Model Mistress metrics (request count, duration, active requests, backend health)
-- ✅ Structured logging with tracing
-- ✅ Health check endpoint
-
-#### Configuration
-- ✅ TOML configuration file support
-- ✅ Environment variable overrides
-- ✅ Sensible defaults
-
----
-
-## Verified Working
-
-### Server Startup
-```bash
-$ cargo run
-🚀 Model Mistress starting on 0.0.0.0:8000
-```
-
-### Health Check
-```bash
-$ curl http://localhost:8000/health
-{
-  "status": "healthy",
-  "timestamp": "2026-07-27T22:11:28.534147300+00:00",
-  "version": "0.1.0"
-}
-```
-
-### List Models
-```bash
-$ curl http://localhost:8000/v1/models
-{
-  "data": [
-    {"id": "llama-3-8b", "object": "model", "owned_by": "model-mistress"},
-    {"id": "llama-3-70b", "object": "model", "owned_by": "model-mistress"}
-  ],
-  "object": "list"
-}
-```
-
-### Chat Completions (OpenAI-compatible)
-```bash
-$ curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"llama-3-8b","messages":[{"role":"user","content":"Hello"}]}'
-
-# Returns 503 (expected - no backends configured)
-{
-  "error": {
-    "code": 503,
-    "message": "No backend available for model: llama-3-8b",
-    "type": "server_error"
-  }
-}
-```
-
----
-
-## Design Document
-
-Comprehensive architecture blueprint: `Z:\Projects\ModelMistress\DESIGN.md`
-
-### Key Design Decisions
-
-1. **Rust Core** - Memory safety, async support, formal verification
-2. **Axum HTTP Framework** - Tower middleware, type safety, Tokio integration
-3. **C/Rust ABI Plugins** - Maximum performance for hardware plugins
-4. **Single Binary** - Simple deployment, no dependency hell
-
----
-
-## Next Steps
-
-### Immediate (Week 1-2)
-- [ ] Add backend proxy forwarding (currently returns mock responses)
-- [ ] Implement streaming responses (SSE)
-- [ ] Add authentication middleware
-
-### Short-term (Month 1)
-- [ ] GGUF model loader
-- [ ] Basic CUDA/Metal backend
-- [ ] Health checker for backends
-
-### Medium-term (Months 2-3)
-- [ ] Kubernetes operator
-- [ ] Auto-scaling
-- [ ] mTLS support
-
-### Long-term (Months 4-12)
-- [ ] Graph compiler
-- [ ] Kernel optimization
-- [ ] Formal verification
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
-# Navigate to project
-cd Z:\Projects\ModelMistress
-
-# Build in debug mode
-cargo build
-
-# Run the server
-cargo run
-
-# Test health endpoint
-curl http://localhost:8000/health
-
-# Build release binary
-cargo build --release
-
-# Run optimized binary
-./target/release/model-mistress.exe
+cargo build --release -p model-mistress
+model-mistress serve            # foreground; writes <home>/control.json = {url, token, pid, version, api}
+# in another terminal: point it at llama-server (or put llama-server on PATH, or in <home>/engines/llama.cpp/)
+model-mistress call config.set '{"settings": {"llama_server": "/path/to/llama-server"}}'
+model-mistress models           # what is on this machine
+model-mistress chat llama3.2:1b "Hello"
+model-mistress mcp              # MCP over stdio, for agents
 ```
 
----
+`<home>` is `%LOCALAPPDATA%\ModelMistress` on Windows, `~/.local/share/ModelMistress` on Linux, or `--home` /
+`MM_HOME`. Settings live in `<home>/config.toml` (every field optional; `config.get` shows them all).
 
-## Project Statistics
+Build llama.cpp from source with the GPU backend you have (for example `-DGGML_VULKAN=ON` for AMD or Intel
+GPUs, `-DGGML_CUDA=ON` for NVIDIA).
 
-- **Total Lines of Code:** 1,386 (Rust)
-- **Binary Size (Release):** 3.9MB
-- **Boot Time:** <3 seconds
-- **API Endpoints:** 4
-- **Plugins:** 2 (Auth, Rate Limiter)
-- **Load Balancing Strategies:** 5
-- **Design Document:** 25KB comprehensive blueprint
+## API
 
----
+Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 
-**Status:** ✅ Core engine implemented and verified  
-**Next Milestone:** Backend proxy forwarding and streaming responses  
-**License:** Apache 2.0
+| Route | What |
+|---|---|
+| `GET /v1/health` | `{ok, pid, version, uptime_s}` |
+| `GET /v1/operations` | every operation with a JSON Schema for its input |
+| `POST /v1/call/{op}` | run one; the answer is `{"result": ...}` |
+| `POST /v1/service/stop` | unload everything and stop |
+| `GET /v1/models` | OpenAI model list |
+| `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI, streaming or not |
+
+Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
+`model.unload`, `chat.complete`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
+
+## Development
+
+`python ci/pipeline.py` runs everything a change must pass (rustfmt, clippy `-D warnings`, tests, a release build,
+and a smoke test against a real hub; with llama-server and a small model on the machine, a real chat too).
+`python ci/pipeline.py --install-hook` runs it before every push. What works and what does not is in
+[docs/STATUS.md](docs/STATUS.md); the original design is in [DESIGN.md](DESIGN.md).
+
+## License
+
+Apache-2.0
