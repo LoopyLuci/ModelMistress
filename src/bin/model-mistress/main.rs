@@ -54,6 +54,18 @@ enum Cmd {
     Load { model: String },
     /// Unload a model ("*" for all).
     Unload { model: String },
+    /// Download a model: `pull hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M` (Hugging Face) or `pull qwen3:8b` (the Ollama
+    /// library).
+    Pull {
+        model: String,
+        /// huggingface or ollama, when the name is ambiguous.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Search Hugging Face for GGUF models.
+    Search { query: String },
+    /// Delete a model ModelMistress downloaded.
+    Rm { model: String },
     /// One question, one answer.
     Chat { model: String, prompt: String },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
@@ -108,6 +120,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 .unwrap_or_else(new_token);
             let hub = Hub {
                 engine: engine.clone(),
+                jobs: Arc::new(Default::default()),
                 token: Arc::new(token),
                 started: Instant::now(),
                 stop: Arc::new(tokio::sync::Notify::new()),
@@ -167,6 +180,48 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 v["tokens_per_s"].as_f64().unwrap_or(0.0)
             );
         }
+        Cmd::Pull { model, source } => {
+            let c = client().await?;
+            let mut a = json!({"model": model});
+            if let Some(s) = source {
+                a["source"] = json!(s);
+            }
+            let job = c.call("model.pull", a).await?;
+            let id = job["job"].as_str().unwrap_or("").to_string();
+            loop {
+                let j = c.call("job.get", json!({"job": id})).await?;
+                let status = j["status"].as_str().unwrap_or("");
+                eprint!(
+                    "\r{} {:>5.1}%  {:.2}/{:.2} GB  {:.1} MB/s  {}          ",
+                    j["model"].as_str().unwrap_or(""),
+                    j["percent"].as_f64().unwrap_or(0.0),
+                    j["done_bytes"].as_f64().unwrap_or(0.0) / 1e9,
+                    j["total_bytes"].as_f64().unwrap_or(0.0) / 1e9,
+                    j["mb_per_s"].as_f64().unwrap_or(0.0),
+                    j["message"].as_str().unwrap_or("")
+                );
+                if status != "running" {
+                    eprintln!();
+                    if status != "done" {
+                        anyhow::bail!("{status}: {}", j["message"].as_str().unwrap_or(""));
+                    }
+                    println!("{}", j["result"]["model"].as_str().unwrap_or(""));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        Cmd::Search { query } => {
+            let v = client().await?.call("model.search", json!({"query": query})).await?;
+            for m in v.as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{:<60} {:>10} downloads",
+                    m["pull"].as_str().unwrap_or(""),
+                    m["downloads"]
+                );
+            }
+        }
+        Cmd::Rm { model } => show(&client().await?.call("model.delete", json!({"model": model})).await?),
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())

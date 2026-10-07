@@ -9,16 +9,19 @@ repo = "https://github.com/LoopyLuci/ModelMistress.git"
 branch = "main"
 api = 1
 area = "models"
-description = "Loads and serves local models (GGUF through llama.cpp, plus Ollama pass-through) behind one OpenAI-compatible API."
+description = "Loads and serves local models (GGUF through its built-in llama.cpp) and downloads them from Hugging Face and the Ollama library, behind one OpenAI-compatible API."
 
 [checkout]
 marker = ["Cargo.toml", "src/Cargo.toml", "src/hub.rs"]
 
 [toolchain]
-require = [{ tool = "cargo", min = "1.85", url = "https://rustup.rs" }]
+require = [{ tool = "cargo", min = "1.85", url = "https://rustup.rs" },
+           { tool = "cmake", min = "3.21", url = "https://cmake.org/download/" }]
 
 [build]
-steps = [["cargo", "build", "--release", "-p", "model-mistress"]]
+# llama.cpp is built into the binary (a pinned submodule; build.rs explains what the build needs)
+steps = [["git", "submodule", "update", "--init", "engines/llama.cpp"],
+         ["cargo", "build", "--release", "-p", "model-mistress", "--features", "bundled-engine"]]
 outputs = ["{target}/release/model-mistress{exe}"]
 
 [hub]

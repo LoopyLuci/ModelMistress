@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Model Mistress Team"]
 license = "Apache-2.0"
-description = "Next-generation enterprise-grade model serving platform"
+description = "Loads and serves local models behind one OpenAI-compatible API"
+build = "build.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -33,6 +34,7 @@ prometheus = "0.13"
 thiserror = "1"
 anyhow = "1"
 blake3 = "1"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 byteorder = "1"
@@ -51,6 +53,9 @@ opentelemetry = { version = "0.22", optional = true }
 opentelemetry-otlp = { version = "0.13", optional = true, features = ["reqwest-client"] }
 tracing-opentelemetry = { version = "0.21", optional = true }
 
+[build-dependencies]
+cc = "1"    # finds MSVC for the bundled llama.cpp build (build.rs)
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
@@ -66,6 +71,8 @@ path = "bin/model-mistress/main.rs"
 
 [features]
 default = ["cpu-backend"]
+# Build llama.cpp (engines/llama.cpp) and embed llama-server and llama-bench in the binary (see build.rs).
+bundled-engine = []
 cpu-backend = []
 gpu-backend = []
 cuda = []

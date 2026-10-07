@@ -37,6 +37,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct Hub {
     pub engine: Arc<Engine>,
+    pub jobs: Arc<crate::pull::Jobs>,
     pub token: Arc<String>,
     pub started: Instant,
     pub stop: Arc<tokio::sync::Notify>,
@@ -170,6 +171,69 @@ pub fn operations() -> Vec<Value> {
             &["model"],
         ),
         op(
+            "model.pull",
+            "Download a model: hf.co/<org>/<repo>[:<quant>] from Hugging Face, or <name>[:<tag>] from the Ollama \
+             library. Runs as a job (job.get shows progress) unless wait is true",
+            true,
+            false,
+            json!({
+                "model": {"type": "string", "description": "hf.co/org/repo[:Q4_K_M], org/repo[:quant], or name[:tag]"},
+                "source": {"type": "string", "enum": ["huggingface", "ollama"], "description": "when the name is ambiguous"},
+                "file": {"type": "string", "description": "Hugging Face: this exact .gguf file instead of a quant"},
+                "projector": {"type": "boolean", "description": "Hugging Face: also the vision projector (default true)"},
+                "wait": {"type": "boolean", "description": "answer only when the download has finished"}
+            }),
+            &["model"],
+        ),
+        op(
+            "model.search",
+            "Search Hugging Face for GGUF models, most downloaded first",
+            false,
+            false,
+            json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}),
+            &["query"],
+        ),
+        op(
+            "model.files",
+            "A Hugging Face repo's GGUF files, with sizes, quants and the name to pull each by",
+            false,
+            false,
+            json!({"model": {"type": "string", "description": "hf.co/org/repo or org/repo"}}),
+            &["model"],
+        ),
+        op(
+            "model.delete",
+            "Delete a model ModelMistress downloaded (models other programs own are refused)",
+            true,
+            true,
+            json!({"model": model}),
+            &["model"],
+        ),
+        op(
+            "job.list",
+            "Downloads: running and finished",
+            false,
+            false,
+            json!({}),
+            &[],
+        ),
+        op(
+            "job.get",
+            "One download's progress",
+            false,
+            false,
+            json!({"job": {"type": "string"}}),
+            &["job"],
+        ),
+        op(
+            "job.cancel",
+            "Stop a download (what is downloaded so far is kept, and a new pull resumes it)",
+            true,
+            false,
+            json!({"job": {"type": "string"}}),
+            &["job"],
+        ),
+        op(
             "chat.complete",
             "Chat with a model and wait for the whole answer",
             false,
@@ -256,6 +320,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let loaded: Vec<Value> = e.loaded().iter().map(|i| i.describe()).collect();
             json!({"version": VERSION, "pid": std::process::id(), "uptime_s": hub.started.elapsed().as_secs(),
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
+                   "llama_built_in": crate::engine::bundled::version(),
                    "models_known": e.catalog().len(), "loaded": loaded})
         }
         "backend.list" => {
@@ -270,7 +335,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                     .is_ok();
             json!([
                 {"id": "llama.cpp", "available": e.llama_server().is_some(), "path": e.llama_server(),
-                 "version": e.llama_version().await, "models": e.catalog().len(), "loaded": e.loaded().len()},
+                 "version": e.llama_version().await, "built_in": crate::engine::bundled::version(),
+                 "models": e.catalog().len(), "loaded": e.loaded().len()},
                 {"id": "ollama", "available": running, "url": st.ollama_url, "models": ollama.len(),
                  "note": "models served as ollama/<name>, passed through to Ollama"}
             ])
@@ -378,7 +444,44 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .ok_or_else(|| Fail::new(409, "not_loaded", format!("{} is not loaded", m.id)))?;
             json!({"model": m.id, "log": inst.log, "text": crate::engine::tail(&inst.log, n)})
         }
-        "config.get" => json!(e.settings()),
+        "model.pull" => {
+            let spec = s(a, "model")?;
+            let plan = match crate::pull::source_of(spec, a["source"].as_str())? {
+                "ollama" => crate::pull::plan_ollama(e, spec).await?,
+                _ => {
+                    crate::pull::plan_hf(e, spec, a["file"].as_str(), a["projector"].as_bool().unwrap_or(true)).await?
+                }
+            };
+            let job = hub.jobs.start(e.clone(), plan);
+            if a["wait"].as_bool().unwrap_or(false) {
+                while job.status() == "running" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            job.describe()
+        }
+        "model.search" => crate::pull::search_hf(e, s(a, "query")?, a["limit"].as_u64().unwrap_or(20) as u32).await?,
+        "model.files" => crate::pull::files_hf(e, s(a, "model")?).await?,
+        "model.delete" => {
+            let id = llama_entry(hub, s(a, "model")?)?.id;
+            let engine = e.clone();
+            tokio::task::spawn_blocking(move || crate::pull::delete(&engine, &id))
+                .await
+                .map_err(|x| Fail::new(500, "io", x.to_string()))??
+        }
+        "job.list" => json!(hub.jobs.list()),
+        "job.get" => {
+            let id = s(a, "job")?;
+            hub.jobs
+                .get(id)
+                .ok_or_else(|| Fail::not_found(format!("no job {id}")))?
+                .describe()
+        }
+        "job.cancel" => {
+            let id = s(a, "job")?;
+            json!({"job": id, "cancelled": hub.jobs.cancel(id)})
+        }
+        "config.get" => shown_settings(&e.settings()),
         "config.set" => {
             let patch = a
                 .get("settings")
@@ -386,6 +489,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .ok_or_else(|| Fail::invalid("settings must be an object"))?;
             let mut cur = serde_json::to_value(e.settings()).map_err(|x| Fail::new(500, "io", x.to_string()))?;
             for (k, v) in patch {
+                if k == "hf_token" && v == "(set)" {
+                    continue; // config.get's placeholder, sent back unchanged
+                }
                 if cur.get(k).is_none() {
                     return Err(Fail::invalid(format!("no setting {k}")).into());
                 }
@@ -397,10 +503,19 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             tokio::task::spawn_blocking(move || engine.set_settings(saved))
                 .await
                 .map_err(|x| Fail::new(500, "io", x.to_string()))??;
-            json!(new)
+            shown_settings(&new)
         }
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
+}
+
+/// The settings as config.get shows them: a secret only says whether it is set.
+fn shown_settings(st: &Settings) -> Value {
+    let mut v = json!(st);
+    if st.hf_token.as_deref().is_some_and(|t| !t.is_empty()) {
+        v["hf_token"] = json!("(set)");
+    }
+    v
 }
 
 // ---- routes -------------------------------------------------------------------------------------------------

@@ -11,20 +11,30 @@ runs on its own.
   port with its own random key, so only the hub can use it. Models load on first use. The least recently used one is
   unloaded when `max_loaded` would be exceeded, and idle models can be unloaded after a time you set. The processes
   belong to the hub: a Windows job object or Linux's parent-death signal stops them even if the hub is killed.
-- **Passes `ollama/<name>` through** to a running Ollama, so both show up in one model list.
+- **Downloads models** from Hugging Face (`hf.co/<org>/<repo>:<quant>`) and from the Ollama library
+  (`qwen3:8b`), with progress, resume and a SHA-256 check of every file. No Ollama or Python needed.
+- **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server` (Vulkan by
+  default) and needs nothing else installed but the GPU driver.
+- **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 
 ## Quick start
 
 ```bash
-cargo build --release -p model-mistress
+git submodule update --init engines/llama.cpp
+cargo build --release -p model-mistress --features bundled-engine   # builds llama.cpp in (a few minutes once)
 model-mistress serve            # foreground; writes <home>/control.json = {url, token, pid, version, api}
-# in another terminal: point it at llama-server (or put llama-server on PATH, or in <home>/engines/llama.cpp/)
-model-mistress call config.set '{"settings": {"llama_server": "/path/to/llama-server"}}'
+# in another terminal:
+model-mistress pull hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M    # or: model-mistress pull qwen3:8b
 model-mistress models           # what is on this machine
-model-mistress chat llama3.2:1b "Hello"
+model-mistress chat qwen3 "Hello"
 model-mistress mcp              # MCP over stdio, for agents
 ```
+
+The bundled build needs CMake, a C++ compiler (Visual Studio's on Windows) and, for the default Vulkan backend,
+the Vulkan SDK; `MM_GGML_BACKEND=cuda|hip|metal|cpu` picks another (see `src/build.rs`). Without the feature,
+ModelMistress uses a `llama-server` you name with `llama_server`, put in `<home>/engines/llama.cpp/`, or have on
+PATH. Downloads go to `download_dir` (default `<home>`); gated Hugging Face repos need `hf_token` or HF_TOKEN.
 
 `<home>` is `%LOCALAPPDATA%\ModelMistress` on Windows, `~/.local/share/ModelMistress` on Linux, or `--home` /
 `MM_HOME`. Settings live in `<home>/config.toml` (every field optional; `config.get` shows them all).
@@ -46,7 +56,8 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI, streaming or not |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
-`model.unload`, `chat.complete`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
+`model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
+`chat.complete`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
 
 ## Development
 

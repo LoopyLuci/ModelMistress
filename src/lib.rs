@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod client;
 pub mod engine;
 pub mod hub;
+pub mod pull;
 
 // ---- legacy -----------------------------------------------------------------------------------------------------
 // The first design's scaffolding, kept until it is either rebuilt on the core above or removed. Its CPU engine

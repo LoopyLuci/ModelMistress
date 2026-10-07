@@ -133,6 +133,10 @@ fn dedup(dirs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Windows' canonical paths start with `\\?\`; drop it (for a drive path) so logs and other programs read them plainly.
+pub fn plain_path(p: PathBuf) -> PathBuf {
+    plain(p)
+}
+
 fn plain(p: PathBuf) -> PathBuf {
     match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
         Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
@@ -257,6 +261,15 @@ fn split_part(name: &str) -> Option<(u32, u32)> {
     let (head, total) = stem.rsplit_once("-of-")?;
     let (_, part) = head.rsplit_once('-')?;
     Some((part.parse().ok()?, total.parse().ok()?))
+}
+
+/// `Big-00001-of-00002` (a file stem) -> `Big`; None when the stem is not a split part.
+pub fn split_part_of(stem: &str) -> Option<&str> {
+    let (head, total) = stem.rsplit_once("-of-")?;
+    total.parse::<u32>().ok()?;
+    let (h, part) = head.rsplit_once('-')?;
+    part.parse::<u32>().ok()?;
+    Some(h)
 }
 
 fn model_stem(p: &Path) -> String {
@@ -431,10 +444,10 @@ fn scalar_size(ty: u32) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod tests_support {
+    use std::path::Path;
 
-    fn gguf(path: &Path, arch: &str, name: &str) {
+    pub fn gguf(path: &Path, arch: &str, name: &str) {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -464,6 +477,13 @@ mod tests {
         s(&mut b, "gpt2");
         std::fs::write(path, b).unwrap();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::tests_support::gguf;
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("mm-catalog-{name}-{}", std::process::id()));

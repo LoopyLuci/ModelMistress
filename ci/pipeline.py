@@ -11,7 +11,7 @@ Stages:
   static     rustfmt on the core's files; clippy -D warnings on the core and CLI (the legacy modules' lints are
              allowed in src/lib.rs); no secret-shaped strings or files over 5 MB in the push
   tests      cargo test on the core and CLI
-  build      the release binary
+  build      the release binary, with llama.cpp built in when engines/llama.cpp is checked out and cmake is here
   smoke      a real hub in a throwaway home: health, a refused caller without the token, 13+ operations, the
              catalog, the OpenAI model list, errors for unknown operations, models and bad input, the MCP bridge, a
              clean stop. With llama-server and a model of 2 GB or less on this machine (the settings in the user's
@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LOGS, REPORTS = ROOT / "ci" / "logs", ROOT / "ci" / "reports"
 LOCK = ROOT / "ci" / ".pipeline.lock"
 STAGES = ["preflight", "static", "tests", "build", "smoke"]
-FMT_CLEAN = ["src/catalog.rs", "src/engine.rs", "src/hub.rs", "src/client.rs", "src/lib.rs",
+FMT_CLEAN = ["src/catalog.rs", "src/engine.rs", "src/hub.rs", "src/client.rs", "src/lib.rs", "src/pull.rs", "src/build.rs",
              "src/bin/model-mistress/main.rs"]                    # grow this as legacy modules are rebuilt
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_|AKIA[0-9A-Z]{16}|"
                     r"-----BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,})")
@@ -144,7 +144,13 @@ def tests() -> tuple[bool, str]:
 
 
 def build() -> tuple[bool, str]:
-    code, out = run(["cargo", "build", "--release", "-p", "model-mistress"], 3600)
+    cmd = ["cargo", "build", "--release", "-p", "model-mistress"]
+    if (ROOT / "engines" / "llama.cpp" / "CMakeLists.txt").is_file() and shutil.which("cmake"):
+        cmd += ["--features", "bundled-engine"]   # llama.cpp built in, as it ships; the smoke test then uses it
+        say("  ->     with the built-in llama.cpp")
+    else:
+        say("  [--]   without the built-in llama.cpp (no engines/llama.cpp checkout, or no cmake)")
+    code, out = run(cmd, 3600)
     if code != 0:
         return False, "\n".join(out.splitlines()[-25:])
     if not (target_dir() / "release" / f"model-mistress{EXE}").is_file():

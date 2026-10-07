@@ -52,7 +52,8 @@ pub type Result<T> = std::result::Result<T, Fail>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Path to `llama-server`. Unset: MM_LLAMA_SERVER, then `<home>/engines/llama.cpp/`, then PATH.
+    /// Path to `llama-server`. Unset: MM_LLAMA_SERVER, then the one built into this binary, then
+    /// `<home>/engines/llama.cpp/`, then PATH.
     pub llama_server: Option<PathBuf>,
     /// Extra folders of .gguf files.
     pub model_dirs: Vec<PathBuf>,
@@ -79,6 +80,10 @@ pub struct Settings {
     pub default_model: Option<String>,
     /// Extra arguments for every llama-server.
     pub extra_args: Vec<String>,
+    /// Where model.pull saves models (default: the home folder). Its `hub` and `ollama` folders are scanned.
+    pub download_dir: Option<PathBuf>,
+    /// A Hugging Face token for gated or private repos (else HF_TOKEN). config.get never shows it.
+    pub hf_token: Option<String>,
 }
 
 impl Default for Settings {
@@ -98,6 +103,8 @@ impl Default for Settings {
             idle_unload_s: 0,
             default_model: None,
             extra_args: vec![],
+            download_dir: None,
+            hf_token: None,
         }
     }
 }
@@ -192,6 +199,8 @@ pub struct Engine {
     pub metrics: Mutex<BTreeMap<String, ModelMetrics>>,
     pub http: reqwest::Client,
     llama_version: Mutex<Option<(PathBuf, String)>>,
+    /// The llama-server built into this binary (feature `bundled-engine`), once written to disk.
+    bundled: Option<PathBuf>,
     #[cfg(windows)]
     job: Option<job::Job>,
 }
@@ -214,7 +223,6 @@ fn exe(name: &str) -> String {
 impl Engine {
     pub fn new(home: PathBuf, settings: Settings) -> Arc<Self> {
         let e = Arc::new(Self {
-            home,
             settings: RwLock::new(settings),
             catalog: RwLock::new(vec![]),
             loaded: Mutex::new(HashMap::new()),
@@ -225,6 +233,8 @@ impl Engine {
                 .build()
                 .unwrap_or_default(),
             llama_version: Mutex::new(None),
+            bundled: bundled::install(&home),
+            home,
             #[cfg(windows)]
             job: job::Job::new(),
         });
@@ -251,6 +261,9 @@ impl Engine {
         r.huggingface.splice(0..0, s.hf_dirs.iter().cloned());
         r.folders.splice(0..0, s.model_dirs.iter().cloned());
         r.folders.push(self.home.join("models"));
+        let downloads = s.download_dir.clone().unwrap_or_else(|| self.home.clone());
+        r.huggingface.push(downloads.join("hub"));
+        r.ollama.push(downloads.join("ollama"));
         r
     }
 
@@ -286,6 +299,9 @@ impl Engine {
             if p.is_file() {
                 return Some(p);
             }
+        }
+        if let Some(p) = self.bundled.as_ref().filter(|p| p.is_file()) {
+            return Some(p.clone());
         }
         let bundled = self.home.join("engines").join("llama.cpp").join(exe("llama-server"));
         if bundled.is_file() {
@@ -749,6 +765,64 @@ fn no_window(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+/// The llama.cpp programs built into this binary (feature `bundled-engine`; see build.rs). They are written to
+/// `<home>/engines/bundled/<hash>/` the first time they are needed, so a new ModelMistress brings its own build
+/// and an old one keeps working with its own; folders of other builds are removed.
+pub mod bundled {
+    use std::path::{Path, PathBuf};
+
+    #[cfg(feature = "bundled-engine")]
+    const FILES: &[(&str, &[u8])] = &[
+        ("llama-server", include_bytes!(env!("MM_BUNDLED_SERVER"))),
+        ("llama-bench", include_bytes!(env!("MM_BUNDLED_BENCH"))),
+    ];
+    #[cfg(not(feature = "bundled-engine"))]
+    const FILES: &[(&str, &[u8])] = &[];
+
+    /// The llama.cpp commit and GPU backend built in, or None.
+    pub fn version() -> Option<&'static str> {
+        #[cfg(feature = "bundled-engine")]
+        return Some(env!("MM_BUNDLED_VERSION"));
+        #[cfg(not(feature = "bundled-engine"))]
+        None
+    }
+
+    /// Writes the programs out if they are not there yet; returns llama-server's path.
+    pub fn install(home: &Path) -> Option<PathBuf> {
+        let (_, server) = FILES.first()?;
+        let tag = blake3::hash(server).to_hex()[..16].to_string();
+        let root = home.join("engines").join("bundled");
+        let dir = root.join(&tag);
+        for (name, bytes) in FILES {
+            if let Err(e) = write_once(&dir.join(super::exe(name)), bytes) {
+                eprintln!("model-mistress: could not write the built-in {name}: {e}");
+                return None;
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for old in rd.flatten().filter(|d| d.file_name() != tag.as_str()) {
+                let _ = std::fs::remove_dir_all(old.path()); // an older build's; fails harmlessly while in use
+            }
+        }
+        Some(dir.join(super::exe("llama-server")))
+    }
+
+    fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&tmp, path)
+    }
 }
 
 #[cfg(windows)]
