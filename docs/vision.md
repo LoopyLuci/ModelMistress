@@ -45,7 +45,7 @@ Every field is optional:
   "kind": "classify",
   "labels": ["tench", "goldfish", "..."],
   "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225], "scale": 0.00392156862,
-  "size": [224, 224], "resize": "crop", "bgr": false,
+  "size": [224, 224], "resize": "crop", "crop_pct": 0.875, "bgr": false,
   "objectness": false, "nms_iou": 0.45, "normalize": true
 }
 ```
@@ -57,9 +57,11 @@ Every field is optional:
 - `size`: the input size, `224` or `[width, height]`; only for models whose input height or width is dynamic (a fixed
   input size wins). Without it: 224, and 640 for detectors.
 - `resize`: `crop` (the short side is scaled to the size and the centre is cut; the default for classifiers and
-  embedders) or `stretch` (the whole picture is squeezed; the default for detectors, which means no letterbox: boxes are
-  mapped back to the picture, but a model trained with letterboxing is a little less accurate). Scaling is bilinear, after
-  a block average when shrinking by 2 or more.
+  embedders), `letterbox` (the whole picture is scaled to fit, aspect kept, on grey 114 padding; the default for
+  detectors, which YOLO models are trained with; boxes are mapped back to the picture) or `stretch` (the whole picture
+  is squeezed). `crop_pct` (0 to 1, with `crop`): the share of the short side kept, i.e. the short side is scaled to
+  size / crop_pct before the cut; default 0.875 for classifiers (the Hugging Face and timm ImageNet convention: 256
+  then 224), 1 for embedders (CLIP). Scaling is antialiased like PIL's: bicubic for `crop`, bilinear otherwise.
 - `bgr`: the model wants blue, green, red. `objectness`: force the YOLO layout (v5 yes, v8 no). `nms_iou`: the overlap
   above which two boxes of one class are one object (default 0.45). `normalize`: scale an embedding to length 1 (default
   yes; cosine similarity is then a dot product).
@@ -112,7 +114,7 @@ detectors exported with `format=onnx` (labels are COCO's by default), and the vi
 
 ## Tests
 
-Request and sidecar parsing, model lookup, preprocessing (NCHW and NHWC, crop and stretch, normalisation), softmax,
+Request and sidecar parsing, model lookup, preprocessing (NCHW and NHWC, crop, stretch and letterbox, normalisation), softmax,
 top-k, overlap and NMS, YOLO decoding, kind guessing and the answer building are unit tests that need no model and run
 in every build. With `--features vision` a model written by hand as protobuf bytes in the test (a global average
 pool, flatten and softmax over the picture, so its three classes are the share of red, green and blue) goes through the

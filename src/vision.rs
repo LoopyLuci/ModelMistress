@@ -6,7 +6,6 @@
 //! Everything but running the session (finding models, reading requests, preparing the pixels, reading the
 //! output tensors) is plain code that builds without the feature, so it is tested without a model.
 
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -157,8 +156,11 @@ pub struct Sidecar {
     pub scale: Option<f32>,
     /// The input size, for models whose input has a dynamic height or width.
     pub size: Option<Size>,
-    /// `stretch` (the whole picture is squeezed to the size) or `crop` (short side to the size, centre cut).
+    /// `stretch` (the whole picture is squeezed to the size), `crop` (short side to the size, centre cut) or
+    /// `letterbox` (the whole picture, aspect kept, on grey padding).
     pub resize: Option<String>,
+    /// With `crop`: the share of the short side kept (default 0.875 for classifiers, else 1).
+    pub crop_pct: Option<f32>,
     /// The model wants blue, green, red.
     pub bgr: bool,
     /// Detection: the output rows carry an objectness score before the class scores (YOLOv5: yes, YOLOv8: no).
@@ -198,9 +200,12 @@ impl Sidecar {
             }
         }
         if let Some(r) = &s.resize {
-            if !matches!(r.as_str(), "stretch" | "crop") {
-                return Err(format!("bad sidecar: resize \"{r}\" is not stretch or crop"));
+            if !matches!(r.as_str(), "stretch" | "crop" | "letterbox") {
+                return Err(format!("bad sidecar: resize \"{r}\" is not stretch, crop or letterbox"));
             }
+        }
+        if s.crop_pct.is_some_and(|v| !(v > 0.0 && v <= 1.0)) {
+            return Err("bad sidecar: crop_pct must be above 0 and at most 1".into());
         }
         if s.nms_iou.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
             return Err("bad sidecar: nms_iou must be from 0 to 1".into());
@@ -356,6 +361,28 @@ pub fn decode_base64(s: &str) -> std::result::Result<Vec<u8>, String> {
 
 // ---- preparing the pixels ---------------------------------------------------------------------------------------
 
+/// How a picture is fitted to the model's input size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The whole picture is squeezed to the size.
+    Stretch,
+    /// The short side is scaled to the size and the centre is cut.
+    Crop,
+    /// The whole picture is scaled to fit, centred on grey padding (what YOLO models are trained with).
+    Letterbox,
+}
+
+/// The grey of letterbox padding, 0..255.
+const PAD: f32 = 114.0;
+
+/// Where a letterboxed picture sits in the input: (left, top, width, height) in input pixels.
+fn letterbox_geom(tw: usize, th: usize, w: usize, h: usize) -> (usize, usize, usize, usize) {
+    let r = (tw as f32 / w as f32).min(th as f32 / h as f32);
+    let nw = ((w as f32 * r).round() as usize).clamp(1, tw);
+    let nh = ((h as f32 * r).round() as usize).clamp(1, th);
+    ((tw - nw) / 2, (th - nh) / 2, nw, nh)
+}
+
 /// How a picture becomes the model's input tensor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prep {
@@ -364,8 +391,11 @@ pub struct Prep {
     pub mean: [f32; 3],
     pub std: [f32; 3],
     pub scale: f32,
-    /// Short side to the size and the centre cut, instead of squeezing the whole picture.
-    pub crop: bool,
+    /// How the picture is fitted to the size.
+    pub fit: Fit,
+    /// With `Fit::Crop`: the share of the short side that is kept (the short side is scaled to size / crop_pct, then
+    /// the centre is cut), 0.875 for ImageNet classifiers.
+    pub crop_pct: f32,
     pub bgr: bool,
     /// Channels last (`[1, h, w, 3]`) instead of `[1, 3, h, w]`.
     pub nhwc: bool,
@@ -377,13 +407,13 @@ const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 impl Prep {
-    /// The usual preparation for `kind` (ImageNet statistics for classifiers, CLIP's for embedders, plain 0..1 for
-    /// detectors), then the sidecar's changes.
+    /// The usual preparation for `kind` (ImageNet statistics and a 0.875 centre crop for classifiers, CLIP's statistics
+    /// for embedders, plain 0..1 and a letterbox for detectors), then the sidecar's changes.
     pub fn for_kind(kind: Kind, width: usize, height: usize, nhwc: bool, side: &Sidecar) -> Prep {
-        let (mean, std, crop) = match kind {
-            Kind::Classify => (IMAGENET_MEAN, IMAGENET_STD, true),
-            Kind::Embed => (CLIP_MEAN, CLIP_STD, true),
-            Kind::Detect => ([0.0; 3], [1.0; 3], false),
+        let (mean, std, fit, crop_pct) = match kind {
+            Kind::Classify => (IMAGENET_MEAN, IMAGENET_STD, Fit::Crop, 0.875),
+            Kind::Embed => (CLIP_MEAN, CLIP_STD, Fit::Crop, 1.0),
+            Kind::Detect => ([0.0; 3], [1.0; 3], Fit::Letterbox, 1.0),
         };
         Prep {
             width,
@@ -391,78 +421,137 @@ impl Prep {
             mean: side.mean.unwrap_or(mean),
             std: side.std.unwrap_or(std),
             scale: side.scale.unwrap_or(1.0 / 255.0),
-            crop: side.resize.as_deref().map_or(crop, |r| r == "crop"),
+            fit: match side.resize.as_deref() {
+                Some("crop") => Fit::Crop,
+                Some("stretch") => Fit::Stretch,
+                Some("letterbox") => Fit::Letterbox,
+                _ => fit,
+            },
+            crop_pct: side.crop_pct.unwrap_or(crop_pct),
             bgr: side.bgr,
             nhwc,
         }
     }
 }
 
-/// Averages blocks of `f` by `f` pixels (the edge blocks are smaller): a cheap filter so that shrinking a large
-/// picture does not skip most of its pixels.
-fn reduce(rgb: &[u8], w: usize, h: usize, f: usize) -> (Vec<u8>, usize, usize) {
-    let (nw, nh) = (w.div_ceil(f), h.div_ceil(f));
-    let mut out = vec![0u8; nw * nh * 3];
-    for by in 0..nh {
-        for bx in 0..nw {
-            let (x1, y1) = ((bx * f + f).min(w), (by * f + f).min(h));
-            let mut sum = [0u32; 3];
-            for y in by * f..y1 {
-                for x in bx * f..x1 {
-                    for (c, s) in sum.iter_mut().enumerate() {
-                        *s += rgb[(y * w + x) * 3 + c] as u32;
-                    }
-                }
+/// The filter of a resampling pass: (support, weight at distance x).
+type Kernel = (f32, fn(f32) -> f32);
+
+/// Triangle (bilinear, widened when shrinking so that no pixel is skipped).
+const TRIANGLE: Kernel = (1.0, |x| (1.0 - x.abs()).max(0.0));
+
+/// Catmull-Rom cubic (a = -0.5), the bicubic of PIL and so of the Hugging Face image processors.
+const CUBIC: Kernel = (2.0, |x| {
+    let x = x.abs();
+    if x < 1.0 {
+        (1.5 * x - 2.5) * x * x + 1.0
+    } else if x < 2.0 {
+        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+    } else {
+        0.0
+    }
+});
+
+/// For each of `n` output positions along an axis, the first source pixel and the weights, when the span of `len`
+/// source pixels from `start` (fractional) is shrunk or grown to `n`; the filter widens when shrinking.
+fn axis_weights(start: f32, len: f32, n: usize, src: usize, k: Kernel) -> Vec<(usize, Vec<f32>)> {
+    let scale = len / n as f32;
+    let fscale = scale.max(1.0);
+    let support = k.0 * fscale;
+    (0..n)
+        .map(|o| {
+            let centre = start + (o as f32 + 0.5) * scale;
+            let lo = ((centre - support + 0.5).floor().max(0.0) as usize).min(src - 1);
+            let hi = ((centre + support + 0.5).floor().max(0.0) as usize)
+                .min(src)
+                .max(lo + 1);
+            let mut ws: Vec<f32> = (lo..hi).map(|i| (k.1)((i as f32 + 0.5 - centre) / fscale)).collect();
+            let sum: f32 = ws.iter().sum();
+            if sum.abs() > 1e-6 {
+                ws.iter_mut().for_each(|w| *w /= sum);
+            } else {
+                ws.iter_mut().for_each(|w| *w = 0.0);
+                let at = (centre.floor().max(0.0) as usize).clamp(lo, hi - 1);
+                ws[at - lo] = 1.0;
             }
-            let n = ((x1 - bx * f) * (y1 - by * f)) as u32;
-            for (c, s) in sum.iter().enumerate() {
-                out[(by * nw + bx) * 3 + c] = ((s + n / 2) / n) as u8;
+            (lo, ws)
+        })
+        .collect()
+}
+
+/// Resamples the part `(x, y, w, h)` (source pixels) of an RGB picture of `size` to `dest`, as 0..255 values rounded
+/// after each of the two passes, like PIL. Interleaved RGB.
+fn resample(rgb: &[u8], size: (usize, usize), part: (f32, f32, f32, f32), dest: (usize, usize), k: Kernel) -> Vec<f32> {
+    let ((w, h), (rx, ry, rw, rh), (dw, dh)) = (size, part, dest);
+    let xs = axis_weights(rx, rw, dw, w, k);
+    let ys = axis_weights(ry, rh, dh, h, k);
+    let y_lo = ys.iter().map(|(lo, _)| *lo).min().unwrap_or(0);
+    let y_hi = ys.iter().map(|(lo, ws)| lo + ws.len()).max().unwrap_or(0);
+    // the horizontal pass, over the rows that matter
+    let mut mid = vec![0f32; (y_hi - y_lo) * dw * 3];
+    for y in y_lo..y_hi {
+        for (ox, (lo, ws)) in xs.iter().enumerate() {
+            for c in 0..3 {
+                let v: f32 = ws
+                    .iter()
+                    .enumerate()
+                    .map(|(j, wt)| rgb[(y * w + lo + j) * 3 + c] as f32 * wt)
+                    .sum();
+                mid[((y - y_lo) * dw + ox) * 3 + c] = v.round().clamp(0.0, 255.0);
             }
         }
     }
-    (out, nw, nh)
+    let mut out = vec![0f32; dh * dw * 3];
+    for (oy, (lo, ws)) in ys.iter().enumerate() {
+        for ox in 0..dw {
+            for c in 0..3 {
+                let v: f32 = ws
+                    .iter()
+                    .enumerate()
+                    .map(|(j, wt)| mid[((lo + j - y_lo) * dw + ox) * 3 + c] * wt)
+                    .sum();
+                out[(oy * dw + ox) * 3 + c] = v.round().clamp(0.0, 255.0);
+            }
+        }
+    }
+    out
 }
 
 /// Resizes an RGB picture (`w` by `h`, 3 bytes a pixel) into the input tensor: `[3, h, w]` or, with `nhwc`,
-/// `[h, w, 3]`, as floats `(pixel * scale - mean) / std`. Bilinear, after a block average when shrinking by 2 or more.
+/// `[h, w, 3]`, as floats `(pixel * scale - mean) / std`. Antialiased: bicubic for a crop (as the Hugging Face
+/// processors do), bilinear for stretch and letterbox.
 pub fn preprocess(rgb: &[u8], w: usize, h: usize, p: &Prep) -> Vec<f32> {
     let (tw, th) = (p.width, p.height);
     if w == 0 || h == 0 || tw == 0 || th == 0 || rgb.len() < w * h * 3 {
         return vec![0.0; tw * th * 3];
     }
-    // the part of the picture that shows, in source pixels
-    let (rx, ry, rw, rh) = if p.crop {
-        let s = (tw as f32 / w as f32).max(th as f32 / h as f32);
-        let (rw, rh) = (tw as f32 / s, th as f32 / s);
-        ((w as f32 - rw) / 2.0, (h as f32 - rh) / 2.0, rw, rh)
-    } else {
-        (0.0, 0.0, w as f32, h as f32)
+    // the part of the picture that shows, in source pixels, and where it lands in the input
+    let (region, (dx, dy, dw, dh), kernel) = match p.fit {
+        Fit::Crop => {
+            let s = (tw as f32 / w as f32).max(th as f32 / h as f32) / p.crop_pct.clamp(0.01, 1.0);
+            let (rw, rh) = ((tw as f32 / s).min(w as f32), (th as f32 / s).min(h as f32));
+            (
+                ((w as f32 - rw) / 2.0, (h as f32 - rh) / 2.0, rw, rh),
+                (0, 0, tw, th),
+                CUBIC,
+            )
+        }
+        Fit::Stretch => ((0.0, 0.0, w as f32, h as f32), (0, 0, tw, th), TRIANGLE),
+        Fit::Letterbox => ((0.0, 0.0, w as f32, h as f32), letterbox_geom(tw, th, w, h), TRIANGLE),
     };
-    let f = (rw / tw as f32).min(rh / th as f32).floor().max(1.0) as usize;
-    let (src, sw, sh): (Cow<[u8]>, usize, usize) = if f >= 2 {
-        let (v, nw, nh) = reduce(rgb, w, h, f);
-        (Cow::Owned(v), nw, nh)
-    } else {
-        (Cow::Borrowed(rgb), w, h)
-    };
-    let k = f as f32;
-    let (rx, ry, rw, rh) = (rx / k, ry / k, rw / k, rh / k);
-    let at = |x: usize, y: usize, c: usize| src[(y * sw + x) * 3 + c] as f32;
+    let pic = resample(rgb, (w, h), region, (dw, dh), kernel);
     let mut out = vec![0f32; tw * th * 3];
     for oy in 0..th {
-        let sy = (ry + (oy as f32 + 0.5) * rh / th as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
-        let (y0, fy) = (sy.floor() as usize, sy - sy.floor());
-        let y1 = (y0 + 1).min(sh - 1);
         for ox in 0..tw {
-            let sx = (rx + (ox as f32 + 0.5) * rw / tw as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
-            let (x0, fx) = (sx.floor() as usize, sx - sx.floor());
-            let x1 = (x0 + 1).min(sw - 1);
+            let inside = (dx..dx + dw).contains(&ox) && (dy..dy + dh).contains(&oy);
             for c in 0..3 {
                 let sc = if p.bgr { 2 - c } else { c };
-                let top = at(x0, y0, sc) * (1.0 - fx) + at(x1, y0, sc) * fx;
-                let bottom = at(x0, y1, sc) * (1.0 - fx) + at(x1, y1, sc) * fx;
-                let v = (top * (1.0 - fy) + bottom * fy) * p.scale;
-                let v = (v - p.mean[c]) / p.std[c];
+                let px = if inside {
+                    pic[((oy - dy) * dw + (ox - dx)) * 3 + sc]
+                } else {
+                    PAD
+                };
+                let v = (px * p.scale - p.mean[c]) / p.std[c];
                 let i = if p.nhwc {
                     (oy * tw + ox) * 3 + c
                 } else {
@@ -858,17 +947,27 @@ pub fn build_result(
             let mut dets = decode_yolo(data, shape, side.objectness, req.threshold.unwrap_or(DEFAULT_THRESHOLD))?;
             dets = nms(dets, side.nms_iou.unwrap_or(DEFAULT_NMS_IOU));
             dets.truncate(req.top_k.unwrap_or(DEFAULT_MAX_DETECTIONS));
-            let (kx, ky) = (
-                img_w as f32 / plan.prep.width as f32,
-                img_h as f32 / plan.prep.height as f32,
-            );
+            // input pixels back to the picture: undo the letterbox's padding and scale, or the stretch
+            let (ox, oy, kx, ky) = match plan.prep.fit {
+                Fit::Letterbox => {
+                    let (px, py, nw, nh) =
+                        letterbox_geom(plan.prep.width, plan.prep.height, img_w as usize, img_h as usize);
+                    (px as f32, py as f32, img_w as f32 / nw as f32, img_h as f32 / nh as f32)
+                }
+                _ => (
+                    0.0,
+                    0.0,
+                    img_w as f32 / plan.prep.width as f32,
+                    img_h as f32 / plan.prep.height as f32,
+                ),
+            };
             let coco = side.labels.is_empty();
             let items: Vec<Value> = dets
                 .iter()
                 .map(|d| {
                     let [x1, y1, x2, y2] = d.bbox;
-                    let (x1, x2) = ((x1 * kx).clamp(0.0, img_w as f32), (x2 * kx).clamp(0.0, img_w as f32));
-                    let (y1, y2) = ((y1 * ky).clamp(0.0, img_h as f32), (y2 * ky).clamp(0.0, img_h as f32));
+                    let (x1, x2) = (((x1 - ox) * kx).clamp(0.0, img_w as f32), ((x2 - ox) * kx).clamp(0.0, img_w as f32));
+                    let (y1, y2) = (((y1 - oy) * ky).clamp(0.0, img_h as f32), ((y2 - oy) * ky).clamp(0.0, img_h as f32));
                     json!({"class": d.class, "label": label(d.class, coco && detector_has_80(shape)), "score": round5(d.score),
                            "box": {"x1": x1.round(), "y1": y1.round(), "x2": x2.round(), "y2": y2.round()}})
                 })
@@ -905,7 +1004,10 @@ fn detector_has_80(shape: &[i64]) -> bool {
     }
 }
 
-/// The CLI's plain-text view of an answer: one line per prediction or box; an embedding as a JSON array.
+/// How many values of an embedding the CLI's text view shows.
+const EMBED_PREVIEW: usize = 6;
+
+/// The CLI's plain-text view of an answer: one line per prediction or box; an embedding as its size and first values.
 pub fn render_text(v: &Value) -> String {
     let mut out = String::new();
     let score = |x: &Value| x["score"].as_f64().unwrap_or(0.0);
@@ -942,11 +1044,18 @@ pub fn render_text(v: &Value) -> String {
             }
         }
         Some("embed") => {
+            let all = v["embedding"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let head: Vec<String> = all
+                .iter()
+                .take(EMBED_PREVIEW)
+                .map(|x| format!("{:.4}", x.as_f64().unwrap_or(0.0)))
+                .collect();
             out += &format!(
-                "{}
-",
-                v["embedding"]
-            )
+                "{} dimensions: [{}{}] (--json for the whole vector)\n",
+                all.len(),
+                head.join(", "),
+                if all.len() > EMBED_PREVIEW { ", ..." } else { "" }
+            );
         }
         _ => {
             out += &format!(
@@ -1201,7 +1310,8 @@ mod tests {
             mean: [0.0; 3],
             std: [1.0; 3],
             scale: 1.0 / 255.0,
-            crop: false,
+            fit: Fit::Stretch,
+            crop_pct: 1.0,
             bgr: false,
             nhwc: false,
         }
@@ -1394,19 +1504,19 @@ mod tests {
     fn stretch_keeps_the_whole_picture_and_crop_the_centre() {
         let p = prep(2, 2);
         let v = preprocess(&halves(), 4, 2, &p);
-        // red plane: left column 1, right column 0
-        assert_eq!(&v[..4], &[1.0, 0.0, 1.0, 0.0]);
+        // red plane: the left column mostly red, the right mostly blue (the filter is wide when shrinking)
+        assert!(v[0] > 0.7 && v[1] < 0.3 && v[2] > 0.7 && v[3] < 0.3, "{v:?}");
         let mut c = prep(2, 2);
-        c.crop = true;
+        c.fit = Fit::Crop;
         // the centre 2x2 is one red and one blue column too, but at the pixel level: red at x=1, blue at x=2
         let v = preprocess(&halves(), 4, 2, &c);
         assert_eq!(&v[..4], &[1.0, 0.0, 1.0, 0.0]);
         // a 1-wide target takes the centre pixel pair, which is half red, half blue
         let mut c = prep(1, 2);
-        c.crop = true;
+        c.fit = Fit::Crop;
         let v = preprocess(&halves(), 4, 2, &c);
         // red plane first, blue plane last
-        assert!((v[0] - 0.5).abs() < 1e-5 && (v[4] - 0.5).abs() < 1e-5, "{v:?}");
+        assert!((v[0] - 0.5).abs() < 0.01 && (v[4] - 0.5).abs() < 0.01, "{v:?}");
     }
 
     #[test]
@@ -1523,6 +1633,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn yolo_picks_the_class_with_the_top_score_in_both_layouts() {
+        // 80 classes, one box whose best class is 16 (dog) while person (0) scores second
+        let mut scores = vec![0.0f32; 80];
+        scores[0] = 0.4;
+        scores[16] = 0.7;
+        scores[79] = 0.1;
+        let (dims, data) = v8_output(100, 80, &[(7, 100.0, 120.0, 40.0, 60.0, &scores)]);
+        let d = decode_yolo(&data, &dims, None, 0.25).unwrap();
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            (d[0].class, d[0].score, d[0].bbox),
+            (16, 0.7, [80.0, 90.0, 120.0, 150.0])
+        );
+        // the same boxes as [1, boxes, 84], told there is no objectness
+        let (n, attrs) = (100, 84);
+        let mut t = vec![0.0f32; n * attrs];
+        for a in 0..attrs {
+            t[7 * attrs + a] = data[a * n + 7];
+        }
+        let d = decode_yolo(&t, &[1, n as i64, attrs as i64], Some(false), 0.25).unwrap();
+        assert_eq!((d.len(), d[0].class, d[0].score), (1, 16, 0.7));
+        // and the label is dog
+        let (shape, flat) = (dims, data);
+        let plan = Plan {
+            kind: Kind::Detect,
+            prep: Prep::for_kind(Kind::Detect, 640, 640, false, &Sidecar::default()),
+            output: 0,
+        };
+        let r = build_result(
+            &plan,
+            &Sidecar::default(),
+            &req(None, None),
+            (&shape, &flat),
+            (640, 640),
+        )
+        .unwrap();
+        assert_eq!(r["detections"][0]["label"], "dog");
+    }
+
+    #[test]
+    fn letterbox_pads_with_grey_and_boxes_map_back() {
+        // a 4x2 white picture in a 4x4 input: 4x2 in the middle (rows 1 and 2), grey above and below
+        let mut p = prep(4, 4);
+        p.fit = Fit::Letterbox;
+        let v = preprocess(&solid(4, 2, [255, 255, 255]), 4, 2, &p);
+        let red = &v[..16];
+        let grey = 114.0 / 255.0;
+        assert!((red[0] - grey).abs() < 1e-5 && (red[12] - grey).abs() < 1e-5, "{red:?}");
+        assert!((red[4] - 1.0).abs() < 1e-5 && (red[11] - 1.0).abs() < 1e-5, "{red:?}");
+        // a box on the picture's right half comes back in picture pixels, the padding removed
+        let plan = Plan {
+            kind: Kind::Detect,
+            prep: Prep {
+                fit: Fit::Letterbox,
+                ..prep(640, 640)
+            },
+            output: 0,
+        };
+        // a 1280x640 picture: scale 0.5, 160 rows of padding above
+        let (shape, data) = v8_output(16, 1, &[(1, 480.0, 320.0, 100.0, 100.0, &[0.9])]);
+        let r = build_result(
+            &plan,
+            &Sidecar::default(),
+            &req(None, None),
+            (&shape, &data),
+            (1280, 640),
+        )
+        .unwrap();
+        let b = &r["detections"][0]["box"];
+        assert_eq!(
+            (b["x1"].as_f64(), b["y1"].as_f64(), b["x2"].as_f64(), b["y2"].as_f64()),
+            (Some(860.0), Some(220.0), Some(1060.0), Some(420.0))
+        );
+    }
+
+    #[test]
+    fn classifier_crop_keeps_the_centre_share() {
+        // an 8x4 picture whose two outer columns each side are blue and the middle four red; a 2x2 input with
+        // crop_pct 0.5 shows only the middle 2x2 pixels, all red
+        let px: Vec<u8> = (0..4)
+            .flat_map(|_| (0..8).flat_map(|x| if (2..6).contains(&x) { [255, 0, 0] } else { [0, 0, 255] }))
+            .collect();
+        let mut p = prep(2, 2);
+        p.fit = Fit::Crop;
+        p.crop_pct = 0.5;
+        let v = preprocess(&px, 8, 4, &p);
+        assert!(v[..4].iter().all(|x| *x > 0.99), "{v:?}");
+        assert!(Sidecar::parse(r#"{"crop_pct": 0}"#).is_err());
+        assert!(Sidecar::parse(r#"{"resize": "letterbox", "crop_pct": 0.875}"#).is_ok());
+    }
+
     fn outs(shapes: &[(&str, &[i64])]) -> Vec<(String, Vec<i64>)> {
         shapes.iter().map(|(n, s)| (n.to_string(), s.to_vec())).collect()
     }
@@ -1566,8 +1768,8 @@ mod tests {
         let none = Sidecar::default();
         let p = plan(&info(&[1, 3, 224, 224], &[("o", &[1, 1000])]), &none, None).unwrap();
         assert_eq!(
-            (p.kind, p.prep.width, p.prep.height, p.prep.nhwc, p.prep.crop),
-            (Kind::Classify, 224, 224, false, true)
+            (p.kind, p.prep.width, p.prep.height, p.prep.nhwc, p.prep.fit),
+            (Kind::Classify, 224, 224, false, Fit::Crop)
         );
         assert_eq!(p.prep.mean, IMAGENET_MEAN);
         // channels last
@@ -1577,8 +1779,8 @@ mod tests {
         let dynamic = info(&[1, 3, -1, -1], &[("o", &[1, 84, 8400])]);
         let p = plan(&dynamic, &none, None).unwrap();
         assert_eq!(
-            (p.kind, p.prep.width, p.prep.height, p.prep.crop),
-            (Kind::Detect, 640, 640, false)
+            (p.kind, p.prep.width, p.prep.height, p.prep.fit),
+            (Kind::Detect, 640, 640, Fit::Letterbox)
         );
         let side = Sidecar::parse(r#"{"size": [320, 256], "mean": [1, 2, 3], "scale": 1}"#).unwrap();
         let p = plan(&dynamic, &side, None).unwrap();
@@ -1699,7 +1901,7 @@ mod tests {
         );
         assert_eq!(
             render_text(&serde_json::json!({"kind": "embed", "embedding": [0.5, 1.0]})),
-            "[0.5,1.0]
+            "2 dimensions: [0.5000, 1.0000] (--json for the whole vector)
 "
         );
     }

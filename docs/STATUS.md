@@ -81,7 +81,7 @@ with a clear error).
 
 - A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
 - Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
-  multi-input models, letterboxed detector input and segmentation or pose outputs for vision.
+  multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
 - The desktop app's Tauri shell (`desktop-app/src/main.rs`) and its Vue pages were written against the hub API but never
