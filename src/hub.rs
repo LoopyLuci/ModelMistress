@@ -20,6 +20,9 @@
 //!   POST /v1/images/generations     OpenAI image generation (PNG as b64_json or a url), stable-diffusion.cpp's sd-cli
 //!   GET  /v1/images/files/{name}    a generated image that a url points to
 //!   POST /v1/images/edits           answers 501 (see docs/images.md)
+//!   POST /v1/vision/classify        image recognition through ONNX Runtime (feature `vision`; see docs/vision.md)
+//!   POST /v1/vision/detect          the same: objects with boxes
+//!   POST /v1/vision/embed           the same: an embedding vector of the picture
 //!
 //! A peer key (see `hosting`) may use only the OpenAI routes above; the owner's token can do everything.
 //!
@@ -42,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::engine::{Engine, Fail, Lease, LoadOpts, Settings, Target};
 use crate::hosting::{Keys, Permit, Quotas, Verdict};
-use crate::{audio, image, speech, tools, tts};
+use crate::{audio, image, speech, tools, tts, vision};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -119,6 +122,9 @@ fn peer_route(path: &str) -> bool {
             | "/v1/audio/translations"
             | "/v1/images/generations"
             | "/v1/images/edits"
+            | "/v1/vision/classify"
+            | "/v1/vision/detect"
+            | "/v1/vision/embed"
     ) || path.starts_with("/v1/images/files/")
 }
 
@@ -443,6 +449,20 @@ pub fn operations() -> Vec<Value> {
             &["prompt"],
         ),
         op(
+            "vision.analyze",
+            "Recognise a picture with an ONNX model from <home>/vision (feature `vision`; see docs/vision.md): the              model's kind decides the answer, predictions (classifier), boxes (detector) or a vector (embedding)",
+            false,
+            false,
+            json!({
+                "model": {"type": "string", "description": "a vision model (default: the only one in <home>/vision)"},
+                "image": {"type": "string", "description": "a PNG or JPEG as base64 or a data URL"},
+                "file": {"type": "string", "description": "or the path of the picture on the hub's machine"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "predictions (default 5) or detections (default 100) to return"},
+                "threshold": {"type": "number", "minimum": 0, "maximum": 1, "description": "the least score of a box (default 0.25) or prediction"}
+            }),
+            &[],
+        ),
+        op(
             "quantize",
             "Make a smaller copy of a GGUF model with llama-quantize. Runs as a job (job.get shows the tensors done) \
              unless wait is true",
@@ -641,6 +661,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .filter(|m| src.is_none_or(|s| m.source == s))
                 .map(|m| m.summary(e.is_loaded(&m.id)))
                 .collect();
+            if src.is_none() && vision::AVAILABLE {
+                out.extend(vision_entries(&e.vision_dirs()));
+            }
             if a["include_ollama"].as_bool().unwrap_or(false) {
                 for m in e.ollama_models().await {
                     out.push(json!({"id": format!("ollama/{}", m["name"].as_str().unwrap_or("")), "source": "ollama-daemon",
@@ -802,6 +825,10 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "seconds": (seconds * 100.0).round() / 100.0, "model": model})
         }
         "image.generate" => image_generate(hub, a).await?,
+        "vision.analyze" => {
+            let req = vision::VisionRequest::from_json(a, true).map_err(Fail::invalid)?;
+            run_vision(hub, req, None).await?
+        }
         "quantize" => quantize(hub, a).await?,
         "lora" => {
             let m = llama_entry(hub, s(a, "model")?)?;
@@ -1593,6 +1620,76 @@ async fn image_edits() -> ApiResult<Response> {
     .into())
 }
 
+/// The vision models for `model.list`: kind "vision", and what the sidecar says the model does (else null: the
+/// model's outputs tell, once it is loaded).
+fn vision_entries(dirs: &[PathBuf]) -> Vec<Value> {
+    vision::list_models(dirs)
+        .into_iter()
+        .map(|(name, path)| {
+            let task = vision::Sidecar::load(&path).ok().and_then(|s| s.forced_kind());
+            json!({"id": name, "source": "vision", "kind": "vision", "task": task.map(vision::Kind::name),
+                   "size_gb": std::fs::metadata(&path).map(|m| (m.len() as f64 / 1e7).round() / 100.0).ok(),
+                   "loaded": Value::Null})
+        })
+        .collect()
+}
+
+/// Find the model and run it on the picture (off the async threads: it takes a while). `want` is the kind a route
+/// asked for.
+async fn run_vision(hub: &Hub, req: vision::VisionRequest, want: Option<vision::Kind>) -> ApiResult<Value> {
+    if !vision::AVAILABLE {
+        return Err(Fail::new(501, "not_implemented", vision::NOT_BUILT).into());
+    }
+    let (name, path) = vision::find_model(&hub.engine.vision_dirs(), &req.model)?;
+    let t0 = Instant::now();
+    let out = tokio::task::spawn_blocking(move || vision::analyze(&path, &req, want))
+        .await
+        .map_err(|x| Fail::new(500, "inference_error", x.to_string()))?;
+    hub.engine
+        .record(&name, out.is_ok(), t0.elapsed().as_millis() as u64, None);
+    Ok(out?)
+}
+
+/// `POST /v1/vision/{classify,detect,embed}`: JSON in, the recognition result out.
+async fn vision_route(hub: Hub, who: Caller, body: Value, want: vision::Kind) -> ApiResult<Response> {
+    if !vision::AVAILABLE {
+        return Err(Fail::new(501, "not_implemented", vision::NOT_BUILT).into());
+    }
+    let req = vision::VisionRequest::from_json(&body, false).map_err(Fail::invalid)?;
+    check_audio_model(&hub, &who, &req.model, "vision")?;
+    let asked = req.model.clone();
+    let ran = run_vision(&hub, req, Some(want)).await;
+    finish_audio(&who, &asked, ran.is_ok());
+    Ok(Json(ran?).into_response())
+}
+
+async fn vision_classify(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    vision_route(hub, who, body, vision::Kind::Classify).await
+}
+
+async fn vision_detect(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    vision_route(hub, who, body, vision::Kind::Detect).await
+}
+
+async fn vision_embed(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    vision_route(hub, who, body, vision::Kind::Embed).await
+}
+
+/// The largest vision request: a picture as base64 (4/3 of the bytes) and a little JSON.
+const MAX_VISION_BODY: usize = vision::MAX_IMAGE_BYTES / 3 * 4 + (1 << 16);
+
 /// The largest audio upload (OpenAI's own limit is 25 MB; local files are often longer).
 const MAX_AUDIO_BYTES: usize = 512 << 20;
 
@@ -1671,6 +1768,18 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/images/edits", post(image_edits))
         .route("/v1/images/files/:name", get(image_file))
+        .route(
+            "/v1/vision/classify",
+            post(vision_classify).layer(DefaultBodyLimit::max(MAX_VISION_BODY)),
+        )
+        .route(
+            "/v1/vision/detect",
+            post(vision_detect).layer(DefaultBodyLimit::max(MAX_VISION_BODY)),
+        )
+        .route(
+            "/v1/vision/embed",
+            post(vision_embed).layer(DefaultBodyLimit::max(MAX_VISION_BODY)),
+        )
         .route(
             "/v1/audio/transcriptions",
             post(transcriptions).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
@@ -1965,6 +2074,7 @@ mod tests {
             .collect();
         for id in [
             "speech.synthesize",
+            "vision.analyze",
             "quantize",
             "lora",
             "speculative",
@@ -2040,6 +2150,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[cfg(not(feature = "vision"))]
+    #[tokio::test]
+    async fn without_the_feature_vision_is_501() {
+        let home = temp_home();
+        let h = hub(&home);
+        for path in ["/v1/vision/classify", "/v1/vision/detect", "/v1/vision/embed"] {
+            let (st, v) = json_post(&h, path, json!({"image": "AAAA"})).await;
+            assert!(
+                st == 501 && message(&v).contains("--features vision"),
+                "{path} {st} {v}"
+            );
+            let req = axum::http::Request::post(path).body(Body::empty()).unwrap();
+            assert_eq!(router(h.clone()).oneshot(req).await.unwrap().status(), 401, "{path}");
+        }
+        let (st, v) = json_post(&h, "/v1/call/vision.analyze", json!({"image": "AAAA"})).await;
+        assert!(st == 501 && message(&v).contains("--features vision"), "{st} {v}");
+        // model.list does not offer what cannot run
+        std::fs::create_dir_all(home.join("vision")).unwrap();
+        std::fs::write(home.join("vision").join("net.onnx"), b"x").unwrap();
+        let (_, v) = json_post(&h, "/v1/call/model.list", json!({})).await;
+        assert!(!v.to_string().contains("\"vision\""), "{v}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(feature = "vision")]
+    #[tokio::test]
+    async fn vision_requests_get_clear_errors_and_answers() {
+        let home = temp_home();
+        let h = hub(&home);
+        let (url, image) = ("/v1/vision/classify", crate::image::base64(b"not a picture"));
+        let (st, v) = json_post(&h, url, json!({})).await;
+        assert!(st == 400 && message(&v).contains("image is required"), "{st} {v}");
+        let (st, v) = json_post(&h, url, json!({"image": "!!"})).await;
+        assert!(st == 400 && message(&v).contains("base64"), "{st} {v}");
+        let (st, v) = json_post(&h, url, json!({"image": image, "top_k": 0})).await;
+        assert!(st == 400 && message(&v).contains("top_k"), "{st} {v}");
+        // no model anywhere, then one that is not there
+        let (st, v) = json_post(&h, url, json!({"image": image})).await;
+        assert!(st == 404 && message(&v).contains("no vision model"), "{st} {v}");
+        let (st, v) = json_post(&h, url, json!({"image": image, "model": "nope"})).await;
+        assert!(st == 404 && message(&v).contains("nope"), "{st} {v}");
+        // the operation reads `file`; the routes (which peers may call) do not
+        let (st, v) = json_post(&h, "/v1/call/vision.analyze", json!({"file": "/no/such/picture.png"})).await;
+        assert!(st == 400 && message(&v).contains("picture.png"), "{st} {v}");
+        let (st, v) = json_post(&h, url, json!({"file": "/no/such/picture.png"})).await;
+        assert!(st == 400 && message(&v).contains("image is required"), "{st} {v}");
+
+        // a real (tiny) model: listed, classifies, and the other routes refuse it
+        let dir = home.join("vision");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shares.onnx"), crate::vision::test_model::color_share_model()).unwrap();
+        std::fs::write(
+            dir.join("shares.json"),
+            r#"{"labels": ["red", "green", "blue"], "mean": [0, 0, 0], "std": [1, 1, 1], "scale": 0.01}"#,
+        )
+        .unwrap();
+        let (_, v) = json_post(&h, "/v1/call/model.list", json!({})).await;
+        let listed = v["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "shares")
+            .cloned();
+        assert!(
+            listed.is_some_and(|m| m["kind"] == "vision" && m["source"] == "vision"),
+            "{v}"
+        );
+        let mut png = Vec::new();
+        ::image::RgbImage::from_pixel(6, 6, ::image::Rgb([0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), ::image::ImageFormat::Png)
+            .unwrap();
+        let data_url = format!("data:image/png;base64,{}", crate::image::base64(&png));
+        let (st, v) = json_post(&h, url, json!({"image": data_url, "top_k": 1})).await;
+        assert!(st == 200 && v["predictions"][0]["label"] == "blue", "{st} {v}");
+        let (st, v) = json_post(
+            &h,
+            "/v1/call/vision.analyze",
+            json!({"image": data_url, "model": "shares"}),
+        )
+        .await;
+        assert!(
+            st == 200 && v["result"]["kind"] == "classify" && v["result"]["model"] == "shares",
+            "{st} {v}"
+        );
+        let (st, v) = json_post(&h, "/v1/vision/embed", json!({"image": data_url})).await;
+        assert!(st == 400 && message(&v).contains("/v1/vision/classify"), "{st} {v}");
+        let (st, v) = json_post(&h, "/v1/vision/detect", json!({"image": data_url})).await;
+        assert_eq!(st, 400, "{v}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[tokio::test]
     async fn image_requests_get_clear_errors() {
         let home = temp_home();
@@ -2098,6 +2299,8 @@ mod tests {
     fn peers_may_draw_but_not_manage() {
         assert!(peer_route("/v1/images/generations") && peer_route("/v1/images/files/x.png"));
         assert!(!peer_route("/v1/call/image.generate"));
+        assert!(peer_route("/v1/vision/classify") && peer_route("/v1/vision/detect") && peer_route("/v1/vision/embed"));
+        assert!(!peer_route("/v1/call/vision.analyze"));
     }
 
     #[tokio::test]

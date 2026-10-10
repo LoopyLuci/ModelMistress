@@ -13,6 +13,7 @@ first start; nothing is downloaded. Without `bundled-engine` they are looked for
 | llama-server `--reranking`, `/v1/rerank` | `rerank.run`, `POST /v1/rerank`, `POST /rerank` | `call` |
 | `llama-tts` | `speech.synthesize`, `POST /v1/audio/speech` | `speak` ([text-to-speech.md](text-to-speech.md)) |
 | `sd-cli` (stable-diffusion.cpp) | `image.generate`, `POST /v1/images/generations` | `image` ([images.md](images.md)) |
+| ONNX Runtime (feature `vision`; not llama.cpp's) | `vision.analyze`, `POST /v1/vision/classify`, `/detect`, `/embed` | `vision` ([vision.md](vision.md)) |
 | `convert_hf_to_gguf.py` | `model.convert` (answers 501) | |
 
 ## Quantize

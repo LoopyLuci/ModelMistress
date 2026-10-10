@@ -55,6 +55,9 @@ tracing-opentelemetry = { version = "0.21", optional = true }
 # Speech to text (feature `whisper`): whisper.cpp built into the binary; MP3 decoding (WAV is read by our own code).
 whisper-rs = { version = "0.16", optional = true }
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3"] }
+# Image recognition (feature `vision`): ONNX Runtime for the models, the image crate for PNG and JPEG.
+ort = { version = "=2.0.0-rc.13", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 
 [build-dependencies]
 cc = "1"    # finds MSVC for the bundled llama.cpp build (build.rs)
@@ -84,4 +87,7 @@ rocm = ["gpu-backend"]
 # Built-in speech to text: POST /v1/audio/transcriptions and /v1/audio/translations through whisper.cpp (needs CMake
 # and a C++ compiler to build, and libclang for the bindings; run time needs nothing).
 whisper = ["whisper-rs", "symphonia"]
+# Built-in image recognition: POST /v1/vision/classify, /detect and /embed through ONNX Runtime (downloads or finds its
+# runtime library at build time; see docs/vision.md).
+vision = ["ort", "image"]
 otel = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]

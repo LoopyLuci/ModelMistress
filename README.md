@@ -29,6 +29,10 @@ runs on its own.
   stable-diffusion.cpp's `sd-cli`: OpenAI's `/v1/images/generations` (PNG as `b64_json` or a url), the operation
   `image.generate` (a job with sampling progress and cancel) and `model-mistress image "a red fox" --out fox.png`.
   Stable Diffusion, SDXL and FLUX models ([docs/images.md](docs/images.md)).
+- **Image recognition, built in.** With `--features vision` it runs ONNX models through ONNX Runtime: classify a
+  picture, find objects with boxes, or get an embedding vector, through `/v1/vision/classify`, `/detect` and `/embed`, the
+  operation `vision.analyze` and `model-mistress vision resnet50 cat.jpg`. Models are `.onnx` files in
+  `<home>/vision` ([docs/vision.md](docs/vision.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 
@@ -72,10 +76,11 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI speech to text (feature `whisper`) |
 | `POST /v1/audio/speech` | OpenAI text to speech (JSON in; WAV or PCM out) |
 | `POST /v1/images/generations` | OpenAI image generation (PNG as `b64_json` or `url`); `/v1/images/edits` answers 501 |
+| `POST /v1/vision/classify`, `/v1/vision/detect`, `/v1/vision/embed` | image recognition (feature `vision`; JSON with a base64 `image`) |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
 `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
-`chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `quantize`, `lora`, `speculative`, `embeddings.create`,
+`chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `vision.analyze`, `quantize`, `lora`, `speculative`, `embeddings.create`,
 `rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
 `config.set`.
 

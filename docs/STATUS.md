@@ -67,10 +67,21 @@ on the machine are ComfyUI-style UNet-only files, which `sd-cli` cannot load), G
 a real image. `/v1/images/edits` answers 501 (image-to-image and inpainting exist in sd.cpp, but OpenAI's
 transparency masks do not map cleanly).
 
+## Image recognition (feature `vision`)
+
+`POST /v1/vision/classify`, `/detect` and `/embed`, the operation `vision.analyze` and the `vision` command, through ONNX
+Runtime (`ort` 2.0.0-rc.13, CPU) with PNG and JPEG decoding from the `image` crate; models are `.onnx` files in
+`<home>/vision` with an optional `<name>.json` ([vision.md](vision.md)). Tested: everything that needs no model
+(preprocessing, softmax and top-k, NMS, YOLO v5 and v8 decoding, kind guessing, sidecars, requests) in every build, and
+with the feature a hand-written ONNX model through the real session and the hub routes on Windows 10. Not tested: any real
+model (ResNet, YOLO, CLIP), GPU execution providers, JPEG inputs through a model, float16 or multi-input models (refused
+with a clear error).
+
 ## Not done yet
 
 - A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
-- Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server).
+- Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
+  multi-input models, letterboxed detector input and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
 - The desktop app's Tauri shell (`desktop-app/src/main.rs`) and its Vue pages were written against the hub API but never

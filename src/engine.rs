@@ -408,6 +408,15 @@ impl Engine {
         d
     }
 
+    /// Where vision models (`.onnx` files) are looked for: `<home>/vision` first, then the model folders.
+    pub fn vision_dirs(&self) -> Vec<PathBuf> {
+        let s = self.settings.read();
+        let mut d = vec![self.home.join("vision")];
+        d.extend(s.model_dirs.iter().cloned());
+        d.push(self.home.join("models"));
+        d
+    }
+
     /// Where generated images are kept until the owner deletes them.
     pub fn generated_dir(&self) -> PathBuf {
         self.home.join("generated")

@@ -86,6 +86,23 @@ enum Cmd {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Recognise a picture with an ONNX model in <home>/vision: `vision resnet50 cat.jpg [--top-k 5]`. A classifier
+    /// lists its best guesses, a detector the boxes it found, an embedding model prints its vector as JSON.
+    Vision {
+        /// A vision model (see `models`), or `-` for the only one.
+        model: String,
+        /// A PNG or JPEG file.
+        image: PathBuf,
+        /// How many predictions (default 5) or detections (default 100).
+        #[arg(long)]
+        top_k: Option<u32>,
+        /// The least score of a box (default 0.25) or prediction.
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// Print the hub's whole answer as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Text to speech with llama.cpp's llama-tts: `speak "Hello there" --out hello.wav [--model M] [--voice V]`.
     Speak {
         text: String,
@@ -395,6 +412,32 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             }
             let v = client().await?.call("speech.transcribe", a).await?;
             print!("{}", v["rendered"].as_str().unwrap_or(""));
+        }
+        Cmd::Vision {
+            model,
+            image,
+            top_k,
+            threshold,
+            json,
+        } => {
+            // The hub reads the file, and its working folder is not ours.
+            let image = std::path::absolute(&image)?;
+            let mut a = json!({"file": image});
+            if model != "-" {
+                a["model"] = json!(model);
+            }
+            if let Some(v) = top_k {
+                a["top_k"] = json!(v);
+            }
+            if let Some(v) = threshold {
+                a["threshold"] = json!(v);
+            }
+            let v = client().await?.call("vision.analyze", a).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", model_mistress::vision::render_text(&v));
+            }
         }
         Cmd::Speak {
             text,
