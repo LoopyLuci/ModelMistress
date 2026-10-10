@@ -206,9 +206,11 @@ fn op(id: &str, summary: &str, mutating: bool, destructive: bool, props: Value, 
            "input_schema": {"type": "object", "properties": props, "required": required, "additionalProperties": false}})
 }
 
+/// Every operation: the hub's own, then the Knowledge Module ones (`km.*`).
 pub fn operations() -> Vec<Value> {
     let mut all = core_operations();
     all.extend(crate::trace::api::operations());
+    all.extend(crate::km::ops::operations());
     all
 }
 
@@ -882,6 +884,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             shown_settings(&new)
         }
         id if id.starts_with("trace.") => crate::trace::api::call(hub, id, a).await?,
+        id if id.starts_with("km.") => crate::km::ops::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1808,6 +1811,7 @@ pub fn router(hub: Hub) -> Router {
             post(translations).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
         )
         .merge(crate::trace::api::routes())
+        .merge(crate::km::ops::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))

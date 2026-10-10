@@ -208,6 +208,11 @@ enum Cmd {
         /// A key id or a peer name (default: all).
         key: Option<String>,
     },
+    /// Knowledge Modules: `km list`, `km search <text>`, `km import <path>`, `km load <id>`... (`km help` lists them).
+    Km {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
 }
@@ -680,6 +685,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             }
             show(&client().await?.call("speculative", a).await?);
         }
+        Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())
