@@ -1,7 +1,9 @@
 # Knowledge Module specification (`mmkm/1`)
 
-A **Knowledge Module (KM)** is the unit of knowledge, skill and capability in ModelMistress's native models. A model is
-a small resident core plus whichever KMs a task needs: everything else stays on disk. The total knowledge available to
+A **Knowledge Module (KM)** is the unit of knowledge, skill and capability in ModelMistress's native models. KMs work
+**in parallel with a model's weights**, like skills, never instead of them: a model is its own (small, general) weights
+plus whichever KMs a task needs, and everything else stays on disk. How KMs are created, and how a model learns a
+KM's behaviour into its weights, is in `km-factory.md`. The total knowledge available to
 a model is bounded only by storage; the memory it uses is bounded by what the task loads.
 
 This document is normative. "Must" means a KM, or the runtime, that does otherwise is rejected.
@@ -44,6 +46,8 @@ KM version's **content id**. Because the manifest pins every file's hash, the co
 | `specialist` | a binding to a model the hub serves (speech, image, vision...) + its I/O schema | the core may call it as a tool/expert |
 | `projector` | a small network mapping a specialist's features into the core's embedding space | lets the core read images/audio |
 | `router` | router weights for one base (classifier over KM descriptors) | replaces the base's KM selector |
+| `skill` | instructions, examples and tool references (procedural knowledge) | its instructions join the context; its examples are a data KM |
+| `tool` | a binding to a tool the host already provides (hub operation or MCP tool): schema, model-facing description, examples, failure cases | the core may call that tool; never contains the tool's code |
 | `bundle` | a list of other KMs | loads/unloads them together |
 
 ## 4. Manifest (`km.toml`)
@@ -114,6 +118,11 @@ Kind-specific tables:
   already has; it cannot point at a program.
 - `projector`: `[projector] from = "<specialist KM id>"`, `feature_dim`, `tokens` (how many embedding slots it emits).
 - `bundle`: `members = ["id@range", ...]`.
+- `skill`: `[skill] instructions = "payload/SKILL.md"`, `examples = "<data KM id@range>"`, `tools = ["<tool KM id>"]`.
+- `tool`: `[tool] provider = "hub" | "mcp:<server>"`, `name`, `input_schema`, `output_schema`, `description`,
+  `examples = "payload/examples.jsonl"`, `side_effects = "none" | "read" | "write"`. Loading a tool KM never grants a
+  permission the host would not grant the caller anyway.
+- `[consolidation]` (any kind, per core): `state = "none" | "learning" | "absorbed"`, `uplift`, `last_step`, `steps`.
 
 Unknown keys are kept and ignored (forward compatibility). Missing optional keys take documented defaults.
 

@@ -10,6 +10,11 @@ ModelMistress has two models of its own. Both are cores that think, choose Knowl
 | Strength | useful from day one; strong reasoning and tool use | entirely MM's own; tiny and fast; grows with training |
 | Teachers | the specialists, the owner's data | Dusty, the specialists, open corpora, the owner's data |
 
+KMs work beside the weights, like skills: the weights stay light and general, KMs add knowledge on demand, and when a
+KM proves better than the weights at something the model slowly learns it into its weights (consolidation). The
+factory creates KMs with any model MM can run, in any format, on GPU or CPU, from tasks the owner or agents give it.
+See `km-factory.md`.
+
 Both use the same KM system, runtime, observability, training pipelines and autonomy settings. Everything below applies
 to both unless it says otherwise.
 
