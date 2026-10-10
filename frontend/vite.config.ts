@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import path from 'path'
 
 export default defineConfig({
+  base: './', // relative, so the same build works under the hub's /ui/ and inside the desktop app
   plugins: [vue()],
   resolve: {
     alias: {

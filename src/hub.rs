@@ -24,6 +24,9 @@
 //!   POST /v1/vision/detect          the same: objects with boxes
 //!   POST /v1/vision/embed           the same: an embedding vector of the picture
 //!
+//!   GET  /v1/native/...             traces, live stream, rerun and diff (owner only; see docs/native/observability.md)
+//!   GET  /ui/                       the dashboard (static files; its API calls need the owner's token)
+//!
 //! A peer key (see `hosting`) may use only the OpenAI routes above; the owner's token can do everything.
 //!
 //! Errors are {"error": {"code", "message"}} with a 4xx/5xx status (OpenAI clients read `message`).
@@ -204,6 +207,12 @@ fn op(id: &str, summary: &str, mutating: bool, destructive: bool, props: Value, 
 }
 
 pub fn operations() -> Vec<Value> {
+    let mut all = core_operations();
+    all.extend(crate::trace::api::operations());
+    all
+}
+
+fn core_operations() -> Vec<Value> {
     let model = json!({"type": "string", "description": "a model id from model.list, or ollama/<name>"});
     let load_props = json!({
         "model": model,
@@ -872,6 +881,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .map_err(|x| Fail::new(500, "io", x.to_string()))??;
             shown_settings(&new)
         }
+        id if id.starts_with("trace.") => crate::trace::api::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1507,8 +1517,17 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
 async fn chat(
     State(hub): State<Hub>,
     Extension(who): Extension<Caller>,
-    Json(body): Json<Value>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
 ) -> ApiResult<Response> {
+    // the owner's requests can be traced (src/trace); a peer's never are
+    let scope = crate::trace::capture::wants(&hub.engine.home, &headers, &mut body);
+    if let (Some(scope), true) = (scope, who.0.is_none()) {
+        match crate::trace::capture::chat(&hub, body, scope).await {
+            crate::trace::capture::Outcome::Handled(r) => return r.map_err(ApiError::from),
+            crate::trace::capture::Outcome::Skip(b) => body = b,
+        }
+    }
     passthrough(hub, who, "/v1/chat/completions", body).await
 }
 
@@ -1788,9 +1807,11 @@ pub fn router(hub: Hub) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
         )
+        .merge(crate::trace::api::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))
+        .merge(crate::trace::ui::routes())
         .merge(private)
         .with_state(hub)
 }

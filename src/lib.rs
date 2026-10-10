@@ -14,6 +14,7 @@ pub mod hosting;
 pub mod hub;
 pub mod image;
 pub mod pull;
+pub mod trace;
 pub mod speech;
 pub mod testing;
 pub mod tools;

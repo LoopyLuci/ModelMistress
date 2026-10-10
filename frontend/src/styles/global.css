@@ -1,4 +1,41 @@
-/* Simple CSS Reset */
+/* Design tokens: light by default, dark when the tab asks for it or the system does and nothing was chosen. */
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --panel-2: #f0f2f6;
+  --text: #1b1f27;
+  --muted: #667085;
+  --border: #dfe3ea;
+  --accent: #4338ca;
+  --accent-text: #ffffff;
+  --good: #15803d;
+  --warn: #b45309;
+  --bad: #b91c1c;
+  --ins: rgba(22, 163, 74, 0.2);
+  --del: rgba(220, 38, 38, 0.2);
+  --mono: ui-monospace, 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace;
+  --color-bg: var(--bg);
+  --color-text: var(--text);
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0e1016;
+  --panel: #171a23;
+  --panel-2: #1e222d;
+  --text: #e6e8ee;
+  --muted: #9aa3b5;
+  --border: #2a2f3c;
+  --accent: #8b8dff;
+  --accent-text: #0e1016;
+  --good: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --ins: rgba(74, 222, 128, 0.22);
+  --del: rgba(248, 113, 113, 0.22);
+  color-scheme: dark;
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
@@ -9,38 +46,60 @@ html, body, #app {
   height: 100%;
   width: 100%;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-  background: var(--color-bg);
-  color: var(--color-text);
+  font-size: 15px;
+  line-height: 1.45;
+  background: var(--bg);
+  color: var(--text);
 }
 
-*:focus {
-  outline: none;
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
 }
 
 button {
   cursor: pointer;
 }
 
-.router-view {
-  height: calc(100vh - 100px);
-  overflow-y: auto;
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
-/* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-}
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
-::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 4px;
+/* shared pieces of the Thoughts and Traces pages */
+.page { padding: 16px; max-width: 1200px; margin: 0 auto; }
+.page h2 { font-size: 1.15rem; margin-bottom: 12px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+.card > h3, .card > summary { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.card > h3 { margin-bottom: 8px; }
+.card > summary { cursor: pointer; }
+.card > summary + * { margin-top: 10px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 0.85em; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.grow { flex: 1 1 auto; }
+.btn {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; line-height: 1.2;
 }
-
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 4px;
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.btn.danger { color: var(--bad); }
+input[type='text'], input[type='number'], input[type='password'], select, textarea {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; min-width: 0;
 }
-
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+textarea { width: 100%; resize: vertical; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--border); background: var(--panel-2); }
+.pill.ok { color: var(--good); }
+.pill.error, .pill.aborted, .pill.interrupted { color: var(--bad); }
+.pill.running { color: var(--warn); }
+.error-box { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 0.9rem; }
+.kv dt { color: var(--muted); }
+@media (max-width: 640px) {
+  html, body, #app { font-size: 14px; }
+  .page { padding: 10px; }
 }

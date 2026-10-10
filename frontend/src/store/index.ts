@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { call, inTauri } from '@/transport'
 
 export const useStore = defineStore('modelMistress', () => {
   const models = ref<any[]>([])
@@ -11,19 +12,16 @@ export const useStore = defineStore('modelMistress', () => {
     autoSave: true
   })
   
-  // Everything goes through the desktop shell to ModelMistress's hub (src-tauri commands in desktop-app/src/main.rs).
-  const hub = (cmd: string, args: Record<string, unknown> = {}) => {
-    const tauri = (window as any).__TAURI__
-    if (!tauri) return Promise.reject('not running inside the ModelMistress desktop app')
-    return tauri.tauri.invoke(cmd, args)
-  }
-
+  // Everything goes through the transport: the desktop shell (desktop-app/src/main.rs commands), or fetch to the hub
+  // when this page is served by it (see ../transport.ts).
   const loadModels = async (refresh = false) => {
-    models.value = await hub('hub_models', { refresh })
+    models.value = inTauri()
+      ? await (window as any).__TAURI__.tauri.invoke('hub_models', { refresh })
+      : await call('model.list', { refresh })
   }
 
-  const callHub = (op: string, args: Record<string, unknown> = {}) => hub('hub_call', { op, args })
-  
+  const callHub = (op: string, args: Record<string, unknown> = {}) => call(op, args)
+
   const addAgent = (agent: any) => {
     agents.value.push(agent)
   }
