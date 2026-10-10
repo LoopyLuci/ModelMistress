@@ -2,7 +2,8 @@
 //! control API (ABP's module contract) for programs and agents.
 //!
 //! The working core is `catalog` (what models are on this machine), `engine` (llama.cpp processes, Ollama
-//! pass-through), `hub` (the HTTP server), `audio` and `speech` (speech to text) and `client` (the CLI's and MCP's
+//! pass-through), `hub` (the HTTP server), `audio` and `speech` (speech to text), `tts` (text to speech), `tools`
+//! (quantize, LoRA, draft models, embeddings, rerank) and `client` (the CLI's and MCP's
 //! way to a running hub).
 
 pub mod audio;
@@ -12,6 +13,8 @@ pub mod engine;
 pub mod hub;
 pub mod pull;
 pub mod speech;
+pub mod tools;
+pub mod tts;
 
 // ---- legacy -----------------------------------------------------------------------------------------------------
 // The first design's scaffolding, kept until it is either rebuilt on the core above or removed. Its CPU engine

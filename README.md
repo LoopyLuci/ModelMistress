@@ -13,12 +13,18 @@ runs on its own.
   belong to the hub: a Windows job object or Linux's parent-death signal stops them even if the hub is killed.
 - **Downloads models** from Hugging Face (`hf.co/<org>/<repo>:<quant>`) and from the Ollama library
   (`qwen3:8b`), with progress, resume and a SHA-256 check of every file. No Ollama or Python needed.
-- **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server` (Vulkan by
+- **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server`, `llama-quantize` and `llama-tts` (Vulkan by
   default) and needs nothing else installed but the GPU driver.
 - **Speech to text, built in.** With `--features whisper` it runs whisper.cpp itself: OpenAI's
   `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in; json, text, verbose_json, srt or vtt out)
   and `model-mistress transcribe talk.wav`. A whisper model is a `ggml-*.bin` file in a model folder
   ([docs/speech.md](docs/speech.md)).
+- **Text to speech, built in.** `POST /v1/audio/speech` (OpenAI's route; WAV or raw PCM out) and
+  `model-mistress speak "Hello" --out hello.wav` run llama.cpp's own `llama-tts`, built from the vendored llama.cpp
+  ([docs/text-to-speech.md](docs/text-to-speech.md)).
+- **llama.cpp's tools as operations.** `quantize` (a job with progress), LoRA adapters (`lora`), a draft model for
+  speculative decoding (`speculative`), embeddings and reranking served beside a chat model, all built from the
+  vendored llama.cpp; Hugging Face conversion needs Python and says so ([docs/tools.md](docs/tools.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 
@@ -58,11 +64,15 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `POST /v1/service/stop` | unload everything and stop |
 | `GET /v1/models` | OpenAI model list |
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI, streaming or not |
+| `POST /v1/rerank`, `/rerank` | reranking with a reranker model (llama-server's format) |
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI speech to text (feature `whisper`) |
+| `POST /v1/audio/speech` | OpenAI text to speech (JSON in; WAV or PCM out) |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
 `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
-`chat.complete`, `speech.transcribe`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
+`chat.complete`, `speech.transcribe`, `speech.synthesize`, `quantize`, `lora`, `speculative`, `embeddings.create`,
+`rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
+`config.set`.
 
 ## Development
 

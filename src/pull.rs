@@ -436,6 +436,19 @@ impl Job {
     pub fn status(&self) -> String {
         self.state.lock().0.clone()
     }
+    /// Has `job.cancel` been asked for?
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+    /// For a task: how far it is (`done` of `total` steps; job.get shows them as done_bytes and total_bytes) and a note.
+    pub fn progress(&self, done: u64, total: u64, note: impl Into<String>) {
+        self.done_bytes.store(done, Ordering::Relaxed);
+        self.total_bytes.store(total, Ordering::Relaxed);
+        let mut st = self.state.lock();
+        if st.0 == "running" {
+            st.1 = note.into();
+        }
+    }
     fn set(&self, status: &str, message: impl Into<String>, result: Option<Value>) {
         *self.state.lock() = (status.to_string(), message.into(), result);
     }
@@ -464,28 +477,65 @@ impl Jobs {
         }
     }
 
-    /// Starts a pull. A pull of the same model that is still running is returned instead of a second one.
-    pub fn start(self: &Arc<Self>, engine: Arc<Engine>, plan: Plan) -> Arc<Job> {
+    /// Registers a job; a running one with the same label is returned instead (as the error).
+    fn register(
+        self: &Arc<Self>,
+        kind: &str,
+        label: String,
+        source: &'static str,
+        total: u64,
+    ) -> std::result::Result<Arc<Job>, Arc<Job>> {
         let mut map = self.map.lock();
-        if let Some(j) = map.values().find(|j| j.model == plan.id && j.status() == "running") {
-            return j.clone();
+        if let Some(j) = map.values().find(|j| j.model == label && j.status() == "running") {
+            return Err(j.clone());
         }
         let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let job = Arc::new(Job {
-            id: format!("pull-{n}"),
-            model: plan.id.clone(),
-            source: plan.source,
+            id: format!("{kind}-{n}"),
+            model: label,
+            source,
             started: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             began: Instant::now(),
             done_bytes: AtomicU64::new(0),
-            total_bytes: AtomicU64::new(plan.total()),
+            total_bytes: AtomicU64::new(total),
             cancel: AtomicBool::new(false),
             state: Mutex::new(("running".into(), "starting".into(), None)),
         });
         map.insert(job.id.clone(), job.clone());
+        Ok(job)
+    }
+
+    /// Starts a task that is not a download (`quantize`): `work` gets the job to report progress on and to check
+    /// for cancelling, and its result becomes the job's. A running task with the same label is returned instead.
+    pub fn start_task<F, Fut>(self: &Arc<Self>, kind: &str, label: String, work: F) -> Arc<Job>
+    where
+        F: FnOnce(Arc<Job>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+    {
+        let job = match self.register(kind, label, "task", 0) {
+            Ok(j) => j,
+            Err(running) => return running,
+        };
+        let j = job.clone();
+        tokio::spawn(async move {
+            match work(j.clone()).await {
+                Ok(v) => j.set("done", "finished", Some(v)),
+                Err(f) if f.code == "cancelled" => j.set("cancelled", f.message, None),
+                Err(f) => j.set("failed", f.message, None),
+            }
+        });
+        job
+    }
+
+    /// Starts a pull. A pull of the same model that is still running is returned instead of a second one.
+    pub fn start(self: &Arc<Self>, engine: Arc<Engine>, plan: Plan) -> Arc<Job> {
+        let job = match self.register("pull", plan.id.clone(), plan.source, plan.total()) {
+            Ok(j) => j,
+            Err(running) => return running,
+        };
         let j = job.clone();
         tokio::spawn(async move {
             match run(&engine, &plan, &j).await {
@@ -944,5 +994,67 @@ mod tests {
         assert_eq!(done["removed"].as_array().unwrap().len(), 2); // the model and its projector
         assert!(!snap.join("M-Q4_K_M.gguf").exists());
         assert!(e.catalog().iter().all(|m| m.id != "org/M-GGUF:M-Q4_K_M"));
+    }
+
+    #[tokio::test]
+    async fn tasks_report_progress_and_finish() {
+        let jobs = Arc::new(Jobs::default());
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let job = jobs.start_task("quantize", "out.gguf".into(), |j| async move {
+            j.progress(3, 10, "tensor 3 of 10");
+            let _ = wait.await;
+            Ok(json!({"output": "out.gguf"}))
+        });
+        assert!(job.id.starts_with("quantize-"));
+        while job.describe()["done_bytes"] != 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let d = job.describe();
+        assert_eq!(
+            (d["status"].as_str(), d["percent"].as_f64(), d["message"].as_str()),
+            (Some("running"), Some(30.0), Some("tensor 3 of 10"))
+        );
+        // the same label while it runs is the same job
+        let again = jobs.start_task("quantize", "out.gguf".into(), |_| async { Ok(json!(null)) });
+        assert_eq!(again.id, job.id);
+        go.send(()).unwrap();
+        while job.status() == "running" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let d = job.describe();
+        assert_eq!(
+            (d["status"].as_str(), d["result"]["output"].as_str()),
+            (Some("done"), Some("out.gguf"))
+        );
+        assert_eq!(jobs.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tasks_can_be_cancelled_and_can_fail() {
+        let jobs = Arc::new(Jobs::default());
+        let job = jobs.start_task("quantize", "a".into(), |j| async move {
+            while !j.cancelled() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(Fail::new(409, "cancelled", "stopped"))
+        });
+        assert!(jobs.cancel(&job.id));
+        while job.status() == "running" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(job.status(), "cancelled");
+        assert!(!jobs.cancel(&job.id), "a finished job cannot be cancelled");
+        let bad = jobs.start_task("quantize", "a".into(), |_| async {
+            Err(Fail::new(500, "tool_failed", "boom"))
+        });
+        assert_ne!(bad.id, job.id, "the label is free once the job is over");
+        while bad.status() == "running" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let d = bad.describe();
+        assert_eq!(
+            (d["status"].as_str(), d["message"].as_str()),
+            (Some("failed"), Some("boom"))
+        );
     }
 }

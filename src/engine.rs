@@ -87,6 +87,11 @@ pub struct Settings {
     /// The whisper model (`base.en` for `ggml-base.en.bin`) that speech to text uses when a request names none or
     /// says `whisper-1`. Unset: the only whisper model found, else the first of small, base, tiny.
     pub whisper_model: Option<String>,
+    /// The speech model (a model id; it needs its `mmproj*.gguf` beside it) that text to speech uses when a request
+    /// names none or says `tts-1`. Unset: the only speech model found.
+    pub tts_model: Option<String>,
+    /// The voice (a recording in `<home>/voices`, or a full path) used when a request names none or an OpenAI voice.
+    pub tts_voice: Option<String>,
 }
 
 impl Default for Settings {
@@ -109,6 +114,8 @@ impl Default for Settings {
             download_dir: None,
             hf_token: None,
             whisper_model: None,
+            tts_model: None,
+            tts_voice: None,
         }
     }
 }
@@ -141,8 +148,75 @@ pub struct LoadOpts {
     /// Serve /v1/embeddings (llama.cpp then serves embeddings only).
     #[serde(default)]
     pub embeddings: bool,
+    /// Serve /v1/rerank (llama.cpp then serves reranking only; the model must be a reranker).
+    #[serde(default)]
+    pub reranking: bool,
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+/// A LoRA adapter attached to a model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Lora {
+    pub path: PathBuf,
+    pub scale: f32,
+}
+
+/// A draft model for speculative decoding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Draft {
+    pub path: PathBuf,
+    pub n_max: Option<u32>,
+    pub n_min: Option<u32>,
+    pub gpu_layers: Option<i32>,
+}
+
+/// What a model is loaded with besides its [`LoadOpts`]: kept per model in `<home>/model_options.json`, so it
+/// survives an unload (autoload) and a restart.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Extras {
+    #[serde(default)]
+    pub lora: Vec<Lora>,
+    #[serde(default)]
+    pub draft: Option<Draft>,
+}
+
+/// llama-server arguments for LoRA adapters. They are loaded without being applied (`--lora-init-without-apply`);
+/// the scales are set through the server's /lora-adapters API once it is up, which is also how a scale changes later.
+pub fn lora_args(lora: &[Lora]) -> Vec<String> {
+    if lora.is_empty() {
+        return vec![];
+    }
+    let mut a = vec!["--lora-init-without-apply".to_string()];
+    for l in lora {
+        a.extend(["--lora".into(), l.path.display().to_string()]);
+    }
+    a
+}
+
+/// llama-server arguments for a draft model.
+pub fn draft_args(d: &Draft, default_gpu_layers: i32) -> Vec<String> {
+    let mut a = vec!["--spec-draft-model".to_string(), d.path.display().to_string()];
+    if let Some(n) = d.n_max {
+        a.extend(["--spec-draft-n-max".into(), n.to_string()]);
+    }
+    if let Some(n) = d.n_min {
+        a.extend(["--spec-draft-n-min".into(), n.to_string()]);
+    }
+    a.extend([
+        "--spec-draft-ngl".into(),
+        d.gpu_layers.unwrap_or(default_gpu_layers).to_string(),
+    ]);
+    a
+}
+
+/// The body of POST /lora-adapters: every adapter by its position, with its scale.
+pub fn lora_scales(lora: &[Lora]) -> Value {
+    json!(lora
+        .iter()
+        .enumerate()
+        .map(|(i, l)| json!({"id": i, "scale": l.scale}))
+        .collect::<Vec<_>>())
 }
 
 pub struct Instance {
@@ -155,6 +229,9 @@ pub struct Instance {
     pub args: Vec<String>,
     pub log: PathBuf,
     pub embeddings: bool,
+    pub reranking: bool,
+    pub opts: LoadOpts,
+    pub extras: Extras,
     last_used: AtomicU64,
 }
 
@@ -168,7 +245,8 @@ impl Instance {
     pub fn describe(&self) -> Value {
         json!({"model": self.model, "backend": "llama.cpp", "pid": self.pid, "port": self.port,
                "uptime_s": self.started.elapsed().as_secs(), "idle_s": self.idle_s(),
-               "embeddings": self.embeddings, "args": self.args, "log": self.log})
+               "embeddings": self.embeddings, "reranking": self.reranking, "args": self.args, "log": self.log,
+               "lora": self.extras.lora, "draft": self.extras.draft})
     }
     fn stop(&self) {
         if let Some(mut c) = self.child.lock().take() {
@@ -205,6 +283,10 @@ pub struct Engine {
     llama_version: Mutex<Option<(PathBuf, String)>>,
     /// The llama-server built into this binary (feature `bundled-engine`), once written to disk.
     bundled: Option<PathBuf>,
+    /// LoRA adapters and draft models per model id (see [`Extras`]).
+    extras: Mutex<HashMap<String, Extras>>,
+    /// The llama.cpp tools (llama-tts, llama-quantize) that take the machine's memory run one at a time per kind.
+    pub tool_lock: tokio::sync::Mutex<()>,
     #[cfg(windows)]
     job: Option<job::Job>,
 }
@@ -238,6 +320,8 @@ impl Engine {
                 .unwrap_or_default(),
             llama_version: Mutex::new(None),
             bundled: bundled::install(&home),
+            extras: Mutex::new(load_extras(&home)),
+            tool_lock: tokio::sync::Mutex::new(()),
             home,
             #[cfg(windows)]
             job: job::Job::new(),
@@ -358,6 +442,157 @@ impl Engine {
         Some(v)
     }
 
+    /// A llama.cpp program that is built with llama-server and lives beside it (`llama-quantize`, `llama-tts`).
+    pub fn tool(&self, name: &str) -> Option<PathBuf> {
+        let p = self.llama_server()?.with_file_name(exe(name));
+        p.is_file().then_some(p)
+    }
+
+    /// Runs one of those programs to the end. Every line it prints (the tools log to stderr) goes to `on_line`, which
+    /// returns false to cancel. Fails with 501 when the program is missing, 504 after `timeout`, 500 when it exits
+    /// with an error (the last lines of its output are in the message).
+    pub async fn run_tool(
+        &self,
+        name: &str,
+        args: &[String],
+        timeout: Duration,
+        on_line: &mut (dyn FnMut(&str) -> bool + Send),
+    ) -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+        let exe = self.tool(name).ok_or_else(|| {
+            Fail::new(
+                501,
+                "not_implemented",
+                format!(
+                    "{name} was not found: build ModelMistress with the bundled-engine feature, or put {name} next to                      llama-server"
+                ),
+            )
+        })?;
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        no_window(&mut cmd);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| Fail::unavailable(format!("cannot start {}: {e}", exe.display())))?;
+        #[cfg(windows)]
+        if let (Some(job), Some(h)) = (&self.job, child.raw_handle()) {
+            job.assign(h);
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        fn pump<R: AsyncRead + Unpin + Send + 'static>(r: R, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+            tokio::spawn(async move {
+                let mut r = BufReader::new(r);
+                let mut buf = Vec::new();
+                while let Ok(n) = r.read_until(b'\n', &mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = tx.send(String::from_utf8_lossy(&buf).trim_end().to_string());
+                    buf.clear();
+                }
+            });
+        }
+        if let Some(o) = child.stdout.take() {
+            pump(o, tx.clone());
+        }
+        if let Some(e) = child.stderr.take() {
+            pump(e, tx.clone());
+        }
+        drop(tx);
+        let mut tail: std::collections::VecDeque<String> = Default::default();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            tokio::select! {
+                line = rx.recv() => match line {
+                    Some(l) => {
+                        if tail.len() >= 15 {
+                            tail.pop_front();
+                        }
+                        tail.push_back(l.clone());
+                        if !on_line(&l) {
+                            let _ = child.kill().await;
+                            return Err(Fail::new(409, "cancelled", format!("{name} was cancelled")));
+                        }
+                    }
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = child.kill().await;
+                    return Err(Fail::new(504, "timeout", format!("{name} took more than {} s", timeout.as_secs())));
+                }
+            }
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| Fail::new(500, "io", format!("{name}: {e}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Fail::new(
+                500,
+                "tool_failed",
+                format!(
+                    "{name} failed ({status}):\n{}",
+                    tail.into_iter().collect::<Vec<_>>().join("\n")
+                ),
+            ))
+        }
+    }
+
+    /// The LoRA adapters and draft model a model is loaded with.
+    pub fn extras(&self, id: &str) -> Extras {
+        self.extras.lock().get(id).cloned().unwrap_or_default()
+    }
+
+    pub fn set_extras(&self, id: &str, x: Extras) -> Result<()> {
+        let mut all = self.extras.lock();
+        if x == Extras::default() {
+            all.remove(id);
+        } else {
+            all.insert(id.to_string(), x);
+        }
+        let path = self.home.join("model_options.json");
+        let text = serde_json::to_vec_pretty(&*all).map_err(|e| Fail::new(500, "io", e.to_string()))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text)
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .map_err(|e| Fail::new(500, "io", format!("{}: {e}", path.display())))
+    }
+
+    /// Saves new LoRA adapters / draft model for a model and, if it is loaded, loads it again with them (same
+    /// options otherwise). Returns whether it was reloaded. If the new setup does not load, the old one is
+    /// restored (and the model loaded again) and the error returned.
+    pub async fn change_extras(&self, entry: &ModelEntry, new: Extras) -> Result<bool> {
+        let old = self.extras(&entry.id);
+        let was = self.loaded.lock().get(&entry.id).map(|i| i.opts.clone());
+        self.set_extras(&entry.id, new)?;
+        let Some(opts) = was else { return Ok(false) };
+        self.unload(&entry.id);
+        match self.ensure_loaded(entry, &opts, true).await {
+            Ok(_) => Ok(true),
+            Err(f) => {
+                let _ = self.set_extras(&entry.id, old);
+                let _ = self.ensure_loaded(entry, &opts, true).await;
+                Err(f)
+            }
+        }
+    }
+
     // ---- resolving names ----------------------------------------------------------------------------------
 
     pub fn resolve(&self, name: &str) -> Result<Target> {
@@ -407,7 +642,7 @@ impl Engine {
 
     pub async fn ensure_loaded(&self, entry: &ModelEntry, opts: &LoadOpts, explicit: bool) -> Result<Arc<Instance>> {
         if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
-            if !(explicit && opts.embeddings != i.embeddings) {
+            if !(explicit && (opts.embeddings != i.embeddings || opts.reranking != i.reranking)) {
                 i.touch();
                 return Ok(i);
             }
@@ -421,7 +656,7 @@ impl Engine {
         }
         let _guard = self.load_lock.lock().await;
         if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
-            if !(explicit && opts.embeddings != i.embeddings) {
+            if !(explicit && (opts.embeddings != i.embeddings || opts.reranking != i.reranking)) {
                 return Ok(i);
             }
         }
@@ -505,10 +740,19 @@ impl Engine {
         if let Some(t) = opts.threads {
             args.extend(["-t".into(), t.to_string()]);
         }
-        if opts.embeddings {
+        let extras = self.extras(&entry.id);
+        if opts.reranking {
+            args.push("--reranking".into());
+        } else if opts.embeddings {
             args.push("--embeddings".into());
-        } else if let Some(p) = &entry.mmproj {
-            args.extend(["--mmproj".into(), p.display().to_string()]);
+        } else {
+            if let Some(p) = &entry.mmproj {
+                args.extend(["--mmproj".into(), p.display().to_string()]);
+            }
+            args.extend(lora_args(&extras.lora));
+            if let Some(d) = &extras.draft {
+                args.extend(draft_args(d, s.gpu_layers));
+            }
         }
         args.extend(s.extra_args.iter().cloned());
         args.extend(opts.extra_args.iter().cloned());
@@ -555,6 +799,13 @@ impl Engine {
             args,
             log: log.clone(),
             embeddings: opts.embeddings,
+            reranking: opts.reranking,
+            opts: opts.clone(),
+            extras: if opts.embeddings || opts.reranking {
+                Extras::default()
+            } else {
+                extras
+            },
             last_used: AtomicU64::new(now_s()),
         };
         // Wait until it answers /health with 200 (it answers 503 while loading).
@@ -575,6 +826,10 @@ impl Engine {
             }
             if let Ok(r) = self.http.get(&url).timeout(Duration::from_secs(2)).send().await {
                 if r.status().is_success() {
+                    if let Err(f) = self.apply_lora(&inst).await {
+                        inst.stop();
+                        return Err(f);
+                    }
                     return Ok(inst);
                 }
             }
@@ -593,6 +848,49 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+
+    /// Sets the scales of the LoRA adapters a server was started with (they start switched off).
+    async fn apply_lora(&self, inst: &Instance) -> Result<()> {
+        if inst.extras.lora.is_empty() {
+            return Ok(());
+        }
+        self.lora_post(inst, &inst.extras.lora).await
+    }
+
+    /// POST /lora-adapters: set the scale of each adapter the server holds.
+    pub async fn lora_post(&self, inst: &Instance, lora: &[Lora]) -> Result<()> {
+        let r = self
+            .http
+            .post(format!("http://127.0.0.1:{}/lora-adapters", inst.port))
+            .bearer_auth(&inst.key)
+            .json(&lora_scales(lora))
+            .send()
+            .await
+            .map_err(|e| Fail::unavailable(format!("{} did not answer: {e}", inst.model)))?;
+        if r.status().is_success() {
+            return Ok(());
+        }
+        let text = r.text().await.unwrap_or_default();
+        Err(Fail::new(
+            500,
+            "lora_failed",
+            format!("{} refused the LoRA scales: {text}", inst.model),
+        ))
+    }
+
+    /// GET /lora-adapters of a loaded model: [{id, path, scale}].
+    pub async fn lora_get(&self, inst: &Instance) -> Result<Value> {
+        let r = self
+            .http
+            .get(format!("http://127.0.0.1:{}/lora-adapters", inst.port))
+            .bearer_auth(&inst.key)
+            .send()
+            .await
+            .map_err(|e| Fail::unavailable(format!("{} did not answer: {e}", inst.model)))?;
+        r.json()
+            .await
+            .map_err(|e| Fail::new(502, "backend_error", e.to_string()))
     }
 
     /// Drop instances whose process has exited, and unload idle ones.
@@ -625,15 +923,22 @@ impl Engine {
             Target::Llama(entry) => {
                 let opts = LoadOpts {
                     embeddings: path.ends_with("/embeddings"),
+                    reranking: path.ends_with("/rerank"),
                     ..Default::default()
                 };
                 let inst = self.ensure_loaded(&entry, &opts, false).await?;
-                if path.ends_with("/embeddings") && !inst.embeddings {
+                let (want, have) = ((opts.embeddings, opts.reranking), (inst.embeddings, inst.reranking));
+                if want != (false, false) && want != have {
+                    let (what, flag) = if opts.reranking {
+                        ("rerank", "reranking")
+                    } else {
+                        ("embed", "embeddings")
+                    };
                     return Err(Fail::new(
                         409,
                         "wrong_mode",
                         format!(
-                            "{} is loaded for chat; load it with embeddings: true to embed",
+                            "{} is loaded for another use; load it with {flag}: true to {what}",
                             entry.id
                         ),
                     ));
@@ -753,6 +1058,13 @@ impl Drop for Engine {
     }
 }
 
+fn load_extras(home: &Path) -> HashMap<String, Extras> {
+    std::fs::read(home.join("model_options.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
@@ -777,7 +1089,7 @@ pub fn tail(path: &Path, lines: usize) -> String {
     v[v.len().saturating_sub(lines)..].join("\n")
 }
 
-fn no_window(cmd: &mut tokio::process::Command) {
+pub(crate) fn no_window(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
@@ -796,6 +1108,8 @@ pub mod bundled {
     const FILES: &[(&str, &[u8])] = &[
         ("llama-server", include_bytes!(env!("MM_BUNDLED_SERVER"))),
         ("llama-bench", include_bytes!(env!("MM_BUNDLED_BENCH"))),
+        ("llama-quantize", include_bytes!(env!("MM_BUNDLED_QUANTIZE"))),
+        ("llama-tts", include_bytes!(env!("MM_BUNDLED_TTS"))),
     ];
     #[cfg(not(feature = "bundled-engine"))]
     const FILES: &[(&str, &[u8])] = &[];
@@ -937,5 +1251,154 @@ mod tests {
         assert_eq!(id(""), "err invalid");
         assert_eq!(id("ollama/x"), "err unavailable"); // passing to Ollama is off here
         assert_eq!(safe_name("unsloth/Qwen:Q4"), "unsloth_Qwen_Q4");
+    }
+
+    #[test]
+    fn llama_server_arguments_for_lora_and_draft_models() {
+        assert!(lora_args(&[]).is_empty());
+        let lora = [
+            Lora {
+                path: PathBuf::from("a.gguf"),
+                scale: 0.5,
+            },
+            Lora {
+                path: PathBuf::from("b.gguf"),
+                scale: 1.0,
+            },
+        ];
+        assert_eq!(
+            lora_args(&lora),
+            ["--lora-init-without-apply", "--lora", "a.gguf", "--lora", "b.gguf"]
+        );
+        // the scales go in by position, through the server's API
+        assert_eq!(
+            lora_scales(&lora),
+            json!([{"id": 0, "scale": 0.5}, {"id": 1, "scale": 1.0}])
+        );
+        let d = Draft {
+            path: PathBuf::from("d.gguf"),
+            n_max: Some(16),
+            n_min: None,
+            gpu_layers: None,
+        };
+        assert_eq!(
+            draft_args(&d, 99),
+            [
+                "--spec-draft-model",
+                "d.gguf",
+                "--spec-draft-n-max",
+                "16",
+                "--spec-draft-ngl",
+                "99"
+            ]
+        );
+        let d = Draft {
+            n_min: Some(2),
+            gpu_layers: Some(0),
+            n_max: None,
+            ..d
+        };
+        assert_eq!(
+            draft_args(&d, 99),
+            [
+                "--spec-draft-model",
+                "d.gguf",
+                "--spec-draft-n-min",
+                "2",
+                "--spec-draft-ngl",
+                "0"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn extras_are_saved_and_a_missing_tool_is_501() {
+        let d = std::env::temp_dir().join(format!("mm-extras-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let settings = Settings {
+            llama_server: Some(d.join("no-such-llama-server")),
+            ollama_url: String::new(),
+            ..Default::default()
+        };
+        let e = Engine::new(d.clone(), settings.clone());
+        assert_eq!(e.extras("m"), Extras::default());
+        let x = Extras {
+            lora: vec![Lora {
+                path: PathBuf::from("a.gguf"),
+                scale: 0.25,
+            }],
+            draft: Some(Draft {
+                path: PathBuf::from("d.gguf"),
+                n_max: Some(4),
+                n_min: None,
+                gpu_layers: Some(-1),
+            }),
+        };
+        e.set_extras("m", x.clone()).unwrap();
+        drop(e);
+        let e = Engine::new(d.clone(), settings);
+        assert_eq!(e.extras("m"), x);
+        e.set_extras("m", Extras::default()).unwrap();
+        assert_eq!(
+            Engine::new(d.clone(), Settings::default()).extras("m"),
+            Extras::default()
+        );
+        // no llama-server, so no tools beside it
+        assert!(e.tool("llama-quantize").is_none());
+        let f = e
+            .run_tool("llama-quantize", &[], Duration::from_secs(5), &mut |_| true)
+            .await
+            .unwrap_err();
+        assert!(f.status == 501 && f.message.contains("llama-quantize"), "{}", f.message);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Runs the real llama-quantize that is built in: a failure carries the program's own words, and a cancel kills it.
+    #[cfg(feature = "bundled-engine")]
+    #[tokio::test]
+    async fn running_the_built_in_tools() {
+        let d = std::env::temp_dir().join(format!("mm-tool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let e = Engine::new(
+            d.clone(),
+            Settings {
+                ollama_url: String::new(),
+                ..Default::default()
+            },
+        );
+        assert!(e.tool("llama-quantize").is_some() && e.tool("llama-tts").is_some());
+        let mut lines = vec![];
+        let args = vec!["--no-such-option".to_string()];
+        let f = e
+            .run_tool("llama-quantize", &args, Duration::from_secs(60), &mut |l| {
+                lines.push(l.to_string());
+                true
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            f.status == 500 && f.code == "tool_failed" && f.message.contains("llama-quantize failed"),
+            "{}",
+            f.message
+        );
+        assert!(!lines.is_empty());
+        // the first line of output cancels it
+        let f = e
+            .run_tool("llama-quantize", &args, Duration::from_secs(60), &mut |_| false)
+            .await
+            .unwrap_err();
+        assert_eq!(f.code, "cancelled");
+        // llama-tts without a model says what is missing
+        let f = e
+            .run_tool("llama-tts", &[], Duration::from_secs(60), &mut |_| true)
+            .await
+            .unwrap_err();
+        assert!(
+            f.message.contains("prompt") || f.message.contains("failed"),
+            "{}",
+            f.message
+        );
+        e.unload_all();
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

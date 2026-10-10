@@ -87,6 +87,69 @@ enum Cmd {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Text to speech with llama.cpp's llama-tts: `speak "Hello there" --out hello.wav [--model M] [--voice V]`.
+    Speak {
+        text: String,
+        /// Where to write the audio (WAV, or raw PCM with --format pcm).
+        #[arg(long, short, default_value = "speech.wav")]
+        out: PathBuf,
+        /// A speech model (default: the tts_model setting, else the only one found).
+        #[arg(long)]
+        model: Option<String>,
+        /// A recording in <home>/voices (name without extension) or the path of one.
+        #[arg(long)]
+        voice: Option<String>,
+        /// 0.25 to 4; 1 is normal speed.
+        #[arg(long)]
+        speed: Option<f64>,
+        /// ISO-639-1 code, for models that take one.
+        #[arg(long)]
+        language: Option<String>,
+        /// wav or pcm.
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Make a smaller copy of a model with llama-quantize: `quantize llama3.2:1b Q4_K_M`, or a .gguf file's path.
+    Quantize {
+        /// A model id from `models`, or the path of a .gguf file.
+        model: String,
+        /// Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ4_XS, F16, ...
+        r#type: String,
+        /// Where to write it (default: <home>/models/<name>-<TYPE>.gguf).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// The model is already quantized.
+        #[arg(long)]
+        allow_requantize: bool,
+        /// Replace the output file if it exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// An importance matrix file.
+        #[arg(long)]
+        imatrix: Option<PathBuf>,
+    },
+    /// LoRA adapters of a model: `lora <model>` lists, `lora <model> attach a.gguf [--scale 0.8]`, `detach [a]`,
+    /// `scale a 0.5`.
+    Lora {
+        model: String,
+        /// list, attach, detach or scale.
+        action: Option<String>,
+        adapter: Option<String>,
+        /// The adapter's strength (attach: default 1; scale: the new value).
+        #[arg(long)]
+        scale: Option<f64>,
+    },
+    /// A draft model for speculative decoding: `draft <model> <draft model>`, `draft <model> --off`, `draft <model>`
+    /// shows it.
+    Draft {
+        model: String,
+        draft_model: Option<String>,
+        #[arg(long)]
+        off: bool,
+        /// The most tokens drafted at a time.
+        #[arg(long)]
+        n_max: Option<u32>,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
 }
@@ -259,6 +322,124 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             }
             let v = client().await?.call("speech.transcribe", a).await?;
             print!("{}", v["rendered"].as_str().unwrap_or(""));
+        }
+        Cmd::Speak {
+            text,
+            out,
+            model,
+            voice,
+            speed,
+            language,
+            format,
+        } => {
+            // The hub writes the file, and its working folder is not ours.
+            let out = std::path::absolute(&out)?;
+            let mut a = json!({"input": text, "output": out});
+            for (k, v) in [
+                ("model", model),
+                ("voice", voice),
+                ("language", language),
+                ("response_format", format),
+            ] {
+                if let Some(v) = v {
+                    a[k] = json!(v);
+                }
+            }
+            if let Some(v) = speed {
+                a["speed"] = json!(v);
+            }
+            let v = client().await?.call("speech.synthesize", a).await?;
+            println!("{}", v["output"].as_str().unwrap_or(""));
+            eprintln!(
+                "[{} | {} s of audio | {} bytes]",
+                v["model"].as_str().unwrap_or(""),
+                v["seconds"],
+                v["bytes"]
+            );
+        }
+        Cmd::Quantize {
+            model,
+            r#type,
+            out,
+            allow_requantize,
+            overwrite,
+            imatrix,
+        } => {
+            let c = client().await?;
+            let mut a = json!({"type": r#type, "allow_requantize": allow_requantize, "overwrite": overwrite});
+            // a file path is the input; anything else is a model id
+            if std::path::Path::new(&model).is_file() {
+                a["input"] = json!(std::path::absolute(&model)?);
+            } else {
+                a["model"] = json!(model);
+            }
+            if let Some(o) = out {
+                a["output"] = json!(std::path::absolute(&o)?);
+            }
+            if let Some(i) = imatrix {
+                a["imatrix"] = json!(std::path::absolute(&i)?);
+            }
+            let job = c.call("quantize", a).await?;
+            let id = job["job"].as_str().unwrap_or("").to_string();
+            loop {
+                let j = c.call("job.get", json!({"job": id})).await?;
+                let status = j["status"].as_str().unwrap_or("");
+                eprint!(
+                    "\r{:>5.1}%  {}          ",
+                    j["percent"].as_f64().unwrap_or(0.0),
+                    j["message"].as_str().unwrap_or("")
+                );
+                if status != "running" {
+                    eprintln!();
+                    if status != "done" {
+                        anyhow::bail!("{status}: {}", j["message"].as_str().unwrap_or(""));
+                    }
+                    println!("{}", j["result"]["output"].as_str().unwrap_or(""));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        Cmd::Lora {
+            model,
+            action,
+            adapter,
+            scale,
+        } => {
+            let mut a = json!({"model": model, "action": action.unwrap_or_else(|| "list".into())});
+            if let Some(ad) = adapter {
+                // a file on this machine is given to the hub by its full path
+                let p = std::path::Path::new(&ad);
+                a["adapter"] = if p.is_file() {
+                    json!(std::path::absolute(p)?)
+                } else {
+                    json!(ad)
+                };
+            }
+            if let Some(s) = scale {
+                a["scale"] = json!(s);
+            }
+            show(&client().await?.call("lora", a).await?);
+        }
+        Cmd::Draft {
+            model,
+            draft_model,
+            off,
+            n_max,
+        } => {
+            let mut a = json!({"model": model, "off": off});
+            if let Some(d) = draft_model {
+                let p = std::path::Path::new(&d);
+                a["draft_model"] = if p.is_file() {
+                    json!(std::path::absolute(p)?)
+                } else {
+                    json!(d)
+                };
+            }
+            if let Some(n) = n_max {
+                a["n_max"] = json!(n);
+            }
+            show(&client().await?.call("speculative", a).await?);
         }
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }

@@ -32,13 +32,21 @@ Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in lla
 Tested on Windows 10 (CPU) with `ggml-base.en.bin` and a synthesized WAV: transcript, verbose_json, srt, vtt and
 the CLI. Not tested: MP3 input, multilingual models, GPU builds.
 
+## llama.cpp's tools and text to speech
+
+`quantize` (a job), `lora`, `speculative`, `embeddings.create`, `rerank.run`, `speech.synthesize` and
+`POST /v1/audio/speech` ([tools.md](tools.md), [text-to-speech.md](text-to-speech.md)). Tested on Windows 10 (CPU
+build of the built-in llama.cpp): quantize of a real GGUF, embeddings with nomic-embed-text, a LoRA adapter attached,
+scaled and detached on a running model, and a draft model, all end to end. Not tested: reranking (no reranker model
+on the machine) and speech (no model that the pinned `llama-tts` runs: it now takes a model plus an `mmproj`, such
+as Qwen3-TTS, not OuteTTS). `model.convert` answers 501: Hugging Face conversion needs Python and PyTorch.
+
 ## Not done yet
 
-- Embeddings are served only by a model loaded with `embeddings: true` (llama.cpp then serves embeddings only).
+- A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
 - Hosting for other machines (per-peer keys, quotas): `serve --host` exposes the token-protected API, and that is all.
-- Other engines (vLLM, ExLlama); text to speech and image generation (stable-diffusion.cpp).
-- llama.cpp's other tools as operations: quantize, convert from Hugging Face weights, LoRA adapters, speculative
-  decoding, reranking.
+- Other engines (vLLM, ExLlama); image generation (stable-diffusion.cpp).
+- Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
 - The desktop app (`desktop-app/`, Tauri) still talks to Ollama directly, not to the hub.
 

@@ -1,5 +1,6 @@
 //! With the `bundled-engine` feature, builds llama.cpp (engines/llama.cpp, a pinned submodule) and embeds its
-//! `llama-server` and `llama-bench` in the model-mistress binary, so ModelMistress needs nothing else installed.
+//! `llama-server`, `llama-bench`, `llama-quantize` and `llama-tts` in the model-mistress binary, so ModelMistress
+//! needs nothing else installed.
 //! At run time they are written once to `<home>/engines/bundled/<hash>/` (see engine.rs).
 //!
 //! Building needs CMake and a C++ compiler; the GPU backend is Vulkan unless MM_GGML_BACKEND says otherwise
@@ -23,7 +24,13 @@ fn main() {
             src.display()
         );
     }
-    for f in ["CMakeLists.txt", "ggml/CMakeLists.txt", "tools/server/CMakeLists.txt"] {
+    for f in [
+        "CMakeLists.txt",
+        "ggml/CMakeLists.txt",
+        "tools/server/CMakeLists.txt",
+        "tools/quantize/CMakeLists.txt",
+        "tools/tts/CMakeLists.txt",
+    ] {
         println!("cargo:rerun-if-changed={}", src.join(f).display());
     }
     for v in ["MM_GGML_BACKEND", "MM_CMAKE_GENERATOR", "MM_CMAKE_ARGS", "VULKAN_SDK"] {
@@ -103,6 +110,8 @@ fn main() {
             "--target",
             "llama-server",
             "llama-bench",
+            "llama-quantize",
+            "llama-tts",
         ]),
         "build llama.cpp",
     );
@@ -110,6 +119,8 @@ fn main() {
     for (name, var) in [
         ("llama-server", "MM_BUNDLED_SERVER"),
         ("llama-bench", "MM_BUNDLED_BENCH"),
+        ("llama-quantize", "MM_BUNDLED_QUANTIZE"),
+        ("llama-tts", "MM_BUNDLED_TTS"),
     ] {
         let exe = find_exe(&build, name).unwrap_or_else(|| panic!("bundled-engine: {name} was not built"));
         println!("cargo:rustc-env={var}={}", exe.display());
