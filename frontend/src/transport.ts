@@ -52,7 +52,9 @@ async function failure(r: Response): Promise<Error> {
   } catch (_) {
     /* not JSON */
   }
-  return new Error(msg)
+  const e: any = new Error(msg)
+  e.status = r.status // pages tell "this operation does not exist here" (404) from a real failure
+  return e
 }
 
 /** Run one hub operation (the same names MCP and POST /v1/call/{op} use). */

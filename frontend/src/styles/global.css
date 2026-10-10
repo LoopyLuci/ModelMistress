@@ -103,3 +103,38 @@ textarea { width: 100%; resize: vertical; }
   html, body, #app { font-size: 14px; }
   .page { padding: 10px; }
 }
+
+/* shared pieces of the Knowledge, Data and Factory pages */
+.small { font-size: 0.8rem; }
+.bar { margin-bottom: 10px; }
+.tablewrap { overflow-x: auto; }
+table.t { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+table.t th, table.t td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.t th { color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+table.t tbody tr:hover { background: var(--panel-2); }
+table.t tr.sel { background: var(--panel-2); }
+table.t .num, .terms .num { text-align: right; font-variant-numeric: tabular-nums; }
+.terms { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.terms th, .terms td { padding: 3px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+.terms th { color: var(--muted); font-weight: 600; }
+.pill.good, .pill.approved, .pill.resident, .pill.pinned, .pill.done, .pill.verified { color: var(--good); }
+.pill.warn, .pill.pending, .pill.refuse, .pill.gated { color: var(--warn); }
+.pill.bad, .pill.rejected, .pill.banned, .pill.failed, .pill.cancelled, .pill.evict { color: var(--bad); }
+.field { display: flex; flex-direction: column; gap: 3px; font-size: 0.85rem; color: var(--muted); }
+.field > input, .field > select, .field > textarea { color: var(--text); font-size: 0.95rem; }
+.formgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.difftext { font-family: var(--mono); font-size: 0.82rem; white-space: pre-wrap; word-break: break-word; }
+.difftext .ins { background: var(--ins); display: block; }
+.difftext .del { background: var(--del); display: block; }
+.difftext .same { display: block; color: var(--muted); }
+.tabs { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 6px 12px; color: var(--muted); white-space: nowrap; }
+.tabs button[aria-selected='true'] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 800px) { .split { grid-template-columns: minmax(0, 1fr); } }
+a { color: var(--accent); }
+a.btn { color: var(--text); text-decoration: none; display: inline-block; }
+a.btn.primary { color: var(--accent-text); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.skip { position: absolute; left: -999px; top: 0; background: var(--accent); color: var(--accent-text); padding: 6px 10px; z-index: 10; }
+.skip:focus { left: 8px; top: 8px; }
