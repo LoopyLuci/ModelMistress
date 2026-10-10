@@ -68,6 +68,25 @@ enum Cmd {
     Rm { model: String },
     /// One question, one answer.
     Chat { model: String, prompt: String },
+    /// Speech to text with the built-in whisper.cpp (WAV or MP3): `transcribe talk.wav --model base.en`.
+    Transcribe {
+        file: PathBuf,
+        /// A whisper model (`base.en` for ggml-base.en.bin); default: the whisper_model setting or what is found.
+        #[arg(long)]
+        model: Option<String>,
+        /// ISO-639-1 code such as `de`; default: detected.
+        #[arg(long)]
+        language: Option<String>,
+        /// Text that guides the style or spelling.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Translate the speech into English.
+        #[arg(long)]
+        translate: bool,
+        /// text, json, verbose_json, srt or vtt.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
 }
@@ -222,6 +241,25 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             }
         }
         Cmd::Rm { model } => show(&client().await?.call("model.delete", json!({"model": model})).await?),
+        Cmd::Transcribe {
+            file,
+            model,
+            language,
+            prompt,
+            translate,
+            format,
+        } => {
+            // The hub reads the file, and its working folder is not ours.
+            let file = std::path::absolute(&file)?;
+            let mut a = json!({"file": file, "translate": translate, "format": format});
+            for (k, v) in [("model", model), ("language", language), ("prompt", prompt)] {
+                if let Some(v) = v {
+                    a[k] = json!(v);
+                }
+            }
+            let v = client().await?.call("speech.transcribe", a).await?;
+            print!("{}", v["rendered"].as_str().unwrap_or(""));
+        }
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())

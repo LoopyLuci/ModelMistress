@@ -13,6 +13,8 @@
 //!   POST /v1/chat/completions       OpenAI, streaming or not
 //!   POST /v1/completions            OpenAI
 //!   POST /v1/embeddings             OpenAI (the model must be loaded with embeddings: true)
+//!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV or MP3), whisper.cpp (feature `whisper`)
+//!   POST /v1/audio/translations     the same, into English
 //!
 //! Errors are {"error": {"code", "message"}} with a 4xx/5xx status (OpenAI clients read `message`).
 
@@ -21,9 +23,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
-use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,6 +33,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::engine::{Engine, Fail, LoadOpts, Settings, Target};
+use crate::{audio, speech};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -288,6 +291,21 @@ pub fn operations() -> Vec<Value> {
             &[],
         ),
         op(
+            "speech.transcribe",
+            "Speech to text with the built-in whisper.cpp: transcribe (or translate to English) an audio file (WAV or MP3) on the hub's machine",
+            false,
+            false,
+            json!({
+                "file": {"type": "string", "description": "path of the audio file"},
+                "model": {"type": "string", "description": "whisper model, e.g. base.en (default: whisper_model setting)"},
+                "language": {"type": "string", "description": "ISO-639-1 code; default: detected"},
+                "prompt": {"type": "string", "description": "text that guides the style or spelling"},
+                "translate": {"type": "boolean", "description": "translate to English instead of transcribing"},
+                "format": {"type": "string", "description": "json, text, verbose_json, srt or vtt; the answer's `rendered` is in it"}
+            }),
+            &["file"],
+        ),
+        op(
             "config.set",
             "Change settings; only the fields given change, and they are saved",
             true,
@@ -481,6 +499,32 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let id = s(a, "job")?;
             json!({"job": id, "cancelled": hub.jobs.cancel(id)})
         }
+        "speech.transcribe" => {
+            let path = s(a, "file")?;
+            let file = std::fs::read(path).map_err(|x| Fail::invalid(format!("{path}: {x}")))?;
+            let opt = |k: &str| {
+                a.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(String::from)
+            };
+            let req = audio::Request {
+                file,
+                filename: path.to_string(),
+                model: opt("model").unwrap_or_default(),
+                language: opt("language").map(|l| l.to_lowercase()),
+                prompt: opt("prompt"),
+                format: audio::ResponseFormat::parse(&opt("format").unwrap_or_else(|| "json".into()))
+                    .map_err(Fail::invalid)?,
+                temperature: 0.0,
+            };
+            let format = req.format;
+            let translate = a.get("translate").and_then(Value::as_bool).unwrap_or(false);
+            let out = run_speech(hub, req, translate).await?;
+            let mut v = out.verbose();
+            v["rendered"] = json!(out.render(format));
+            v
+        }
         "config.get" => shown_settings(&e.settings()),
         "config.set" => {
             let patch = a
@@ -603,6 +647,49 @@ async fn embeddings(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResul
     passthrough(hub, "/v1/embeddings", body).await
 }
 
+/// The largest audio upload (OpenAI's own limit is 25 MB; local files are often longer).
+const MAX_AUDIO_BYTES: usize = 512 << 20;
+
+/// `POST /v1/audio/transcriptions` and `/v1/audio/translations`: multipart in, the transcript out.
+async fn speech_to_text(hub: Hub, headers: HeaderMap, body: Bytes, translate: bool) -> ApiResult<Response> {
+    if !speech::AVAILABLE {
+        return Err(Fail::new(501, "not_implemented", speech::NOT_BUILT).into());
+    }
+    let ctype = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let req = audio::parse_request(ctype, &body).map_err(Fail::invalid)?;
+    let format = req.format;
+    let out = run_speech(&hub, req, translate).await?;
+    Ok(([("content-type", format.content_type())], out.render(format)).into_response())
+}
+
+/// Find the model, decode the audio and transcribe it (off the async threads: it takes a while).
+async fn run_speech(hub: &Hub, req: audio::Request, translate: bool) -> ApiResult<audio::Transcript> {
+    if !speech::AVAILABLE {
+        return Err(Fail::new(501, "not_implemented", speech::NOT_BUILT).into());
+    }
+    let (dirs, preferred) = (hub.engine.whisper_dirs(), hub.engine.settings().whisper_model);
+    let model = speech::find_model(&dirs, &req.model, preferred.as_deref())?;
+    let name = speech::model_name(&model).unwrap_or_else(|| "whisper".into());
+    let t0 = Instant::now();
+    let out = tokio::task::spawn_blocking(move || -> Result<audio::Transcript, Fail> {
+        let samples = audio::decode(&req.file, &req.filename).map_err(Fail::invalid)?;
+        speech::transcribe(&model, &samples, &req, translate)
+    })
+    .await
+    .map_err(|x| Fail::new(500, "inference_error", x.to_string()))?;
+    hub.engine
+        .record(&name, out.is_ok(), t0.elapsed().as_millis() as u64, None);
+    Ok(out?)
+}
+
+async fn transcriptions(State(hub): State<Hub>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
+    speech_to_text(hub, headers, body, false).await
+}
+
+async fn translations(State(hub): State<Hub>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
+    speech_to_text(hub, headers, body, true).await
+}
+
 pub fn router(hub: Hub) -> Router {
     let private = Router::new()
         .route("/v1/operations", get(list_ops))
@@ -612,6 +699,14 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcriptions).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(translations).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
+        )
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))
@@ -669,4 +764,178 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&control);
     eprintln!("model-mistress stopped ({n} model(s) unloaded)");
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-token-0123456789";
+
+    fn hub(home: &std::path::Path) -> Hub {
+        Hub {
+            engine: Engine::new(home.to_path_buf(), Settings::default()),
+            jobs: Arc::new(Default::default()),
+            token: Arc::new(TOKEN.into()),
+            started: Instant::now(),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn wav(samples: &[i16]) -> Vec<u8> {
+        let mut v = b"RIFF".to_vec();
+        v.extend((36 + samples.len() as u32 * 2).to_le_bytes());
+        v.extend(b"WAVEfmt ");
+        v.extend([16, 0, 0, 0, 1, 0, 1, 0]);
+        v.extend(16_000u32.to_le_bytes());
+        v.extend(32_000u32.to_le_bytes());
+        v.extend([2, 0, 16, 0]);
+        v.extend(b"data");
+        v.extend((samples.len() as u32 * 2).to_le_bytes());
+        samples.iter().for_each(|s| v.extend(s.to_le_bytes()));
+        v
+    }
+
+    fn form(fields: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (name, file, data) in fields {
+            b.extend(b"--B\r\n");
+            match file {
+                Some(f) => b.extend(
+                    format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{f}\"\r\n\r\n").as_bytes(),
+                ),
+                None => b.extend(format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes()),
+            }
+            b.extend(*data);
+            b.extend(b"\r\n");
+        }
+        b.extend(b"--B--\r\n");
+        b
+    }
+
+    async fn post(hub: &Hub, path: &str, ctype: &str, body: Vec<u8>) -> (StatusCode, String, String) {
+        let req = axum::http::Request::post(path)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", ctype)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router(hub.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap();
+        (status, ct, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    const MP: &str = "multipart/form-data; boundary=B";
+
+    fn temp_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mm-hub-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn audio_needs_the_token() {
+        let home = temp_home();
+        let h = hub(&home);
+        let req = axum::http::Request::post("/v1/audio/transcriptions")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router(h).oneshot(req).await.unwrap().status(), 401);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(not(feature = "whisper"))]
+    #[tokio::test]
+    async fn without_the_feature_speech_is_501() {
+        let home = temp_home();
+        let h = hub(&home);
+        let body = form(&[("file", Some("a.wav"), &wav(&[0; 3200])), ("model", None, b"base.en")]);
+        for path in ["/v1/audio/transcriptions", "/v1/audio/translations"] {
+            let (st, _, text) = post(&h, path, MP, body.clone()).await;
+            assert_eq!(st, 501, "{text}");
+            assert!(text.contains("--features whisper"));
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(feature = "whisper")]
+    #[tokio::test]
+    async fn bad_speech_requests_get_clear_errors() {
+        let home = temp_home();
+        let h = hub(&home);
+        let t = "/v1/audio/transcriptions";
+        let (st, _, text) = post(&h, t, "application/json", b"{}".to_vec()).await;
+        assert_eq!((st.as_u16(), text.contains("multipart")), (400, true), "{text}");
+        let (st, _, text) = post(&h, t, MP, form(&[("model", None, b"base.en")])).await;
+        assert_eq!((st.as_u16(), text.contains("file")), (400, true), "{text}");
+        let bad_format = form(&[("file", Some("a.wav"), b"x"), ("response_format", None, b"xml")]);
+        let (st, _, text) = post(&h, t, MP, bad_format).await;
+        assert_eq!((st.as_u16(), text.contains("response_format")), (400, true), "{text}");
+        // the model is looked up before the audio is read: unknown model, 404
+        let ok_audio = wav(&[0; 3200]);
+        let unknown = form(&[("file", Some("a.wav"), &ok_audio), ("model", None, b"nope")]);
+        let (st, _, text) = post(&h, t, MP, unknown).await;
+        assert_eq!((st.as_u16(), text.contains("nope")), (404, true), "{text}");
+        let none = form(&[("file", Some("a.wav"), &ok_audio)]);
+        let (st, _, _) = post(&h, "/v1/audio/translations", MP, none).await;
+        assert_eq!(st, 404, "no whisper model in an empty home");
+        // a model file is there, but the audio is not WAV or MP3: 400 before the model is ever loaded
+        std::fs::create_dir_all(home.join("whisper")).unwrap();
+        std::fs::write(home.join("whisper").join("ggml-fake.bin"), b"not a model").unwrap();
+        let ogg = form(&[("file", Some("a.ogg"), b"OggS....."), ("model", None, b"fake")]);
+        let (st, _, text) = post(&h, t, MP, ogg).await;
+        assert_eq!((st.as_u16(), text.contains("Ogg")), (400, true), "{text}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Needs a real whisper model and a short recording; see docs/speech.md. Run:
+    ///   MM_TEST_WHISPER_MODEL=<ggml-base.en.bin> MM_TEST_WHISPER_WAV=<speech.wav> MM_TEST_WHISPER_EXPECT=<a word said>
+    ///   cargo test --features whisper -- --ignored transcribes_real_speech
+    #[cfg(feature = "whisper")]
+    #[tokio::test]
+    #[ignore = "needs a whisper model and a WAV file (MM_TEST_WHISPER_MODEL, MM_TEST_WHISPER_WAV, MM_TEST_WHISPER_EXPECT)"]
+    async fn transcribes_real_speech() {
+        let model = std::env::var("MM_TEST_WHISPER_MODEL").expect("MM_TEST_WHISPER_MODEL");
+        let wav_path = std::env::var("MM_TEST_WHISPER_WAV").expect("MM_TEST_WHISPER_WAV");
+        let expect = std::env::var("MM_TEST_WHISPER_EXPECT")
+            .unwrap_or_default()
+            .to_lowercase();
+        let home = temp_home();
+        let h = hub(&home);
+        let audio = std::fs::read(&wav_path).unwrap();
+        let fields = |fmt: &'static str| {
+            form(&[
+                ("file", Some("speech.wav"), &audio),
+                ("model", None, model.as_bytes()),
+                ("response_format", None, fmt.as_bytes()),
+            ])
+        };
+        let (st, ct, text) = post(&h, "/v1/audio/transcriptions", MP, fields("json")).await;
+        assert_eq!(st, 200, "{text}");
+        assert_eq!(ct, "application/json");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["text"].as_str().unwrap().to_lowercase().contains(&expect), "{text}");
+        let (st, _, text) = post(&h, "/v1/audio/transcriptions", MP, fields("verbose_json")).await;
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((st.as_u16(), v["language"].as_str()), (200, Some("english")), "{text}");
+        assert!(v["duration"].as_f64().unwrap() > 0.5 && !v["segments"].as_array().unwrap().is_empty());
+        let (_, ct, text) = post(&h, "/v1/audio/transcriptions", MP, fields("srt")).await;
+        assert!(
+            text.starts_with("1\n00:00:00,") && ct.starts_with("text/plain"),
+            "{text}"
+        );
+        let (_, _, text) = post(&h, "/v1/audio/transcriptions", MP, fields("vtt")).await;
+        assert!(text.starts_with("WEBVTT"), "{text}");
+        // an English-only model cannot translate
+        let (st, _, text) = post(&h, "/v1/audio/translations", MP, fields("json")).await;
+        assert!(st == 200 || (st == 400 && text.contains("English only")), "{st} {text}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

@@ -84,6 +84,9 @@ pub struct Settings {
     pub download_dir: Option<PathBuf>,
     /// A Hugging Face token for gated or private repos (else HF_TOKEN). config.get never shows it.
     pub hf_token: Option<String>,
+    /// The whisper model (`base.en` for `ggml-base.en.bin`) that speech to text uses when a request names none or
+    /// says `whisper-1`. Unset: the only whisper model found, else the first of small, base, tiny.
+    pub whisper_model: Option<String>,
 }
 
 impl Default for Settings {
@@ -105,6 +108,7 @@ impl Default for Settings {
             extra_args: vec![],
             download_dir: None,
             hf_token: None,
+            whisper_model: None,
         }
     }
 }
@@ -265,6 +269,21 @@ impl Engine {
         r.huggingface.push(downloads.join("hub"));
         r.ollama.push(downloads.join("ollama"));
         r
+    }
+
+    /// Where whisper models (`ggml-*.bin`) are looked for.
+    pub fn whisper_dirs(&self) -> Vec<PathBuf> {
+        let s = self.settings.read();
+        let mut d = vec![self.home.join("whisper")];
+        d.extend(s.model_dirs.iter().cloned());
+        d.push(self.home.join("models"));
+        d.push(
+            s.download_dir
+                .clone()
+                .unwrap_or_else(|| self.home.clone())
+                .join("whisper"),
+        );
+        d
     }
 
     /// Rescan the disk. Returns how many models were found.

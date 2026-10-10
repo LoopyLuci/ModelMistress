@@ -15,6 +15,10 @@ runs on its own.
   (`qwen3:8b`), with progress, resume and a SHA-256 check of every file. No Ollama or Python needed.
 - **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server` (Vulkan by
   default) and needs nothing else installed but the GPU driver.
+- **Speech to text, built in.** With `--features whisper` it runs whisper.cpp itself: OpenAI's
+  `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in; json, text, verbose_json, srt or vtt out)
+  and `model-mistress transcribe talk.wav`. A whisper model is a `ggml-*.bin` file in a model folder
+  ([docs/speech.md](docs/speech.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 
@@ -54,10 +58,11 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `POST /v1/service/stop` | unload everything and stop |
 | `GET /v1/models` | OpenAI model list |
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` | OpenAI, streaming or not |
+| `POST /v1/audio/transcriptions`, `/v1/audio/translations` | OpenAI speech to text (feature `whisper`) |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
 `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
-`chat.complete`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
+`chat.complete`, `speech.transcribe`, `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`, `config.set`.
 
 ## Development
 

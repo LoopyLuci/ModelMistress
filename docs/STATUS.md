@@ -26,11 +26,17 @@ Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in lla
   `config.set` saving to `config.toml`.
 - MCP over stdio (`model-mistress mcp`).
 
+## Speech to text (feature `whisper`)
+
+`/v1/audio/transcriptions` and `/v1/audio/translations` run whisper.cpp inside the hub (see [speech.md](speech.md)).
+Tested on Windows 10 (CPU) with `ggml-base.en.bin` and a synthesized WAV: transcript, verbose_json, srt, vtt and
+the CLI. Not tested: MP3 input, multilingual models, GPU builds.
+
 ## Not done yet
 
 - Embeddings are served only by a model loaded with `embeddings: true` (llama.cpp then serves embeddings only).
 - Hosting for other machines (per-peer keys, quotas): `serve --host` exposes the token-protected API, and that is all.
-- Other engines (vLLM, ExLlama); speech (whisper.cpp), text to speech and image generation (stable-diffusion.cpp).
+- Other engines (vLLM, ExLlama); text to speech and image generation (stable-diffusion.cpp).
 - llama.cpp's other tools as operations: quantize, convert from Hugging Face weights, LoRA adapters, speculative
   decoding, reranking.
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
