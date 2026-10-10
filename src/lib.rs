@@ -12,6 +12,7 @@ pub mod client;
 pub mod engine;
 pub mod hosting;
 pub mod hub;
+pub mod image;
 pub mod pull;
 pub mod speech;
 pub mod testing;

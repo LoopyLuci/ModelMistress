@@ -1,3 +1,6 @@
 [submodule "engines/llama.cpp"]
 	path = engines/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "engines/stable-diffusion.cpp"]
+	path = engines/stable-diffusion.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git

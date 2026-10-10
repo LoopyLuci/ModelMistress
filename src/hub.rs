@@ -17,6 +17,9 @@
 //!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV or MP3), whisper.cpp (feature `whisper`)
 //!   POST /v1/audio/translations     the same, into English
 //!   POST /v1/audio/speech           OpenAI text to speech (JSON in, WAV or raw PCM out), llama.cpp's llama-tts
+//!   POST /v1/images/generations     OpenAI image generation (PNG as b64_json or a url), stable-diffusion.cpp's sd-cli
+//!   GET  /v1/images/files/{name}    a generated image that a url points to
+//!   POST /v1/images/edits           answers 501 (see docs/images.md)
 //!
 //! A peer key (see `hosting`) may use only the OpenAI routes above; the owner's token can do everything.
 //!
@@ -39,7 +42,7 @@ use serde_json::{json, Value};
 
 use crate::engine::{Engine, Fail, Lease, LoadOpts, Settings, Target};
 use crate::hosting::{Keys, Permit, Quotas, Verdict};
-use crate::{audio, speech, tools, tts};
+use crate::{audio, image, speech, tools, tts};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -114,7 +117,9 @@ fn peer_route(path: &str) -> bool {
             | "/v1/audio/speech"
             | "/v1/audio/transcriptions"
             | "/v1/audio/translations"
-    )
+            | "/v1/images/generations"
+            | "/v1/images/edits"
+    ) || path.starts_with("/v1/images/files/")
 }
 
 /// The owner's token is accepted from this machine only. (No address known, as in tests that call the router
@@ -414,6 +419,28 @@ pub fn operations() -> Vec<Value> {
                 "max_frames": {"type": "integer", "minimum": 1, "description": "limit on the generated audio"}
             }),
             &["input", "output"],
+        ),
+        op(
+            "image.generate",
+            "Generate images with the built-in stable-diffusion.cpp. Runs as a job (job.get shows the sampling step, \
+             job.cancel stops it) unless wait is true; the PNG files are in the result",
+            true,
+            false,
+            json!({
+                "prompt": {"type": "string", "description": "what to draw (up to 4000 characters)"},
+                "model": {"type": "string", "description": "an image model (default: the image_model setting, else the only one; see docs/images.md)"},
+                "negative_prompt": {"type": "string"},
+                "n": {"type": "integer", "minimum": 1, "maximum": 10},
+                "size": {"type": "string", "description": "WIDTHxHEIGHT, each a multiple of 8 from 64 to 2048 (default 512x512)"},
+                "steps": {"type": "integer", "minimum": 1, "maximum": 150},
+                "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "10, 20 or 30 steps; steps wins"},
+                "cfg_scale": {"type": "number", "description": "guidance (1 for FLUX models)"},
+                "sampler": {"type": "string", "description": "sd.cpp sampling method, e.g. euler, euler_a, dpm++2m"},
+                "seed": {"type": "integer", "description": "negative or unset: random"},
+                "output": {"type": "string", "description": "path of the PNG to write on the hub's machine (n > 1: _0, _1, ... before .png); default: <home>/generated"},
+                "wait": {"type": "boolean", "description": "answer only when it has finished"}
+            }),
+            &["prompt"],
         ),
         op(
             "quantize",
@@ -774,6 +801,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             json!({"output": output, "format": req.format.content_type(), "bytes": bytes.len(),
                    "seconds": (seconds * 100.0).round() / 100.0, "model": model})
         }
+        "image.generate" => image_generate(hub, a).await?,
         "quantize" => quantize(hub, a).await?,
         "lora" => {
             let m = llama_entry(hub, s(a, "model")?)?;
@@ -923,6 +951,133 @@ async fn run_tts(hub: &Hub, req: &tts::SpeechRequest) -> ApiResult<(Vec<u8>, f64
     e.record(&entry.id, wav.is_ok(), t0.elapsed().as_millis() as u64, None);
     let (bytes, seconds) = tts::finish(&wav?, req).map_err(|x| Fail::new(500, "tool_failed", x))?;
     Ok((bytes, seconds, entry.id))
+}
+
+/// What one run of `sd-cli` made.
+struct Generated {
+    files: Vec<PathBuf>,
+    model: String,
+    seed: i64,
+    seconds: f64,
+}
+
+/// Draws the images: finds the model and the tool, runs `sd-cli` (one at a time), and returns the PNG files in
+/// `<home>/generated`. With a job, shows the sampling step on it and stops when it is cancelled.
+async fn run_image(
+    e: &Arc<Engine>,
+    req: &image::ImageRequest,
+    job: Option<Arc<crate::pull::Job>>,
+) -> Result<Generated, Fail> {
+    let st = e.settings();
+    let model = image::find_model(&e.image_dirs(), &e.catalog(), &req.model, st.image_model.as_deref())?;
+    let dir = e.generated_dir();
+    std::fs::create_dir_all(&dir).map_err(|x| Fail::new(500, "io", format!("{}: {x}", dir.display())))?;
+    sweep_generated(&dir);
+    let seed = match req.seed {
+        Some(s) if s >= 0 => s,
+        _ => rand::random::<u32>() as i64,
+    };
+    let pattern = std::path::absolute(&dir)
+        .unwrap_or(dir)
+        .join(format!("image-{}_%d.png", uuid::Uuid::new_v4().simple()));
+    let args = image::tool_args(&model, req, seed, &pattern, st.gpu_layers == 0);
+    let _one_at_a_time = e.tool_lock.lock().await;
+    let t0 = Instant::now();
+    let ran = e
+        .run_tool("sd-cli", &args, Duration::from_secs(6 * 3600), &mut |line| {
+            if let (Some(job), Some((done, total))) = (&job, image::progress(line)) {
+                job.progress(done, total, format!("step {done} of {total}"));
+            }
+            !job.as_ref().is_some_and(|j| j.cancelled())
+        })
+        .await;
+    let files = image::output_files(&pattern, req.n);
+    let made = match ran {
+        Ok(()) if files.len() == req.n as usize => Ok(()),
+        Ok(()) => Err(Fail::new(
+            500,
+            "tool_failed",
+            format!("sd-cli made {} of the {} images", files.len(), req.n),
+        )),
+        Err(f) => Err(f),
+    };
+    e.record(&model.id, made.is_ok(), t0.elapsed().as_millis() as u64, None);
+    if let Err(f) = made {
+        files.iter().for_each(|f| drop(std::fs::remove_file(f)));
+        return Err(f);
+    }
+    Ok(Generated {
+        files,
+        model: model.id,
+        seed,
+        seconds: t0.elapsed().as_secs_f64(),
+    })
+}
+
+/// Removes generated images that are over a day old.
+fn sweep_generated(dir: &std::path::Path) {
+    let day = Duration::from_secs(24 * 3600);
+    for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let old = f
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if old && f.path().extension().is_some_and(|x| x == "png") {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+}
+
+/// `image.generate`: a job running sd-cli.
+async fn image_generate(hub: &Hub, a: &Value) -> ApiResult<Value> {
+    let e = &hub.engine;
+    let req = image::ImageRequest::from_json(a).map_err(Fail::invalid)?;
+    let output = match a.get("output") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if !p.trim().is_empty() => Some(PathBuf::from(p.trim())),
+        Some(_) => return Err(Fail::invalid("output must be a file path").into()),
+    };
+    if let Some(o) = &output {
+        if o.extension().and_then(|x| x.to_str()).map(str::to_lowercase).as_deref() != Some("png") {
+            return Err(Fail::invalid("output must be a .png file").into());
+        }
+    }
+    let engine = e.clone();
+    let job = hub.jobs.start_task(
+        "image",
+        format!("image-{}", uuid::Uuid::new_v4().simple()),
+        move |job| async move {
+            let g = run_image(&engine, &req, Some(job)).await?;
+            let mut files = g.files.clone();
+            if let Some(o) = &output {
+                files.clear();
+                for (i, f) in g.files.iter().enumerate() {
+                    let to = if g.files.len() == 1 {
+                        o.clone()
+                    } else {
+                        let stem = o.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+                        o.with_file_name(format!("{stem}_{i}.png"))
+                    };
+                    if let Some(dir) = to.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(dir)
+                            .map_err(|x| Fail::new(500, "io", format!("{}: {x}", dir.display())))?;
+                    }
+                    std::fs::copy(f, &to).map_err(|x| Fail::new(500, "io", format!("{}: {x}", to.display())))?;
+                    let _ = std::fs::remove_file(f);
+                    files.push(std::path::absolute(&to).unwrap_or(to));
+                }
+            }
+            Ok(json!({"files": files, "model": g.model, "seed": g.seed, "seconds": (g.seconds * 10.0).round() / 10.0}))
+        },
+    );
+    if a["wait"].as_bool().unwrap_or(false) {
+        while job.status() == "running" {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    Ok(job.describe())
 }
 
 /// `quantize`: a job running llama-quantize.
@@ -1382,6 +1537,62 @@ async fn speech(
     Ok(([("content-type", req.format.content_type())], bytes).into_response())
 }
 
+/// `POST /v1/images/generations`: JSON in, the PNGs out (as base64, or as urls of `/v1/images/files/`).
+async fn image_generations(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    let req = image::ImageRequest::from_json(&body).map_err(Fail::invalid)?;
+    check_audio_model(&hub, &who, &req.model, "dall-e-3")?;
+    let ran = run_image(&hub.engine, &req, None).await;
+    finish_audio(&who, &req.model, ran.is_ok());
+    let g = ran?;
+    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("127.0.0.1");
+    let mut data = Vec::new();
+    for f in &g.files {
+        match req.format {
+            image::Format::B64Json => {
+                let bytes =
+                    std::fs::read(f).map_err(|x| Fail::new(500, "tool_failed", format!("{}: {x}", f.display())))?;
+                let _ = std::fs::remove_file(f);
+                data.push(json!({"b64_json": image::base64(&bytes)}));
+            }
+            image::Format::Url => {
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                data.push(json!({"url": format!("http://{host}/v1/images/files/{name}")}));
+            }
+        }
+    }
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(Json(json!({"created": created, "data": data, "model": g.model, "seed": g.seed})).into_response())
+}
+
+/// `GET /v1/images/files/{name}`: an image that a `url` answer points to (they are removed after a day).
+async fn image_file(State(hub): State<Hub>, Path(name): Path<String>) -> ApiResult<Response> {
+    let ok = name.ends_with(".png") && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    if !ok || name.contains("..") {
+        return Err(Fail::not_found("no such image").into());
+    }
+    let bytes = std::fs::read(hub.engine.generated_dir().join(&name)).map_err(|_| Fail::not_found("no such image"))?;
+    Ok(([("content-type", "image/png")], bytes).into_response())
+}
+
+/// `POST /v1/images/edits`: not available. sd.cpp's image-to-image and inpainting exist, but OpenAI's mask marks the
+/// part to change by transparency, which needs a PNG decoder (and the opposite mask polarity) that is not built in.
+async fn image_edits() -> ApiResult<Response> {
+    Err(Fail::new(
+        501,
+        "not_implemented",
+        "image edits are not available: only /v1/images/generations is (see docs/images.md)",
+    )
+    .into())
+}
+
 /// The largest audio upload (OpenAI's own limit is 25 MB; local files are often longer).
 const MAX_AUDIO_BYTES: usize = 512 << 20;
 
@@ -1457,6 +1668,9 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
         .route("/v1/audio/speech", post(speech))
+        .route("/v1/images/generations", post(image_generations))
+        .route("/v1/images/edits", post(image_edits))
+        .route("/v1/images/files/:name", get(image_file))
         .route(
             "/v1/audio/transcriptions",
             post(transcriptions).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
@@ -1827,6 +2041,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_requests_get_clear_errors() {
+        let home = temp_home();
+        let h = hub_without_tools(&home, &[]);
+        let url = "/v1/images/generations";
+        let (st, v) = json_post(&h, url, json!({})).await;
+        assert!(st == 400 && message(&v).contains("prompt"), "{v}");
+        let (st, v) = json_post(&h, url, json!({"prompt": "a cat", "size": "100x100"})).await;
+        assert!(st == 400 && message(&v).contains("size"), "{v}");
+        let (st, v) = json_post(&h, url, json!({"prompt": "a cat", "n": 99})).await;
+        assert!(st == 400 && message(&v).contains("n must"), "{v}");
+        // no image model anywhere, then a named one that is not there
+        let (st, v) = json_post(&h, url, json!({"prompt": "a cat"})).await;
+        assert!(st == 404 && message(&v).contains("no image model"), "{st} {v}");
+        let (st, v) = json_post(&h, url, json!({"prompt": "a cat", "model": "nope"})).await;
+        assert!(st == 404 && message(&v).contains("nope"), "{st} {v}");
+        // a model file, but no sd-cli
+        std::fs::create_dir_all(home.join("images")).unwrap();
+        std::fs::write(home.join("images").join("tiny-sd.safetensors"), b"x").unwrap();
+        let (st, v) = json_post(&h, url, json!({"prompt": "a cat", "model": "dall-e-3"})).await;
+        assert!(st == 501 && message(&v).contains("sd-cli"), "{st} {v}");
+        // the operation checks the same input; the job fails the same way
+        let (st, v) = json_post(&h, "/v1/call/image.generate", json!({})).await;
+        assert!(st == 400 && message(&v).contains("prompt"), "{st} {v}");
+        let (st, v) = json_post(&h, "/v1/call/image.generate", json!({"prompt": "a cat", "wait": true})).await;
+        assert!(st == 200 && v["result"]["status"] == "failed", "{st} {v}");
+        assert!(v["result"]["message"].as_str().unwrap().contains("sd-cli"), "{v}");
+        let (st, v) = json_post(&h, "/v1/call/image.generate", json!({"prompt": "a", "output": "x.jpg"})).await;
+        assert!(st == 400 && message(&v).contains(".png"), "{st} {v}");
+        // edits are not available
+        let (st, v) = json_post(&h, "/v1/images/edits", json!({})).await;
+        assert!(st == 501 && message(&v).contains("edits"), "{st} {v}");
+        // the files route serves only what the hub generated
+        let get = |path: &str| {
+            let req = axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            router(h.clone()).oneshot(req)
+        };
+        assert_eq!(get("/v1/images/files/nope.png").await.unwrap().status(), 404);
+        assert_eq!(get("/v1/images/files/x.txt").await.unwrap().status(), 404);
+        std::fs::create_dir_all(h.engine.generated_dir()).unwrap();
+        std::fs::write(h.engine.generated_dir().join("image-a_0.png"), b"png").unwrap();
+        let resp = get("/v1/images/files/image-a_0.png").await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        for path in ["/v1/images/generations", "/v1/images/edits"] {
+            let req = axum::http::Request::post(path).body(Body::empty()).unwrap();
+            assert_eq!(router(h.clone()).oneshot(req).await.unwrap().status(), 401, "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn peers_may_draw_but_not_manage() {
+        assert!(peer_route("/v1/images/generations") && peer_route("/v1/images/files/x.png"));
+        assert!(!peer_route("/v1/call/image.generate"));
+    }
+
+    #[tokio::test]
     async fn embeddings_and_rerank_bodies_are_checked() {
         let home = temp_home();
         let h = hub_without_tools(&home, &[]);
@@ -2185,6 +2459,61 @@ mod tests {
         assert!(st == 200 && v["result"]["reloaded"] == true, "{v}");
         h.engine.unload_all();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Needs an image model (Stable Diffusion or FLUX; for FLUX its VAE and text encoders beside it) and a built-in
+    /// stable-diffusion.cpp; see docs/images.md. Run:
+    ///   MM_TEST_IMAGE_MODEL=<the model file> cargo test --features bundled-engine -- --ignored draws_with_a_real_model
+    #[tokio::test]
+    #[ignore = "needs an image model (MM_TEST_IMAGE_MODEL) and feature bundled-engine"]
+    async fn draws_with_a_real_model() {
+        let model = std::env::var("MM_TEST_IMAGE_MODEL").expect("MM_TEST_IMAGE_MODEL");
+        let home = temp_home();
+        let h = real_hub(&home, &model);
+        let body = json!({"model": model, "prompt": "a red apple on a table", "size": "256x256", "steps": 4,
+                          "seed": 7, "cfg_scale": 1.0});
+        let (st, ct, bytes) = json_post_raw(&h, "/v1/images/generations", body).await;
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(st == 200 && ct.starts_with("application/json"), "{st} {v}");
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        let png = png_of(v["data"][0]["b64_json"].as_str().unwrap());
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+        // the width and height are in the IHDR chunk
+        let dim = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+        assert_eq!((dim(16), dim(20)), (256, 256));
+        // the operation is a job with progress, and writes where it is told
+        let out = home.join("apple.png");
+        let (st, v) = json_post(
+            &h,
+            "/v1/call/image.generate",
+            json!({"model": model, "prompt": "a red apple", "size": "256x256", "steps": 4, "output": &out,
+                   "wait": true}),
+        )
+        .await;
+        let job = &v["result"];
+        assert!(st == 200 && job["status"] == "done", "{v}");
+        assert!(std::fs::read(&out).unwrap().starts_with(b"\x89PNG"), "{v}");
+        assert!(
+            job["total_bytes"].as_u64().unwrap_or(0) >= 4,
+            "the sampling steps were counted: {job}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn png_of(b64: &str) -> Vec<u8> {
+        let val = |c: u8| match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            _ => 63,
+        };
+        let mut out = Vec::new();
+        for c in b64.trim_end_matches('=').as_bytes().chunks(4) {
+            let n = c.iter().fold(0u32, |n, &x| n << 6 | val(x) as u32) << (6 * (4 - c.len()));
+            out.extend(&n.to_be_bytes()[1..c.len()]);
+        }
+        out
     }
 
     /// Needs a text-to-speech model with its mmproj*.gguf beside it, and a built-in llama.cpp; see

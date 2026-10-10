@@ -1,6 +1,7 @@
 //! With the `bundled-engine` feature, builds llama.cpp (engines/llama.cpp, a pinned submodule) and embeds its
-//! `llama-server`, `llama-bench`, `llama-quantize` and `llama-tts` in the model-mistress binary, so ModelMistress
-//! needs nothing else installed.
+//! `llama-server`, `llama-bench`, `llama-quantize` and `llama-tts` in the model-mistress binary, and does the same
+//! for stable-diffusion.cpp's `sd-cli` (engines/stable-diffusion.cpp, built as a CMake project of its own with its
+//! own ggml), so ModelMistress needs nothing else installed.
 //! At run time they are written once to `<home>/engines/bundled/<hash>/` (see engine.rs).
 //!
 //! Building needs CMake and a C++ compiler; the GPU backend is Vulkan unless MM_GGML_BACKEND says otherwise
@@ -17,12 +18,16 @@ fn main() {
         return;
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let src = manifest.parent().unwrap().join("engines").join("llama.cpp");
-    if !src.join("CMakeLists.txt").is_file() {
-        panic!(
-            "bundled-engine: {} is empty; run `git submodule update --init engines/llama.cpp`",
-            src.display()
-        );
+    let engines = manifest.parent().unwrap().join("engines");
+    let src = engines.join("llama.cpp");
+    let sd_src = engines.join("stable-diffusion.cpp");
+    for (dir, name) in [(&src, "llama.cpp"), (&sd_src, "stable-diffusion.cpp")] {
+        if !dir.join("CMakeLists.txt").is_file() {
+            panic!(
+                "bundled-engine: {} is empty; run `git submodule update --init --recursive engines/{name}`",
+                dir.display()
+            );
+        }
     }
     for f in [
         "CMakeLists.txt",
@@ -33,23 +38,25 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", src.join(f).display());
     }
+    for f in ["CMakeLists.txt", "examples/cli/CMakeLists.txt"] {
+        println!("cargo:rerun-if-changed={}", sd_src.join(f).display());
+    }
     for v in ["MM_GGML_BACKEND", "MM_CMAKE_GENERATOR", "MM_CMAKE_ARGS", "VULKAN_SDK"] {
         println!("cargo:rerun-if-env-changed={v}");
     }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let build = out.join("llama.cpp-build");
     let backend = std::env::var("MM_GGML_BACKEND").unwrap_or_else(|_| "vulkan".into());
-    let mut cfg: Vec<String> = vec![
-        "-S".into(),
-        src.display().to_string(),
-        "-B".into(),
-        build.display().to_string(),
-        "-DCMAKE_BUILD_TYPE=Release".into(),
-        "-DBUILD_SHARED_LIBS=OFF".into(),
+    if !["vulkan", "cuda", "hip", "metal", "cpu"].contains(&backend.as_str()) {
+        panic!("MM_GGML_BACKEND={backend}: use vulkan, cuda, hip, metal or cpu");
+    }
+    let on = |flag: &str| format!("-D{flag}=ON");
+
+    // llama.cpp
+    let build = out.join("llama.cpp-build");
+    let mut flags: Vec<String> = vec![
         "-DGGML_NATIVE=OFF".into(),
         "-DGGML_OPENMP=OFF".into(),
-        "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded".into(),
         "-DLLAMA_OPENSSL=OFF".into(),
         "-DLLAMA_CURL=OFF".into(),
         "-DLLAMA_USE_PREBUILT_UI=OFF".into(), // no download during the build; the hub has its own API
@@ -60,14 +67,82 @@ fn main() {
         "-DLLAMA_BUILD_SERVER=ON".into(),
         "-DLLAMA_BUILD_TOOLS=ON".into(),
     ];
-    match backend.as_str() {
-        "vulkan" => cfg.push("-DGGML_VULKAN=ON".into()),
-        "cuda" => cfg.push("-DGGML_CUDA=ON".into()),
-        "hip" => cfg.push("-DGGML_HIP=ON".into()),
-        "metal" => cfg.push("-DGGML_METAL=ON".into()),
-        "cpu" => {}
-        other => panic!("MM_GGML_BACKEND={other}: use vulkan, cuda, hip, metal or cpu"),
+    flags.extend(match backend.as_str() {
+        "vulkan" => Some(on("GGML_VULKAN")),
+        "cuda" => Some(on("GGML_CUDA")),
+        "hip" => Some(on("GGML_HIP")),
+        "metal" => Some(on("GGML_METAL")),
+        _ => None,
+    });
+    cmake_build(
+        "llama.cpp",
+        &src,
+        &build,
+        flags,
+        &["llama-server", "llama-bench", "llama-quantize", "llama-tts"],
+    );
+    for (name, var) in [
+        ("llama-server", "MM_BUNDLED_SERVER"),
+        ("llama-bench", "MM_BUNDLED_BENCH"),
+        ("llama-quantize", "MM_BUNDLED_QUANTIZE"),
+        ("llama-tts", "MM_BUNDLED_TTS"),
+    ] {
+        let exe = find_exe(&build, name).unwrap_or_else(|| panic!("bundled-engine: {name} was not built"));
+        println!("cargo:rustc-env={var}={}", exe.display());
     }
+
+    // stable-diffusion.cpp: a CMake project of its own, with its own copy of ggml (it patches it), so the two never
+    // share a library or a symbol. Only the command line program is built; WebP and WebM output are off (PNG only).
+    let build = out.join("stable-diffusion.cpp-build");
+    let mut flags: Vec<String> = vec![
+        "-DGGML_NATIVE=OFF".into(),
+        "-DGGML_OPENMP=OFF".into(),
+        "-DSD_BUILD_EXAMPLES=ON".into(),
+        "-DSD_WEBP=OFF".into(),
+        "-DSD_WEBM=OFF".into(),
+    ];
+    flags.extend(match backend.as_str() {
+        "vulkan" => Some(on("SD_VULKAN")),
+        "cuda" => Some(on("SD_CUDA")),
+        "hip" => Some(on("SD_HIPBLAS")),
+        "metal" => Some(on("SD_METAL")),
+        _ => None,
+    });
+    cmake_build("stable-diffusion.cpp", &sd_src, &build, flags, &["sd-cli"]);
+    let exe = find_exe(&build, "sd-cli").unwrap_or_else(|| panic!("bundled-engine: sd-cli was not built"));
+    println!("cargo:rustc-env=MM_BUNDLED_SD={}", exe.display());
+
+    let version = Command::new("git")
+        .args(["-C", &src.display().to_string(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=MM_BUNDLED_VERSION={version} ({backend})");
+    let sd_version = Command::new("git")
+        .args(["-C", &sd_src.display().to_string(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=MM_BUNDLED_SD_VERSION={sd_version}");
+}
+
+/// Configures and builds `targets` of the CMake project in `src` into `build`. The flags in `flags` are the
+/// project's own; the ones every engine needs (static, Release, static C runtime on MSVC) are added here.
+fn cmake_build(label: &str, src: &Path, build: &Path, flags: Vec<String>, targets: &[&str]) {
+    let mut cfg: Vec<String> = vec![
+        "-S".into(),
+        src.display().to_string(),
+        "-B".into(),
+        build.display().to_string(),
+        "-DCMAKE_BUILD_TYPE=Release".into(),
+        "-DBUILD_SHARED_LIBS=OFF".into(),
+        "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded".into(),
+    ];
+    cfg.extend(flags);
     // With an MSVC target, build with MSVC's own compiler and its environment (cc finds the newest Visual
     // Studio), not whatever C compiler is first on PATH: another Clang or GCC would not match MSVC's headers.
     let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![];
@@ -85,7 +160,7 @@ fn main() {
         // A build folder configured with another compiler cannot be switched; start it again.
         let cache = std::fs::read_to_string(build.join("CMakeCache.txt")).unwrap_or_default();
         if !cache.is_empty() && !cache.contains(&format!("CMAKE_CXX_COMPILER:STRING={cl}")) {
-            let _ = std::fs::remove_dir_all(&build);
+            let _ = std::fs::remove_dir_all(build);
         }
     }
     if let Some(g) = generator {
@@ -96,43 +171,26 @@ fn main() {
     }
     run(
         Command::new("cmake").args(&cfg).envs(env.iter().cloned()),
-        "configure llama.cpp",
+        &format!("configure {label}"),
     );
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    run(
-        Command::new("cmake").envs(env.iter().cloned()).args([
-            "--build",
-            &build.display().to_string(),
-            "--config",
-            "Release",
-            "--parallel",
-            &jobs.to_string(),
-            "--target",
-            "llama-server",
-            "llama-bench",
-            "llama-quantize",
-            "llama-tts",
-        ]),
-        "build llama.cpp",
-    );
-
-    for (name, var) in [
-        ("llama-server", "MM_BUNDLED_SERVER"),
-        ("llama-bench", "MM_BUNDLED_BENCH"),
-        ("llama-quantize", "MM_BUNDLED_QUANTIZE"),
-        ("llama-tts", "MM_BUNDLED_TTS"),
-    ] {
-        let exe = find_exe(&build, name).unwrap_or_else(|| panic!("bundled-engine: {name} was not built"));
-        println!("cargo:rustc-env={var}={}", exe.display());
-    }
-    let version = Command::new("git")
-        .args(["-C", &src.display().to_string(), "rev-parse", "--short", "HEAD"])
-        .output()
+    let jobs = std::env::var("CARGO_BUILD_JOBS")
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=MM_BUNDLED_VERSION={version} ({backend})");
+        .and_then(|j| j.parse::<usize>().ok())
+        .filter(|j| *j > 0)
+        .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
+        .unwrap_or(4);
+    let mut build_cmd = Command::new("cmake");
+    build_cmd.envs(env.iter().cloned()).args([
+        "--build",
+        &build.display().to_string(),
+        "--config",
+        "Release",
+        "--parallel",
+        &jobs.to_string(),
+        "--target",
+    ]);
+    build_cmd.args(targets);
+    run(&mut build_cmd, &format!("build {label}"));
 }
 
 fn run(cmd: &mut Command, what: &str) {

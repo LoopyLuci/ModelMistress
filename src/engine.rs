@@ -92,6 +92,9 @@ pub struct Settings {
     pub tts_model: Option<String>,
     /// The voice (a recording in `<home>/voices`, or a full path) used when a request names none or an OpenAI voice.
     pub tts_voice: Option<String>,
+    /// The image model (an id, a file name in `<home>/images`, or a path) that image generation uses when a request
+    /// names none or an OpenAI one (`dall-e-3`). Unset: the only image model found.
+    pub image_model: Option<String>,
     /// Allow `serve --host` to listen beyond this machine (it also needs at least one peer key). Off by default.
     pub allow_network: bool,
 }
@@ -118,6 +121,7 @@ impl Default for Settings {
             whisper_model: None,
             tts_model: None,
             tts_voice: None,
+            image_model: None,
             allow_network: false,
         }
     }
@@ -394,6 +398,21 @@ impl Engine {
         r
     }
 
+    /// Where image models are looked for: `<home>/images` first (everything in it is an image model), then the
+    /// model folders (a file counts there when its name says it is a diffusion model).
+    pub fn image_dirs(&self) -> Vec<PathBuf> {
+        let s = self.settings.read();
+        let mut d = vec![self.home.join("images")];
+        d.extend(s.model_dirs.iter().cloned());
+        d.push(self.home.join("models"));
+        d
+    }
+
+    /// Where generated images are kept until the owner deletes them.
+    pub fn generated_dir(&self) -> PathBuf {
+        self.home.join("generated")
+    }
+
     /// Where whisper models (`ggml-*.bin`) are looked for.
     pub fn whisper_dirs(&self) -> Vec<PathBuf> {
         let s = self.settings.read();
@@ -481,8 +500,14 @@ impl Engine {
         Some(v)
     }
 
-    /// A llama.cpp program that is built with llama-server and lives beside it (`llama-quantize`, `llama-tts`).
+    /// A program that is built with llama-server and lives beside it (`llama-quantize`, `llama-tts`, and
+    /// stable-diffusion.cpp's `sd-cli`, which MM_SD_CLI can point elsewhere).
     pub fn tool(&self, name: &str) -> Option<PathBuf> {
+        if name == "sd-cli" {
+            if let Some(p) = std::env::var_os("MM_SD_CLI").map(PathBuf::from).filter(|p| p.is_file()) {
+                return Some(p);
+            }
+        }
         let p = self.llama_server()?.with_file_name(exe(name));
         p.is_file().then_some(p)
     }
@@ -497,7 +522,7 @@ impl Engine {
         timeout: Duration,
         on_line: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> Result<()> {
-        use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+        use tokio::io::{AsyncRead, AsyncReadExt};
         let exe = self.tool(name).ok_or_else(|| {
             Fail::new(
                 501,
@@ -534,14 +559,28 @@ impl Engine {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         fn pump<R: AsyncRead + Unpin + Send + 'static>(r: R, tx: tokio::sync::mpsc::UnboundedSender<String>) {
             tokio::spawn(async move {
-                let mut r = BufReader::new(r);
-                let mut buf = Vec::new();
-                while let Ok(n) = r.read_until(b'\n', &mut buf).await {
-                    if n == 0 {
-                        break;
+                // A line ends at LF or CR: a progress bar redraws its line with CR, and each redraw is a line here.
+                let mut r = r;
+                let mut chunk = [0u8; 4096];
+                let mut line: Vec<u8> = Vec::new();
+                loop {
+                    let n = match r.read(&mut chunk).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break,
+                    };
+                    for &b in &chunk[..n] {
+                        if b == 0x0a || b == 0x0d {
+                            if !line.is_empty() {
+                                let _ = tx.send(String::from_utf8_lossy(&line).trim_end().to_string());
+                                line.clear();
+                            }
+                        } else {
+                            line.push(b);
+                        }
                     }
-                    let _ = tx.send(String::from_utf8_lossy(&buf).trim_end().to_string());
-                    buf.clear();
+                }
+                if !line.is_empty() {
+                    let _ = tx.send(String::from_utf8_lossy(&line).trim_end().to_string());
                 }
             });
         }
@@ -1247,6 +1286,7 @@ pub mod bundled {
         ("llama-bench", include_bytes!(env!("MM_BUNDLED_BENCH"))),
         ("llama-quantize", include_bytes!(env!("MM_BUNDLED_QUANTIZE"))),
         ("llama-tts", include_bytes!(env!("MM_BUNDLED_TTS"))),
+        ("sd-cli", include_bytes!(env!("MM_BUNDLED_SD"))),
     ];
     #[cfg(not(feature = "bundled-engine"))]
     const FILES: &[(&str, &[u8])] = &[];
@@ -1255,6 +1295,14 @@ pub mod bundled {
     pub fn version() -> Option<&'static str> {
         #[cfg(feature = "bundled-engine")]
         return Some(env!("MM_BUNDLED_VERSION"));
+        #[cfg(not(feature = "bundled-engine"))]
+        None
+    }
+
+    /// The stable-diffusion.cpp commit built in, or None.
+    pub fn sd_version() -> Option<&'static str> {
+        #[cfg(feature = "bundled-engine")]
+        return Some(env!("MM_BUNDLED_SD_VERSION"));
         #[cfg(not(feature = "bundled-engine"))]
         None
     }

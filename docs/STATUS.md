@@ -56,10 +56,21 @@ scaled and detached on a running model, and a draft model, all end to end. Not t
 on the machine) and speech (no model that the pinned `llama-tts` runs: it now takes a model plus an `mmproj`, such
 as Qwen3-TTS, not OuteTTS). `model.convert` answers 501: Hugging Face conversion needs Python and PyTorch.
 
+## Image generation
+
+`POST /v1/images/generations`, the operation `image.generate` (a job: sampling steps as progress, cancel) and the
+`image` command, through stable-diffusion.cpp's `sd-cli`, built from `engines/stable-diffusion.cpp` as a CMake project of
+its own (own ggml; PNG only) and embedded with the `bundled-engine` feature ([images.md](images.md)). One process per
+request, one at a time. Tested on Windows 10 (CPU build): a real Stable Diffusion 1.5 checkpoint at 256x256, 4 steps,
+through the endpoint and the operation (valid PNG, step progress counted). Not tested: FLUX and SDXL (the SDXL GGUFs
+on the machine are ComfyUI-style UNet-only files, which `sd-cli` cannot load), GPU backends, `response_format: url` with
+a real image. `/v1/images/edits` answers 501 (image-to-image and inpainting exist in sd.cpp, but OpenAI's
+transparency masks do not map cleanly).
+
 ## Not done yet
 
 - A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
-- Other engines (vLLM, ExLlama); image generation (stable-diffusion.cpp).
+- Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server).
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
 - The desktop app's Tauri shell (`desktop-app/src/main.rs`) and its Vue pages were written against the hub API but never

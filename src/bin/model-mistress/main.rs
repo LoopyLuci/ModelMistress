@@ -108,6 +108,38 @@ enum Cmd {
         #[arg(long)]
         format: Option<String>,
     },
+    /// Generate an image with the built-in stable-diffusion.cpp: `image "a red fox in snow" --out fox.png [--model M]
+    /// [--size 512x512] [--steps 20]`. See docs/images.md for the models.
+    Image {
+        prompt: String,
+        /// Where to write the PNG (with --count above 1: fox_0.png, fox_1.png, ...).
+        #[arg(long, short, default_value = "image.png")]
+        out: PathBuf,
+        /// An image model (default: the image_model setting, else the only one found).
+        #[arg(long)]
+        model: Option<String>,
+        /// What to leave out.
+        #[arg(long)]
+        negative: Option<String>,
+        /// How many images.
+        #[arg(long = "count", short = 'n')]
+        count: Option<u32>,
+        /// WIDTHxHEIGHT, each a multiple of 8 (default 512x512).
+        #[arg(long)]
+        size: Option<String>,
+        /// Sampling steps (default 20).
+        #[arg(long)]
+        steps: Option<u32>,
+        /// Guidance scale (1 for FLUX models).
+        #[arg(long)]
+        cfg_scale: Option<f64>,
+        /// Sampling method, for example euler, euler_a or dpm++2m.
+        #[arg(long)]
+        sampler: Option<String>,
+        /// A number that makes the picture repeatable (default: random).
+        #[arg(long)]
+        seed: Option<i64>,
+    },
     /// Make a smaller copy of a model with llama-quantize: `quantize llama3.2:1b Q4_K_M`, or a .gguf file's path.
     Quantize {
         /// A model id from `models`, or the path of a .gguf file.
@@ -452,6 +484,73 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                     u["prompt_tokens"].as_u64().unwrap_or(0) + u["completion_tokens"].as_u64().unwrap_or(0),
                     if u["revoked"].is_null() { "" } else { "  (revoked)" }
                 );
+            }
+        }
+        Cmd::Image {
+            prompt,
+            out,
+            model,
+            negative,
+            count,
+            size,
+            steps,
+            cfg_scale,
+            sampler,
+            seed,
+        } => {
+            // The hub writes the file, and its working folder is not ours.
+            let out = std::path::absolute(&out)?;
+            let mut a = json!({"prompt": prompt, "output": out});
+            for (k, v) in [
+                ("model", model),
+                ("negative_prompt", negative),
+                ("size", size),
+                ("sampler", sampler),
+            ] {
+                if let Some(v) = v {
+                    a[k] = json!(v);
+                }
+            }
+            if let Some(v) = count {
+                a["n"] = json!(v);
+            }
+            if let Some(v) = steps {
+                a["steps"] = json!(v);
+            }
+            if let Some(v) = cfg_scale {
+                a["cfg_scale"] = json!(v);
+            }
+            if let Some(v) = seed {
+                a["seed"] = json!(v);
+            }
+            let c = client().await?;
+            let job = c.call("image.generate", a).await?;
+            let id = job["job"].as_str().unwrap_or("").to_string();
+            loop {
+                let j = c.call("job.get", json!({"job": id})).await?;
+                let status = j["status"].as_str().unwrap_or("");
+                eprint!(
+                    "\r{:>5.1}%  {}          ",
+                    j["percent"].as_f64().unwrap_or(0.0),
+                    j["message"].as_str().unwrap_or("")
+                );
+                if status != "running" {
+                    eprintln!();
+                    if status != "done" {
+                        anyhow::bail!("{status}: {}", j["message"].as_str().unwrap_or(""));
+                    }
+                    for f in j["result"]["files"].as_array().into_iter().flatten() {
+                        println!("{}", f.as_str().unwrap_or(""));
+                    }
+                    eprintln!(
+                        "[{} | seed {} | {} s]",
+                        j["result"]["model"].as_str().unwrap_or(""),
+                        j["result"]["seed"],
+                        j["result"]["seconds"]
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
         Cmd::Quantize {
