@@ -3,18 +3,23 @@
 //!
 //! The working core is `catalog` (what models are on this machine), `engine` (llama.cpp processes, Ollama
 //! pass-through), `hub` (the HTTP server), `audio` and `speech` (speech to text), `tts` (text to speech), `tools`
-//! (quantize, LoRA, draft models, embeddings, rerank) and `client` (the CLI's and MCP's
-//! way to a running hub).
+//! (quantize, LoRA, draft models, embeddings, rerank), `hosting` (keys, quotas and usage for peers) and
+//! `client` (the CLI's, MCP's and the desktop app's way to a running hub).
 
 pub mod audio;
 pub mod catalog;
 pub mod client;
 pub mod engine;
+pub mod hosting;
 pub mod hub;
 pub mod pull;
 pub mod speech;
+pub mod testing;
 pub mod tools;
 pub mod tts;
+
+#[cfg(test)]
+mod tests_hosting;
 
 // ---- legacy -----------------------------------------------------------------------------------------------------
 // The first design's scaffolding, kept until it is either rebuilt on the core above or removed. Its CPU engine

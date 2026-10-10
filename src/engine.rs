@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -92,6 +92,8 @@ pub struct Settings {
     pub tts_model: Option<String>,
     /// The voice (a recording in `<home>/voices`, or a full path) used when a request names none or an OpenAI voice.
     pub tts_voice: Option<String>,
+    /// Allow `serve --host` to listen beyond this machine (it also needs at least one peer key). Off by default.
+    pub allow_network: bool,
 }
 
 impl Default for Settings {
@@ -116,6 +118,7 @@ impl Default for Settings {
             whisper_model: None,
             tts_model: None,
             tts_voice: None,
+            allow_network: false,
         }
     }
 }
@@ -153,6 +156,10 @@ pub struct LoadOpts {
     pub reranking: bool,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Hot swap: if the model is loaded, start the new one beside it and switch over when it is ready. Requests
+    /// already running finish on the old one; new ones go to the new one.
+    #[serde(default)]
+    pub reload: bool,
 }
 
 /// A LoRA adapter attached to a model.
@@ -233,6 +240,25 @@ pub struct Instance {
     pub opts: LoadOpts,
     pub extras: Extras,
     last_used: AtomicU64,
+    /// Requests being served now (see [`Lease`]).
+    inflight: AtomicUsize,
+    /// No longer in `loaded`: it stops when its last request is done.
+    retired: AtomicBool,
+    stopped: AtomicBool,
+    /// Runs when it stops (a server that is not our child, such as a stand-in in tests).
+    on_stop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// A request in progress on an instance. The instance is not stopped while any lease on it is held, even when a hot
+/// swap or an eviction has already taken it out of service.
+pub struct Lease(Arc<Instance>);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::AcqRel) == 1 && self.0.retired.load(Ordering::Acquire) {
+            self.0.stop();
+        }
+    }
 }
 
 impl Instance {
@@ -248,9 +274,19 @@ impl Instance {
                "embeddings": self.embeddings, "reranking": self.reranking, "args": self.args, "log": self.log,
                "lora": self.extras.lora, "draft": self.extras.draft})
     }
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Acquire)
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
     fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
         if let Some(mut c) = self.child.lock().take() {
             let _ = c.start_kill();
+        }
+        if let Some(f) = self.on_stop.lock().take() {
+            f();
         }
     }
 }
@@ -277,6 +313,8 @@ pub struct Engine {
     settings: RwLock<Settings>,
     catalog: RwLock<Vec<ModelEntry>>,
     loaded: Mutex<HashMap<String, Arc<Instance>>>,
+    /// Instances taken out of service that still have requests running, with when they were retired.
+    draining: Mutex<Vec<(Instant, Arc<Instance>)>>,
     load_lock: tokio::sync::Mutex<()>,
     pub metrics: Mutex<BTreeMap<String, ModelMetrics>>,
     pub http: reqwest::Client,
@@ -312,6 +350,7 @@ impl Engine {
             settings: RwLock::new(settings),
             catalog: RwLock::new(vec![]),
             loaded: Mutex::new(HashMap::new()),
+            draining: Mutex::new(Vec::new()),
             load_lock: tokio::sync::Mutex::new(()),
             metrics: Mutex::new(BTreeMap::new()),
             http: reqwest::Client::builder()
@@ -582,12 +621,12 @@ impl Engine {
         let was = self.loaded.lock().get(&entry.id).map(|i| i.opts.clone());
         self.set_extras(&entry.id, new)?;
         let Some(opts) = was else { return Ok(false) };
-        self.unload(&entry.id);
+        // a hot swap: the old setup serves until the new one is ready, and stays if the new one does not load
+        let opts = LoadOpts { reload: true, ..opts };
         match self.ensure_loaded(entry, &opts, true).await {
             Ok(_) => Ok(true),
             Err(f) => {
                 let _ = self.set_extras(&entry.id, old);
-                let _ = self.ensure_loaded(entry, &opts, true).await;
                 Err(f)
             }
         }
@@ -641,10 +680,14 @@ impl Engine {
     // ---- loading ------------------------------------------------------------------------------------------
 
     pub async fn ensure_loaded(&self, entry: &ModelEntry, opts: &LoadOpts, explicit: bool) -> Result<Arc<Instance>> {
-        if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
-            if !(explicit && (opts.embeddings != i.embeddings || opts.reranking != i.reranking)) {
-                i.touch();
-                return Ok(i);
+        let reload = explicit && opts.reload;
+        let current = |i: &Instance| !(explicit && (opts.embeddings != i.embeddings || opts.reranking != i.reranking));
+        if !reload {
+            if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
+                if current(&i) {
+                    i.touch();
+                    return Ok(i);
+                }
             }
         }
         if !explicit && !self.settings.read().autoload {
@@ -655,21 +698,83 @@ impl Engine {
             ));
         }
         let _guard = self.load_lock.lock().await;
-        if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
-            if !(explicit && (opts.embeddings != i.embeddings || opts.reranking != i.reranking)) {
-                return Ok(i);
+        if !reload {
+            if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
+                if current(&i) {
+                    return Ok(i);
+                }
             }
+            self.unload(&entry.id);
+            self.make_room();
         }
-        self.unload(&entry.id);
-        self.make_room();
+        // A reload keeps the old instance serving while the new one loads (both are in memory for a while), then
+        // `install` switches over.
         let t0 = Instant::now();
         let inst = Arc::new(self.spawn(entry, opts).await?);
-        self.loaded.lock().insert(entry.id.clone(), inst.clone());
+        self.install(inst.clone());
         let mut m = self.metrics.lock();
         let mm = m.entry(entry.id.clone()).or_default();
         mm.loads += 1;
         mm.last_load_ms = t0.elapsed().as_millis() as u64;
         Ok(inst)
+    }
+
+    /// Put an instance into service as its model's one. One already there is retired: it takes no new requests
+    /// (they find this one) and stops when those it is serving are done.
+    fn install(&self, inst: Arc<Instance>) {
+        let old = self.loaded.lock().insert(inst.model.clone(), inst);
+        if let Some(old) = old {
+            self.retire(old);
+        }
+    }
+
+    /// Take an instance that is no longer in `loaded` out of service without dropping what it is serving.
+    fn retire(&self, inst: Arc<Instance>) {
+        inst.retired.store(true, Ordering::Release);
+        if inst.inflight() == 0 {
+            inst.stop();
+        } else {
+            self.draining.lock().push((Instant::now(), inst));
+        }
+    }
+
+    /// Count a request on `inst`, if it is still the one in service (else the caller asks `ensure_loaded` again).
+    pub fn lease(&self, inst: &Arc<Instance>) -> Option<Lease> {
+        let loaded = self.loaded.lock();
+        match loaded.get(&inst.model) {
+            Some(cur) if Arc::ptr_eq(cur, inst) => {
+                inst.inflight.fetch_add(1, Ordering::AcqRel);
+                Some(Lease(inst.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Use a llama-server that is already listening on 127.0.0.1:`port` as `model`'s instance, replacing (hot
+    /// swapping) the one in service. For stand-ins in tests; `on_stop` runs when it is stopped.
+    #[doc(hidden)]
+    pub fn adopt(&self, model: &str, port: u16, key: &str, on_stop: Option<Box<dyn FnOnce() + Send>>) -> Arc<Instance> {
+        let inst = Arc::new(Instance {
+            model: model.to_string(),
+            port,
+            pid: 0,
+            key: key.to_string(),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            args: vec![],
+            log: PathBuf::new(),
+            embeddings: false,
+            reranking: false,
+            opts: LoadOpts::default(),
+            extras: Extras::default(),
+            last_used: AtomicU64::new(now_s()),
+            inflight: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            on_stop: Mutex::new(on_stop),
+        });
+        self.install(inst.clone());
+        inst
     }
 
     fn make_room(&self) {
@@ -691,20 +796,24 @@ impl Engine {
         }
     }
 
+    /// Take a model out of service. A request it is serving finishes first.
     pub fn unload(&self, id: &str) -> bool {
         let inst = self.loaded.lock().remove(id);
         match inst {
             Some(i) => {
-                i.stop();
+                self.retire(i);
                 true
             }
             None => false,
         }
     }
 
+    /// Stop every model now, including those still finishing requests (shutdown).
     pub fn unload_all(&self) -> usize {
         let all: Vec<_> = self.loaded.lock().drain().map(|(_, i)| i).collect();
-        for i in &all {
+        let draining: Vec<_> = self.draining.lock().drain(..).map(|(_, i)| i).collect();
+        for i in all.iter().chain(&draining) {
+            i.retired.store(true, Ordering::Release);
             i.stop();
         }
         all.len()
@@ -800,13 +909,20 @@ impl Engine {
             log: log.clone(),
             embeddings: opts.embeddings,
             reranking: opts.reranking,
-            opts: opts.clone(),
+            opts: LoadOpts {
+                reload: false,
+                ..opts.clone()
+            },
             extras: if opts.embeddings || opts.reranking {
                 Extras::default()
             } else {
                 extras
             },
             last_used: AtomicU64::new(now_s()),
+            inflight: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            on_stop: Mutex::new(None),
         };
         // Wait until it answers /health with 200 (it answers 503 while loading).
         let deadline = Instant::now() + Duration::from_secs(s.load_timeout_s.max(5));
@@ -911,14 +1027,24 @@ impl Engine {
         for g in gone {
             self.unload(&g);
         }
+        // Retired instances: forget the stopped ones, and stop any whose request has run for 15 minutes.
+        self.draining.lock().retain(|(since, i)| {
+            if since.elapsed() > Duration::from_secs(900) {
+                i.stop();
+            }
+            !i.is_stopped()
+        });
     }
 
     // ---- requests -----------------------------------------------------------------------------------------
 
     /// Send an OpenAI-style request (`path` like "/v1/chat/completions") to where `body.model` lives.
-    pub async fn forward(&self, path: &str, mut body: Value) -> Result<(String, reqwest::Response)> {
+    /// The [`Lease`] (for a model of ours) must be held until the answer has been read to its end: until then the
+    /// model is not stopped by a hot swap or an eviction.
+    pub async fn forward(&self, path: &str, mut body: Value) -> Result<(String, reqwest::Response, Option<Lease>)> {
         let name = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
         let target = self.resolve(&name)?;
+        let mut lease = None;
         let (id, req) = match target {
             Target::Llama(entry) => {
                 let opts = LoadOpts {
@@ -926,7 +1052,18 @@ impl Engine {
                     reranking: path.ends_with("/rerank"),
                     ..Default::default()
                 };
-                let inst = self.ensure_loaded(&entry, &opts, false).await?;
+                let mut inst = self.ensure_loaded(&entry, &opts, false).await?;
+                // a hot swap may retire the instance between the two calls: then the new one is the answer
+                for _ in 0..8 {
+                    lease = self.lease(&inst);
+                    if lease.is_some() {
+                        break;
+                    }
+                    inst = self.ensure_loaded(&entry, &opts, false).await?;
+                }
+                if lease.is_none() {
+                    return Err(Fail::unavailable(format!("{} is being replaced; try again", entry.id)));
+                }
                 let (want, have) = ((opts.embeddings, opts.reranking), (inst.embeddings, inst.reranking));
                 if want != (false, false) && want != have {
                     let (what, flag) = if opts.reranking {
@@ -963,7 +1100,7 @@ impl Engine {
             .send()
             .await
             .map_err(|e| Fail::unavailable(format!("{id} did not answer: {e}")))?;
-        Ok((id, resp))
+        Ok((id, resp, lease))
     }
 
     pub fn record(&self, id: &str, ok: bool, ms: u64, usage: Option<&Value>) {

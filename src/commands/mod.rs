@@ -87,7 +87,7 @@ impl SlashCommand for LoadModelCmd {
     fn category(&self) -> &'static str { "Model" }
     fn description(&self) -> &'static str { "Load a model from disk" }
     fn usage(&self) -> &'static str { "/load <path> [name] [context_length=4096]" }
-    fn examples(&self) -> Vec<&'static str> { vec!["/load /models/MyModel", "/load ./models/llama.gguf mymodel 8192"] }
+    fn examples(&self) -> Vec<&'static str> { vec!["/load ~/models/MyModel", "/load ./models/llama.gguf mymodel 8192"] }
     fn execute(&self, args: Vec<String>) -> Result<SlashResponse, SlashError> {
         if args.is_empty() { return Err(SlashError::MissingArg("path".to_string())); }
         Ok(SlashResponse::success(format!("📥 Loading model '{}'...", args[0])))
@@ -228,7 +228,7 @@ impl SlashCommand for HelpCmd {
   /config         Show config
 
 Examples:
-  /load /models/llama.gguf
+  /load ~/models/llama.gguf
   /infer lfm2.5:8b \"Explain quantum computing\"
   /agent control hermes cancel";
         Ok(SlashResponse::success(help_text.to_string()))

@@ -26,6 +26,21 @@ Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in lla
   `config.set` saving to `config.toml`.
 - MCP over stdio (`model-mistress mcp`).
 
+## Hosting for peers
+
+Per-peer keys (stored hashed in the home folder), quotas (requests per minute, tokens per day, concurrent requests,
+`429` with `Retry-After`), model allow-lists, usage accounting, revocation that applies to the next request, and a hot
+swap (`model.load` with `reload`, LoRA or draft changes, unload, eviction) that lets running requests, streams
+included, finish on the old model ([hosting.md](hosting.md)). Listening beyond loopback needs `allow_network` and a key.
+Tested over HTTP with stand-ins for `llama-server`: quotas, revocation, allow-lists, and a hot swap under concurrent
+requests and a stream that drops nothing. Not tested: a hot swap of a real model under load.
+
+## The desktop app
+
+Talks to the hub only (list, pull, delete, load, unload, chat, speech, keys, usage); its Ollama client is gone
+([desktop.md](desktop.md)). Its client code is tested against a hub in the test process; the Tauri window itself was not
+built here.
+
 ## Speech to text (feature `whisper`)
 
 `/v1/audio/transcriptions` and `/v1/audio/translations` run whisper.cpp inside the hub (see [speech.md](speech.md)).
@@ -44,11 +59,13 @@ as Qwen3-TTS, not OuteTTS). `model.convert` answers 501: Hugging Face conversion
 ## Not done yet
 
 - A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
-- Hosting for other machines (per-peer keys, quotas): `serve --host` exposes the token-protected API, and that is all.
 - Other engines (vLLM, ExLlama); image generation (stable-diffusion.cpp).
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
-- The desktop app (`desktop-app/`, Tauri) still talks to Ollama directly, not to the hub.
+- The desktop app's Tauri shell (`desktop-app/src/main.rs`) and its Vue pages were written against the hub API but never
+  built or run: Tauri's build dependencies were not available where this was done. Its API, command and model-list
+  modules are tested.
+- Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
 
 ## Legacy code
 

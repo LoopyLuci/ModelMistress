@@ -18,6 +18,8 @@
 //!   POST /v1/audio/translations     the same, into English
 //!   POST /v1/audio/speech           OpenAI text to speech (JSON in, WAV or raw PCM out), llama.cpp's llama-tts
 //!
+//! A peer key (see `hosting`) may use only the OpenAI routes above; the owner's token can do everything.
+//!
 //! Errors are {"error": {"code", "message"}} with a 4xx/5xx status (OpenAI clients read `message`).
 
 use std::net::SocketAddr;
@@ -26,15 +28,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{json, Value};
 
-use crate::engine::{Engine, Fail, LoadOpts, Settings, Target};
+use crate::engine::{Engine, Fail, Lease, LoadOpts, Settings, Target};
+use crate::hosting::{Keys, Permit, Quotas, Verdict};
 use crate::{audio, speech, tools, tts};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,7 +50,27 @@ pub struct Hub {
     pub token: Arc<String>,
     pub started: Instant,
     pub stop: Arc<tokio::sync::Notify>,
+    /// The peer keys (see `hosting`).
+    pub keys: Arc<Keys>,
 }
+
+impl Hub {
+    pub fn new(engine: Arc<Engine>, token: String) -> Self {
+        let keys = Keys::open(&engine.home);
+        Self {
+            engine,
+            jobs: Arc::new(Default::default()),
+            token: Arc::new(token),
+            started: Instant::now(),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            keys,
+        }
+    }
+}
+
+/// Who is calling: the owner (None) or a peer with a key.
+#[derive(Clone)]
+pub struct Caller(pub Option<Arc<Permit>>);
 
 pub struct ApiError(Fail);
 
@@ -77,22 +101,87 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn auth(State(hub): State<Hub>, req: Request, next: Next) -> Response {
+/// The routes a peer key may use.
+fn peer_route(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/models"
+            | "/v1/chat/completions"
+            | "/v1/completions"
+            | "/v1/embeddings"
+            | "/v1/rerank"
+            | "/rerank"
+            | "/v1/audio/speech"
+            | "/v1/audio/transcriptions"
+            | "/v1/audio/translations"
+    )
+}
+
+/// The owner's token is accepted from this machine only. (No address known, as in tests that call the router
+/// directly: this machine.)
+pub fn owner_allowed(peer: Option<SocketAddr>) -> bool {
+    peer.is_none_or(|a| a.ip().to_canonical().is_loopback())
+}
+
+async fn auth(State(hub): State<Hub>, mut req: Request, next: Next) -> Response {
+    let from = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let h = req.headers();
     let given = h
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| h.get("x-api-key").and_then(|v| v.to_str().ok()));
-    if !given.is_some_and(|t| same(t.as_bytes(), hub.token.as_bytes())) {
-        return ApiError(Fail::new(
+        .or_else(|| h.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .map(str::to_string);
+    let unauthorized = || {
+        ApiError(Fail::new(
             401,
             "unauthorized",
-            "this needs the hub's token (it is also the API key)",
+            "this needs the hub's token or a peer key (either is also the API key)",
+        ))
+        .into_response()
+    };
+    let Some(given) = given else { return unauthorized() };
+    if same(given.as_bytes(), hub.token.as_bytes()) {
+        if !owner_allowed(from) {
+            return ApiError(Fail::new(
+                403,
+                "owner_token_local_only",
+                "the hub's own token is accepted from this machine only; use a peer key (model-mistress keys create)",
+            ))
+            .into_response();
+        }
+        req.extensions_mut().insert(Caller(None));
+        return next.run(req).await;
+    }
+    if !hub.keys.knows(&given) {
+        return unauthorized();
+    }
+    if !peer_route(req.uri().path()) {
+        return ApiError(Fail::new(
+            403,
+            "forbidden",
+            "a peer key can use the model routes only (/v1/models, chat, completions, embeddings, rerank, audio)",
         ))
         .into_response();
     }
-    next.run(req).await
+    match hub.keys.check(&given) {
+        Verdict::Admitted(permit) => {
+            req.extensions_mut().insert(Caller(Some(permit)));
+            next.run(req).await
+        }
+        Verdict::Revoked => ApiError(Fail::new(401, "key_revoked", "this key was revoked")).into_response(),
+        Verdict::Unknown => unauthorized(),
+        Verdict::Rejected {
+            retry_after,
+            code,
+            message,
+        } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after.to_string())],
+            Json(json!({"error": {"code": code, "message": message, "type": code, "retry_after_s": retry_after}})),
+        )
+            .into_response(),
+    }
 }
 
 // ---- operations ---------------------------------------------------------------------------------------------
@@ -113,7 +202,8 @@ pub fn operations() -> Vec<Value> {
         "threads": {"type": "integer", "minimum": 1},
         "embeddings": {"type": "boolean", "description": "serve /v1/embeddings instead of chat"},
         "reranking": {"type": "boolean", "description": "serve /v1/rerank instead of chat (a reranker model)"},
-        "extra_args": {"type": "array", "items": {"type": "string"}, "description": "more llama-server arguments"}
+        "extra_args": {"type": "array", "items": {"type": "string"}, "description": "more llama-server arguments"},
+        "reload": {"type": "boolean", "description": "hot swap: load a fresh copy beside the running one and switch over when it is ready; requests in progress finish on the old copy"}
     });
     vec![
         op(
@@ -418,6 +508,45 @@ pub fn operations() -> Vec<Value> {
             &[],
         ),
         op(
+            "key.create",
+            "Make an API key for a peer (another machine) with optional quotas and an allow-list of models. The key is shown once, here; only its hash is kept",
+            true,
+            false,
+            json!({
+                "peer": {"type": "string", "description": "who the key is for (1 to 64 characters)"},
+                "requests_per_min": {"type": "integer", "minimum": 1},
+                "tokens_per_day": {"type": "integer", "minimum": 1, "description": "prompt + completion tokens per UTC day"},
+                "concurrent": {"type": "integer", "minimum": 1, "description": "requests at a time (a stream counts until it ends)"},
+                "models": {"type": "array", "items": {"type": "string"},
+                           "description": "model ids the key may use; a trailing * is a prefix; none = every model"}
+            }),
+            &["peer"],
+        ),
+        op(
+            "key.list",
+            "The peer keys (never the secrets): id, peer, quotas, allow-list, revoked",
+            false,
+            false,
+            json!({}),
+            &[],
+        ),
+        op(
+            "key.revoke",
+            "Revoke a peer key by id, or every key of a peer by name; it stops working at once",
+            true,
+            true,
+            json!({"key": {"type": "string", "description": "a key id from key.list, or a peer name"}}),
+            &["key"],
+        ),
+        op(
+            "usage.get",
+            "What each peer key has used: requests, errors, refused requests, tokens (also today's), in flight, per model",
+            false,
+            false,
+            json!({"key": {"type": "string", "description": "a key id or peer name (default: all)"}}),
+            &[],
+        ),
+        op(
             "config.set",
             "Change settings; only the fields given change, and they are saved",
             true,
@@ -536,7 +665,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                               "max_tokens": a.get("max_tokens").cloned().unwrap_or(json!(512)),
                               "temperature": a.get("temperature").cloned().unwrap_or(json!(0.7)), "stream": false});
             let t0 = Instant::now();
-            let (model, resp) = e.forward("/v1/chat/completions", body).await?;
+            let (model, resp, _lease) = e.forward("/v1/chat/completions", body).await?;
             let status = resp.status();
             let v: Value = resp.json().await.unwrap_or(Value::Null);
             let ms = t0.elapsed().as_millis() as u64;
@@ -663,6 +792,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             forward_json(hub, "/v1/rerank", body).await?
         }
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
+        "key.create" | "key.list" | "key.revoke" | "usage.get" => key_call(&hub.keys, id, a).map_err(ApiError::from)?,
         "config.get" => shown_settings(&e.settings()),
         "config.set" => {
             let patch = a
@@ -691,6 +821,49 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
     })
 }
 
+fn text<'a>(v: &'a Value, k: &str) -> Result<&'a str, Fail> {
+    v.get(k)
+        .and_then(Value::as_str)
+        .ok_or_else(|| Fail::invalid(format!("{k} is required")))
+}
+
+/// The key operations, on any key store (the CLI also runs them without a hub, on the files in the home folder).
+pub fn key_call(keys: &Keys, id: &str, a: &Value) -> Result<Value, Fail> {
+    Ok(match id {
+        "key.create" => {
+            let n = |k: &str| a.get(k).and_then(Value::as_u64);
+            let quotas = Quotas {
+                requests_per_min: n("requests_per_min").map(|v| v.min(u32::MAX as u64) as u32),
+                tokens_per_day: n("tokens_per_day"),
+                concurrent: n("concurrent").map(|v| v.min(u32::MAX as u64) as u32),
+            };
+            let models: Vec<String> = match a.get("models") {
+                None | Some(Value::Null) => vec![],
+                Some(Value::Array(l)) => l
+                    .iter()
+                    .map(|m| m.as_str().map(str::to_string))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| Fail::invalid("models must be a list of strings"))?,
+                Some(_) => return Err(Fail::invalid("models must be a list of strings")),
+            };
+            let (mut info, secret) = keys.create(text(a, "peer")?, quotas, models).map_err(Fail::invalid)?;
+            info["key"] = json!(secret);
+            info["note"] = json!("this is the only time the key is shown");
+            info
+        }
+        "key.list" => json!(keys.list()),
+        "key.revoke" => {
+            let n = keys.revoke(text(a, "key")?).map_err(Fail::invalid)?;
+            if n == 0 && keys.usage(Some(text(a, "key")?)).is_empty() {
+                return Err(Fail::not_found("no such key or peer (key.list shows them)"));
+            }
+            json!({"revoked": n})
+        }
+        "usage.get" => json!(keys.usage(a.get("key").and_then(Value::as_str))),
+        _ => return Err(Fail::not_found(format!("no operation {id}"))),
+    })
+}
+
 /// What model.convert answers: converting Hugging Face weights needs Python and PyTorch, which are not built in.
 const CONVERT_HELP: &str =
     "Converting a Hugging Face model to GGUF is not built in: llama.cpp's converter is a Python \
@@ -702,7 +875,7 @@ for a smaller file. Or download a model that is already in GGUF format with mode
 /// Sends a body to a model's llama-server and returns its JSON answer.
 async fn forward_json(hub: &Hub, path: &'static str, body: Value) -> ApiResult<Value> {
     let t0 = Instant::now();
-    let (model, resp) = hub.engine.forward(path, body).await?;
+    let (model, resp, _lease) = hub.engine.forward(path, body).await?;
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(Value::Null);
     hub.engine.record(
@@ -1000,17 +1173,22 @@ async fn stop(State(hub): State<Hub>) -> Json<Value> {
     Json(json!({"result": {"stopping": true}}))
 }
 
-async fn openai_models(State(hub): State<Hub>) -> Json<Value> {
+async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>) -> Json<Value> {
     let e = &hub.engine;
+    let allowed = |id: &str| who.0.as_ref().is_none_or(|p| p.allows(id, id));
     let mut data: Vec<Value> = e
         .catalog()
         .iter()
+        .filter(|m| allowed(&m.id))
         .map(|m| {
             json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
                          "meta": m.summary(e.is_loaded(&m.id))})
         })
         .collect();
     for m in e.ollama_models().await {
+        if !allowed(&format!("ollama/{}", m["name"].as_str().unwrap_or(""))) {
+            continue;
+        }
         data.push(
             json!({"id": format!("ollama/{}", m["name"].as_str().unwrap_or("")), "object": "model",
                          "created": 0, "owned_by": "ollama"}),
@@ -1019,15 +1197,110 @@ async fn openai_models(State(hub): State<Hub>) -> Json<Value> {
     Json(json!({"object": "list", "data": data}))
 }
 
-async fn passthrough(hub: Hub, path: &'static str, body: Value) -> ApiResult<Response> {
+/// Refuse a peer a model its key does not allow.
+fn check_model(hub: &Hub, who: &Caller, asked: &str) -> ApiResult<()> {
+    let Some(p) = &who.0 else { return Ok(()) };
+    let resolved = match hub.engine.resolve(asked) {
+        Ok(Target::Llama(e)) => e.id,
+        Ok(Target::Ollama(n)) => format!("ollama/{n}"),
+        Err(_) => asked.to_string(),
+    };
+    if p.allows(asked, &resolved) {
+        return Ok(());
+    }
+    Err(Fail::new(
+        403,
+        "model_not_allowed",
+        format!(
+            "this key may not use \"{asked}\" (its models: {})",
+            p.allow_list().join(", ")
+        ),
+    )
+    .into())
+}
+
+/// Ends a request that was handed to a model: keeps the model from being stopped under it, and counts the outcome
+/// (and the tokens, from the answer's `usage`, or an estimate from the stream) for the peer's key when it is dropped.
+struct Tracker {
+    _lease: Option<Lease>,
+    who: Option<Arc<Permit>>,
+    model: String,
+    ok: bool,
+    tail: String,
+    events: u64,
+}
+
+impl Tracker {
+    fn observe(&mut self, chunk: &[u8]) {
+        if self.who.is_none() {
+            return;
+        }
+        let text = String::from_utf8_lossy(chunk);
+        self.events += text.matches("data:").count() as u64;
+        self.tail.push_str(&text);
+        if self.tail.len() > 4096 {
+            let mut cut = self.tail.len() - 4096;
+            while !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+    }
+}
+
+impl Drop for Tracker {
+    fn drop(&mut self) {
+        let Some(p) = &self.who else { return };
+        let usage = self.tail.rfind("\"usage\":").and_then(|i| {
+            serde_json::Deserializer::from_str(self.tail[i + 8..].trim_start())
+                .into_iter::<Value>()
+                .next()?
+                .ok()
+        });
+        let n = |k: &str| usage.as_ref().and_then(|u| u[k].as_u64());
+        let (prompt, completion) = match (n("prompt_tokens"), n("completion_tokens")) {
+            (None, None) => (0, self.events.saturating_sub(1)), // about a token an event, less the [DONE]
+            (a, b) => (a.unwrap_or(0), b.unwrap_or(0)),
+        };
+        p.finish(&self.model, self.ok, prompt, completion);
+    }
+}
+
+async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> ApiResult<Response> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let asked = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    check_model(&hub, &who, &asked)?;
     let t0 = Instant::now();
-    let (model, resp) = hub.engine.forward(path, body).await?;
+    let (model, resp, lease) = match hub.engine.forward(path, body).await {
+        Ok(x) => x,
+        Err(f) => {
+            if let Some(p) = &who.0 {
+                p.finish(&asked, false, 0, 0);
+            }
+            return Err(f.into());
+        }
+    };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = resp.headers().get("content-type").cloned();
+    let mut tracker = Tracker {
+        _lease: lease,
+        who: who.0.clone(),
+        model: model.clone(),
+        ok: status.is_success(),
+        tail: String::new(),
+        events: 0,
+    };
     let mut out = if streaming && status.is_success() {
         hub.engine.record(&model, true, t0.elapsed().as_millis() as u64, None);
-        Response::new(Body::from_stream(resp.bytes_stream()))
+        // the tracker lives as long as the stream: the model stays up, and the peer's request stays counted as
+        // running, until the last byte has gone out
+        Response::new(Body::from_stream(resp.bytes_stream().map(move |chunk| {
+            match &chunk {
+                Ok(b) => tracker.observe(b),
+                Err(_) => tracker.ok = false,
+            }
+            chunk
+        })))
     } else {
         let bytes = resp.bytes().await.map_err(|x| Fail::unavailable(x.to_string()))?;
         let usage = serde_json::from_slice::<Value>(&bytes)
@@ -1039,6 +1312,7 @@ async fn passthrough(hub: Hub, path: &'static str, body: Value) -> ApiResult<Res
             t0.elapsed().as_millis() as u64,
             usage.as_ref(),
         );
+        tracker.observe(&bytes);
         Response::new(Body::from(bytes))
     };
     *out.status_mut() = status;
@@ -1048,28 +1322,63 @@ async fn passthrough(hub: Hub, path: &'static str, body: Value) -> ApiResult<Res
     Ok(out)
 }
 
-async fn chat(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Response> {
-    passthrough(hub, "/v1/chat/completions", body).await
+async fn chat(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    passthrough(hub, who, "/v1/chat/completions", body).await
 }
 
-async fn completions(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Response> {
-    passthrough(hub, "/v1/completions", body).await
+async fn completions(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    passthrough(hub, who, "/v1/completions", body).await
 }
 
-async fn embeddings(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Response> {
+async fn embeddings(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
     tools::check_embeddings(&body).map_err(Fail::invalid)?;
-    passthrough(hub, "/v1/embeddings", body).await
+    passthrough(hub, who, "/v1/embeddings", body).await
 }
 
-async fn rerank(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Response> {
+async fn rerank(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
     let body = tools::check_rerank(&body).map_err(Fail::invalid)?;
-    passthrough(hub, "/v1/rerank", body).await
+    passthrough(hub, who, "/v1/rerank", body).await
+}
+
+/// Audio has no model of its own to resolve: the name in the request (`whisper-1`, `tts-1` when it says none) is
+/// what a peer key's allow-list is checked against.
+fn check_audio_model(hub: &Hub, who: &Caller, asked: &str, generic: &str) -> ApiResult<()> {
+    check_model(hub, who, if asked.is_empty() { generic } else { asked })
+}
+
+fn finish_audio(who: &Caller, model: &str, ok: bool) {
+    if let Some(p) = &who.0 {
+        p.finish(model, ok, 0, 0);
+    }
 }
 
 /// `POST /v1/audio/speech`: JSON in, the audio out.
-async fn speech(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Response> {
+async fn speech(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
     let req = tts::SpeechRequest::from_json(&body).map_err(Fail::invalid)?;
-    let (bytes, _, _) = run_tts(&hub, &req).await?;
+    check_audio_model(&hub, &who, &req.model, "tts-1")?;
+    let ran = run_tts(&hub, &req).await;
+    finish_audio(&who, &req.model, ran.is_ok());
+    let (bytes, _, _) = ran?;
     Ok(([("content-type", req.format.content_type())], bytes).into_response())
 }
 
@@ -1077,14 +1386,24 @@ async fn speech(State(hub): State<Hub>, Json(body): Json<Value>) -> ApiResult<Re
 const MAX_AUDIO_BYTES: usize = 512 << 20;
 
 /// `POST /v1/audio/transcriptions` and `/v1/audio/translations`: multipart in, the transcript out.
-async fn speech_to_text(hub: Hub, headers: HeaderMap, body: Bytes, translate: bool) -> ApiResult<Response> {
+async fn speech_to_text(
+    hub: Hub,
+    who: Caller,
+    headers: HeaderMap,
+    body: Bytes,
+    translate: bool,
+) -> ApiResult<Response> {
     if !speech::AVAILABLE {
         return Err(Fail::new(501, "not_implemented", speech::NOT_BUILT).into());
     }
     let ctype = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
     let req = audio::parse_request(ctype, &body).map_err(Fail::invalid)?;
     let format = req.format;
-    let out = run_speech(&hub, req, translate).await?;
+    check_audio_model(&hub, &who, &req.model, "whisper-1")?;
+    let asked = req.model.clone();
+    let ran = run_speech(&hub, req, translate).await;
+    finish_audio(&who, &asked, ran.is_ok());
+    let out = ran?;
     Ok(([("content-type", format.content_type())], out.render(format)).into_response())
 }
 
@@ -1108,12 +1427,22 @@ async fn run_speech(hub: &Hub, req: audio::Request, translate: bool) -> ApiResul
     Ok(out?)
 }
 
-async fn transcriptions(State(hub): State<Hub>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
-    speech_to_text(hub, headers, body, false).await
+async fn transcriptions(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    speech_to_text(hub, who, headers, body, false).await
 }
 
-async fn translations(State(hub): State<Hub>, headers: HeaderMap, body: Bytes) -> ApiResult<Response> {
-    speech_to_text(hub, headers, body, true).await
+async fn translations(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    speech_to_text(hub, who, headers, body, true).await
 }
 
 pub fn router(hub: Hub) -> Router {
@@ -1150,6 +1479,8 @@ pub struct ServeOpts {
 }
 
 pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
+    crate::hosting::check_bind(o.host, hub.engine.settings().allow_network, hub.keys.active())
+        .map_err(|m| std::io::Error::new(std::io::ErrorKind::PermissionDenied, m))?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(o.host, o.port)).await?;
     let addr = listener.local_addr()?;
     let shown = if o.host.is_unspecified() {
@@ -1172,23 +1503,30 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     }
     let stop = hub.stop.clone();
     let engine = hub.engine.clone();
+    let keys = hub.keys.clone();
     let housekeeping = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         loop {
             tick.tick().await;
             engine.housekeeping();
+            keys.flush();
         }
     });
     let engine = hub.engine.clone();
-    let result = axum::serve(listener, router(hub))
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = stop.notified() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
-        .await;
+    let keys = hub.keys.clone();
+    let result = axum::serve(
+        listener,
+        router(hub).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = stop.notified() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    })
+    .await;
     housekeeping.abort();
+    keys.flush();
     let n = engine.unload_all();
     let _ = std::fs::remove_file(&control);
     eprintln!("model-mistress stopped ({n} model(s) unloaded)");
@@ -1209,6 +1547,7 @@ mod tests {
             token: Arc::new(TOKEN.into()),
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
+            keys: Keys::in_memory(),
         }
     }
 
@@ -1389,6 +1728,7 @@ mod tests {
             token: Arc::new(TOKEN.into()),
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
+            keys: Keys::in_memory(),
         }
     }
 
@@ -1658,6 +1998,7 @@ mod tests {
             token: Arc::new(TOKEN.into()),
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
+            keys: Keys::in_memory(),
         };
         let id = std::path::Path::new(&model)
             .file_stem()
@@ -1712,6 +2053,7 @@ mod tests {
             token: Arc::new(TOKEN.into()),
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
+            keys: Keys::in_memory(),
         }
     }
 

@@ -55,6 +55,175 @@ impl Client {
         Ok(hub)
     }
 
+    /// A client for the hub at `url` with its token (what `find` reads from the control file).
+    pub fn new(url: &str, token: &str) -> Self {
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// The hub's open health answer: {ok, pid, version, uptime_s}.
+    pub async fn health(&self) -> Result<Value> {
+        Ok(self
+            .http
+            .get(format!("{}/v1/health", self.url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    // ---- what a program with a window needs: one call each, all through the hub's operations -------------------
+
+    pub async fn status(&self) -> Result<Value> {
+        self.call("service.status", json!({})).await
+    }
+
+    pub async fn list_models(&self, refresh: bool) -> Result<Vec<Value>> {
+        let v = self.call("model.list", json!({"refresh": refresh})).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    pub async fn loaded_models(&self) -> Result<Vec<Value>> {
+        let v = self.call("model.loaded", json!({})).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    pub async fn load_model(&self, model: &str, opts: Value) -> Result<Value> {
+        let mut a = if opts.is_object() { opts } else { json!({}) };
+        a["model"] = json!(model);
+        self.call("model.load", a).await
+    }
+
+    pub async fn unload_model(&self, model: &str) -> Result<Value> {
+        self.call("model.unload", json!({"model": model})).await
+    }
+
+    /// Start a download; returns the job id (`job` shows progress).
+    pub async fn pull_model(&self, model: &str, source: Option<&str>) -> Result<String> {
+        let mut a = json!({"model": model});
+        if let Some(s) = source {
+            a["source"] = json!(s);
+        }
+        let v = self.call("model.pull", a).await?;
+        v["job"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("the hub started no download job"))
+    }
+
+    pub async fn job(&self, id: &str) -> Result<Value> {
+        self.call("job.get", json!({"job": id})).await
+    }
+
+    pub async fn delete_model(&self, model: &str) -> Result<Value> {
+        self.call("model.delete", json!({"model": model})).await
+    }
+
+    pub async fn search_models(&self, query: &str) -> Result<Vec<Value>> {
+        let v = self.call("model.search", json!({"query": query})).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// One chat answer. `messages` is the OpenAI list ([{"role": "user", "content": "..."}]).
+    pub async fn chat(&self, model: &str, messages: Vec<Value>) -> Result<Value> {
+        self.call("chat.complete", json!({"model": model, "messages": messages}))
+            .await
+    }
+
+    /// A streamed chat answer through `POST /v1/chat/completions`: `on_text` gets each piece as it arrives; the whole
+    /// text is returned.
+    pub async fn chat_stream(
+        &self,
+        model: &str,
+        messages: Vec<Value>,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<String> {
+        use futures::StreamExt;
+        let r = self
+            .http
+            .post(format!("{}/v1/chat/completions", self.url))
+            .bearer_auth(&self.token)
+            .json(&json!({"model": model, "messages": messages, "stream": true}))
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            let status = r.status();
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            bail!(
+                "{}",
+                v["error"]["message"].as_str().unwrap_or(&format!("HTTP {status}"))
+            );
+        }
+        let (mut all, mut buf) = (String::new(), String::new());
+        let mut body = r.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(end) = buf.find("\n\n") {
+                let event: String = buf.drain(..end + 2).collect();
+                for line in event.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    if let Some(t) = serde_json::from_str::<Value>(data.trim())
+                        .ok()
+                        .and_then(|v| v["choices"][0]["delta"]["content"].as_str().map(str::to_string))
+                    {
+                        on_text(&t);
+                        all.push_str(&t);
+                    }
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    /// Speech to text of a file on the hub's machine (`speech.transcribe`); `model` and `language` may be empty.
+    pub async fn transcribe(&self, file: &str, model: Option<&str>, language: Option<&str>) -> Result<Value> {
+        let mut a = json!({"file": file});
+        for (k, v) in [("model", model), ("language", language)] {
+            if let Some(v) = v {
+                a[k] = json!(v);
+            }
+        }
+        self.call("speech.transcribe", a).await
+    }
+
+    /// Text to speech into a file on the hub's machine (`speech.synthesize`).
+    pub async fn speak(&self, text: &str, output: &str, model: Option<&str>, voice: Option<&str>) -> Result<Value> {
+        let mut a = json!({"input": text, "output": output});
+        for (k, v) in [("model", model), ("voice", voice)] {
+            if let Some(v) = v {
+                a[k] = json!(v);
+            }
+        }
+        self.call("speech.synthesize", a).await
+    }
+
+    pub async fn create_key(&self, peer: &str, limits: Value) -> Result<Value> {
+        let mut a = if limits.is_object() { limits } else { json!({}) };
+        a["peer"] = json!(peer);
+        self.call("key.create", a).await
+    }
+
+    pub async fn keys(&self) -> Result<Vec<Value>> {
+        let v = self.call("key.list", json!({})).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    pub async fn revoke_key(&self, key: &str) -> Result<Value> {
+        self.call("key.revoke", json!({"key": key})).await
+    }
+
+    pub async fn usage(&self, key: Option<&str>) -> Result<Vec<Value>> {
+        let a = key.map(|k| json!({"key": k})).unwrap_or(json!({}));
+        let v = self.call("usage.get", a).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     pub async fn operations(&self) -> Result<Vec<Value>> {
         let v: Value = self
             .http

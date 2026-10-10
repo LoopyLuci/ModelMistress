@@ -1,14 +1,13 @@
 //! `model-mistress`: the hub (`serve`, the default) and a client for a running hub.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 use model_mistress::client::{default_home, serve_mcp, Client};
 use model_mistress::engine::{Engine, Settings};
+use model_mistress::hosting::Keys;
 use model_mistress::hub::{self, new_token, Hub, ServeOpts};
 
 #[derive(Parser)]
@@ -150,8 +149,56 @@ enum Cmd {
         #[arg(long)]
         n_max: Option<u32>,
     },
+    /// Keys for peers (other machines) that use this hub's models: `keys create alice --requests-per-min 60`.
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+    /// What each peer key has used (requests, tokens, refused requests): `usage` or `usage alice`.
+    Usage {
+        /// A key id or a peer name (default: all).
+        key: Option<String>,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Make a key for a peer. It is shown once; only its hash is kept.
+    Create {
+        peer: String,
+        /// Requests per minute.
+        #[arg(long)]
+        requests_per_min: Option<u64>,
+        /// Prompt plus completion tokens per UTC day.
+        #[arg(long)]
+        tokens_per_day: Option<u64>,
+        /// Requests at a time.
+        #[arg(long)]
+        concurrent: Option<u64>,
+        /// A model the key may use (repeatable; a trailing * is a prefix). Default: every model.
+        #[arg(long = "model")]
+        models: Vec<String>,
+    },
+    /// The keys (never the secrets).
+    List,
+    /// Revoke a key by id, or all of a peer's keys by name. It stops working at once.
+    Revoke { key: String },
+}
+
+/// The key commands go through a running hub; with none running they work on the files in the home folder (the next
+/// `serve` reads them).
+async fn key_op(home: &std::path::Path, op: &str, args: Value) -> anyhow::Result<Value> {
+    match Client::find(Some(home.to_path_buf())).await {
+        Ok(c) => c.call(op, args).await,
+        Err(_) => {
+            let keys = Keys::open(home);
+            let out = hub::key_call(&keys, op, &args).map_err(|f| anyhow::anyhow!("{}", f.message));
+            keys.flush();
+            out
+        }
+    }
 }
 
 fn main() {
@@ -200,13 +247,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 .ok()
                 .filter(|t| t.len() >= 16)
                 .unwrap_or_else(new_token);
-            let hub = Hub {
-                engine: engine.clone(),
-                jobs: Arc::new(Default::default()),
-                token: Arc::new(token),
-                started: Instant::now(),
-                stop: Arc::new(tokio::sync::Notify::new()),
-            };
+            let hub = Hub::new(engine.clone(), token);
             hub::serve(hub, ServeOpts { home, host, port }).await?;
             drop(engine);
         }
@@ -356,6 +397,62 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 v["seconds"],
                 v["bytes"]
             );
+        }
+        Cmd::Keys { cmd } => match cmd {
+            KeysCmd::Create {
+                peer,
+                requests_per_min,
+                tokens_per_day,
+                concurrent,
+                models,
+            } => {
+                let mut a = json!({"peer": peer, "models": models});
+                for (k, v) in [
+                    ("requests_per_min", requests_per_min),
+                    ("tokens_per_day", tokens_per_day),
+                    ("concurrent", concurrent),
+                ] {
+                    if let Some(v) = v {
+                        a[k] = json!(v);
+                    }
+                }
+                let v = key_op(&home, "key.create", a).await?;
+                println!("{}", v["key"].as_str().unwrap_or(""));
+                eprintln!(
+                    "[key {} for {}: shown once, store it now; it is the peer's API key (Authorization: Bearer ...)]",
+                    v["id"].as_str().unwrap_or(""),
+                    v["peer"].as_str().unwrap_or("")
+                );
+            }
+            KeysCmd::List => {
+                let v = key_op(&home, "key.list", json!({})).await?;
+                for k in v.as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "{:<10} {:<24} {:<9} {}",
+                        k["id"].as_str().unwrap_or(""),
+                        k["peer"].as_str().unwrap_or(""),
+                        if k["revoked"].is_null() { "active" } else { "revoked" },
+                        k["quotas"]
+                    );
+                }
+            }
+            KeysCmd::Revoke { key } => show(&key_op(&home, "key.revoke", json!({"key": key})).await?),
+        },
+        Cmd::Usage { key } => {
+            let a = key.map(|k| json!({"key": k})).unwrap_or(json!({}));
+            let v = key_op(&home, "usage.get", a).await?;
+            for u in v.as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{:<10} {:<24} {:>7} requests {:>5} refused {:>9} tokens today {:>9} tokens in all{}",
+                    u["id"].as_str().unwrap_or(""),
+                    u["peer"].as_str().unwrap_or(""),
+                    u["requests"],
+                    u["rejected"],
+                    u["tokens_today"],
+                    u["prompt_tokens"].as_u64().unwrap_or(0) + u["completion_tokens"].as_u64().unwrap_or(0),
+                    if u["revoked"].is_null() { "" } else { "  (revoked)" }
+                );
+            }
         }
         Cmd::Quantize {
             model,

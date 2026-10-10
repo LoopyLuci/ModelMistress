@@ -37,7 +37,7 @@
             <label>Model:</label>
             <select v-model="agent.model">
               <option value="lmf2.5:8b">lmf2.5:8b</option>
-              <option value="example-model-9B">example-model-9B</option>
+              <option value="Example-9B">Example-9B</option>
               <option value="gemma:2b">gemma:2b</option>
             </select>
           </div>
@@ -74,7 +74,7 @@ const agents = ref([
     name: 'orchestrator',
     role: 'orchestrator',
     reasoning_effort: 'medium',
-    model: 'example-model-9B',
+    model: 'Example-9B',
     max_actions: 100,
     timeout_seconds: 600,
     tools_enabled: ['terminal', 'file', 'web', 'delegation'],

@@ -443,8 +443,9 @@ fn scalar_size(ty: u32) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests_support {
+/// Writes a tiny GGUF file for tests (here, and in the desktop app's).
+#[doc(hidden)]
+pub mod tests_support {
     use std::path::Path;
 
     pub fn gguf(path: &Path, arch: &str, name: &str) {

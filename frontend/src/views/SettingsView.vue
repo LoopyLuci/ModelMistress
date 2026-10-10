@@ -36,26 +36,22 @@
         <input 
           type="text" 
           v-model="settings.modelPath" 
-          placeholder="/models or /models"
+          placeholder="/path/to/models"
         />
       </div>
     </div>
     
     <div class="settings-section">
-      <h3>Ollama Proxy</h3>
+      <h3>Hub</h3>
       <div class="setting-item">
-        <label>Endpoint:</label>
-        <input 
-          type="text" 
-          v-model="settings.ollamaEndpoint" 
-        />
+        <label>
+          The app talks to ModelMistress's own hub (found through its control file, or started inside the app).
+          Models, downloads, chat, speech and peer keys all go through it.
+        </label>
       </div>
       <div class="setting-item">
-        <label>Type:</label>
-        <select v-model="settings.endpointType">
-          <option value="https">HTTPS (recommended)</option>
-          <option value="http">HTTP (local only)</option>
-        </select>
+        <label>Status:</label>
+        <span>{{ hubStatus }}</span>
       </div>
     </div>
     
@@ -82,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useStore } from '@/store'
 
 const store = useStore()
@@ -90,10 +86,19 @@ const settings = ref({
   theme: 'dark',
   notifications: true,
   autoSave: true,
-  modelPath: '/models',
-  ollamaEndpoint: 'http://localhost:11434',
-  endpointType: 'http',
+  modelPath: '',
   enableTelemetry: false
+})
+
+const hubStatus = ref('checking...')
+
+onMounted(async () => {
+  try {
+    await store.loadModels()
+    hubStatus.value = `connected, ${store.models.length} model(s)`
+  } catch (e) {
+    hubStatus.value = `not reachable: ${e}`
+  }
 })
 
 const themes = [

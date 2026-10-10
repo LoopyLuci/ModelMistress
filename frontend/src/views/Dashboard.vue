@@ -50,7 +50,7 @@ const status = computed(() => store.models.length > 0 ? 'online' : 'offline')
 const statusClass = computed(() => status.value === 'online' ? 'status-online' : 'status-offline')
 
 const recentModels = computed(() => [
-  { id: 1, name: 'example-model-9B', status: 'loaded' },
+  { id: 1, name: 'Example-9B', status: 'loaded' },
   { id: 2, name: 'gemma:2b', status: 'ready' }
 ])
 </script>

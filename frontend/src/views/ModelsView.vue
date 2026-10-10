@@ -43,12 +43,12 @@ const store = useStore()
 const models = ref([
   {
     id: 1,
-    name: 'example-model-9B',
+    name: 'Example-9B-Instruct',
     type: 'Q5_K',
     size: 5120,
     context: 8192,
     loaded: false,
-    path: '/models/example-model-9B'
+    path: '~/models/Example-9B'
   },
   {
     id: 2,
