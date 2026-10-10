@@ -203,7 +203,14 @@ fn op(id: &str, summary: &str, mutating: bool, destructive: bool, props: Value, 
            "input_schema": {"type": "object", "properties": props, "required": required, "additionalProperties": false}})
 }
 
+/// Every operation: the hub's own, then the Knowledge Module ones (`km.*`).
 pub fn operations() -> Vec<Value> {
+    let mut all = core_operations();
+    all.extend(crate::km::ops::operations());
+    all
+}
+
+fn core_operations() -> Vec<Value> {
     let model = json!({"type": "string", "description": "a model id from model.list, or ollama/<name>"});
     let load_props = json!({
         "model": model,
@@ -872,6 +879,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .map_err(|x| Fail::new(500, "io", x.to_string()))??;
             shown_settings(&new)
         }
+        id if id.starts_with("km.") => crate::km::ops::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1788,6 +1796,7 @@ pub fn router(hub: Hub) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
         )
+        .merge(crate::km::ops::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))

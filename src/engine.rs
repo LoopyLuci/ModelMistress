@@ -97,6 +97,8 @@ pub struct Settings {
     pub image_model: Option<String>,
     /// Allow `serve --host` to listen beyond this machine (it also needs at least one peer key). Off by default.
     pub allow_network: bool,
+    /// Knowledge Modules: trusted keys, budgets, embedder, selection weights (see docs/native/km-runtime.md).
+    pub km: crate::km::KmSettings,
 }
 
 impl Default for Settings {
@@ -123,6 +125,7 @@ impl Default for Settings {
             tts_voice: None,
             image_model: None,
             allow_network: false,
+            km: Default::default(),
         }
     }
 }
