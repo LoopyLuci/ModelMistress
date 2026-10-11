@@ -1,6 +1,6 @@
 [package]
 name = "model-mistress-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ModelMistress CLI/TUI for headless and terminal interaction"
 license = "Apache-2.0"
