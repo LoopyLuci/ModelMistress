@@ -213,6 +213,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// The Knowledge Module factory: `factory create <goal> --author M --source dir:docs`, `factory list`,
+    /// `factory get <task>`, `factory resume <task>`, `factory review` (`factory help` lists them).
+    Factory {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
 }
@@ -686,6 +692,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             show(&client().await?.call("speculative", a).await?);
         }
         Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
+        Cmd::Factory { args } => model_mistress::factory::cli::run(&home, args).await?,
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())
