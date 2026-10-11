@@ -227,6 +227,8 @@ fn core_operations() -> Vec<Value> {
         "embeddings": {"type": "boolean", "description": "serve /v1/embeddings instead of chat"},
         "reranking": {"type": "boolean", "description": "serve /v1/rerank instead of chat (a reranker model)"},
         "extra_args": {"type": "array", "items": {"type": "string"}, "description": "more llama-server arguments"},
+        "cpu_moe": {"type": "boolean", "description": "mixture-of-experts: all expert tensors in system memory, the rest on the GPU (default: on for MM's own models)"},
+        "n_cpu_moe": {"type": "integer", "minimum": 0, "description": "mixture-of-experts: the experts of the first N layers in system memory"},
         "reload": {"type": "boolean", "description": "hot swap: load a fresh copy beside the running one and switch over when it is ready; requests in progress finish on the old copy"}
     });
     vec![
@@ -619,6 +621,64 @@ fn core_operations() -> Vec<Value> {
     ]
 }
 
+/// The machine's memory and the hub's own, for the status page.
+fn system_report() -> Value {
+    use sysinfo::{Pid, System};
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let me = Pid::from_u32(std::process::id());
+    sys.refresh_process(me);
+    let mb = |b: u64| (b as f64 / 1_048_576.0 * 10.0).round() / 10.0;
+    json!({"total_mb": mb(sys.total_memory()), "available_mb": mb(sys.available_memory()),
+           "hub_rss_mb": sys.process(me).map(|p| mb(p.memory())),
+           "cpus": std::thread::available_parallelism().map(|n| n.get()).ok()})
+}
+
+/// The loaded models with the memory each server process holds (`rss_mb`) and the buffers llama.cpp says it put on
+/// each device (`buffers`, read from the model's log: `Vulkan0 model`, `CPU_Mapped model`, `Vulkan0 KV`, ...).
+fn loaded_report(e: &crate::engine::Engine) -> Vec<Value> {
+    use sysinfo::{Pid, System};
+    let mut sys = System::new();
+    e.loaded()
+        .iter()
+        .map(|i| {
+            let mut v = i.describe();
+            let pid = Pid::from_u32(i.pid);
+            sys.refresh_process(pid);
+            v["rss_mb"] = json!(sys.process(pid).map(|p| (p.memory() as f64 / 1_048_576.0).round()));
+            v["buffers"] = json!(log_buffers(&i.log));
+            v
+        })
+        .collect()
+}
+
+fn log_buffers(log: &std::path::Path) -> Vec<Value> {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Ok(f) = std::fs::File::open(log) {
+        let mut raw = vec![];
+        let _ = f.take(1 << 20).read_to_end(&mut raw);
+        text = String::from_utf8_lossy(&raw).into_owned();
+    }
+    let mut out: Vec<Value> = vec![];
+    for line in text.lines() {
+        let Some((head, tail)) = line.split_once(" buffer size =") else {
+            continue;
+        };
+        let mib: f64 = tail
+            .split_whitespace()
+            .next()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.0);
+        let words: Vec<&str> = head.split_whitespace().collect();
+        let what = words[words.len().saturating_sub(2)..].join(" ");
+        if !what.is_empty() && !out.iter().any(|o| o["what"] == what.as_str()) {
+            out.push(json!({"what": what, "mib": mib}));
+        }
+    }
+    out
+}
+
 fn s<'a>(v: &'a Value, k: &str) -> ApiResult<&'a str> {
     v.get(k)
         .and_then(Value::as_str)
@@ -636,8 +696,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
     let e = &hub.engine;
     Ok(match id {
         "service.status" => {
-            let loaded: Vec<Value> = e.loaded().iter().map(|i| i.describe()).collect();
+            let loaded = loaded_report(e);
             json!({"version": VERSION, "pid": std::process::id(), "uptime_s": hub.started.elapsed().as_secs(),
+                   "system": system_report(),
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
                    "llama_built_in": crate::engine::bundled::version(),
                    "models_known": e.catalog().len(), "loaded": loaded})
@@ -690,7 +751,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             json!({"id": m.id, "source": m.source, "path": m.path, "mmproj": m.mmproj, "size_bytes": m.size_bytes,
                    "summary": m.summary(e.is_loaded(&m.id)), "metadata": m.meta})
         }
-        "model.loaded" => json!(e.loaded().iter().map(|i| i.describe()).collect::<Vec<_>>()),
+        "model.loaded" => json!(loaded_report(e)),
         "model.load" => {
             let m = llama_entry(hub, s(a, "model")?)?;
             let mut args = a.clone();
@@ -1889,6 +1950,30 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_log_gives_buffers_per_device() {
+        let f = std::env::temp_dir().join(format!("mm-buf-{}.log", std::process::id()));
+        std::fs::write(
+            &f,
+            "load_tensors:      Vulkan0 model buffer size = 1234.50 MiB
+load_tensors:   CPU_Mapped model buffer size = 22000.00 MiB
+             llama_kv_cache:    Vulkan0 KV buffer size =   256.00 MiB
+unrelated line
+",
+        )
+        .unwrap();
+        let b = log_buffers(&f);
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            (b[0]["what"].as_str(), b[0]["mib"].as_f64()),
+            (Some("Vulkan0 model"), Some(1234.5))
+        );
+        assert_eq!(b[1]["what"], "CPU_Mapped model");
+        assert_eq!(b[2]["what"], "Vulkan0 KV");
+        assert!(log_buffers(std::path::Path::new("no/such.log")).is_empty());
+    }
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-token-0123456789";

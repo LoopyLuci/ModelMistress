@@ -176,6 +176,13 @@ pub struct LoadOpts {
     pub reranking: bool,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Keep every expert tensor of a mixture-of-experts model in system memory (llama-server's `--cpu-moe`) and the
+    /// rest on the GPU. Unset: on for MM's own (native) MoE models, off otherwise.
+    #[serde(default)]
+    pub cpu_moe: Option<bool>,
+    /// Only the experts of the first N layers on the CPU (`--n-cpu-moe N`); wins over `cpu_moe`.
+    #[serde(default)]
+    pub n_cpu_moe: Option<u32>,
     /// Hot swap: if the model is loaded, start the new one beside it and switch over when it is ready. Requests
     /// already running finish on the old one; new ones go to the new one.
     #[serde(default)]
@@ -222,6 +229,21 @@ pub fn lora_args(lora: &[Lora]) -> Vec<String> {
 }
 
 /// llama-server arguments for a draft model.
+/// `--cpu-moe` / `--n-cpu-moe N` for a mixture-of-experts model: what the load asks for, else on for a native one
+/// (experts in RAM, attention and the shared expert on the GPU: the 24 GB Dusty Q8_0 does not fit a 24 GB card otherwise).
+pub fn moe_args(entry: &ModelEntry, opts: &LoadOpts) -> Vec<String> {
+    if entry.experts().is_none() {
+        return vec![];
+    }
+    match (opts.n_cpu_moe, opts.cpu_moe) {
+        (Some(n), _) if n > 0 => vec!["--n-cpu-moe".into(), n.to_string()],
+        (Some(_), None) | (_, Some(false)) => vec![],
+        (_, Some(true)) => vec!["--cpu-moe".into()],
+        (None, None) if entry.native.is_some() => vec!["--cpu-moe".into()],
+        _ => vec![],
+    }
+}
+
 pub fn draft_args(d: &Draft, default_gpu_layers: i32) -> Vec<String> {
     let mut a = vec!["--spec-draft-model".to_string(), d.path.display().to_string()];
     if let Some(n) = d.n_max {
@@ -411,7 +433,23 @@ impl Engine {
         let downloads = s.download_dir.clone().unwrap_or_else(|| self.home.clone());
         r.huggingface.push(downloads.join("hub"));
         r.ollama.push(downloads.join("ollama"));
+        r.native.push(self.forge_data_dir());
         r
+    }
+
+    /// The Forge's data folder (setting, else MM_FORGE_DATA_DIR, else `<forge_dir>/data`), where MM's own models are.
+    pub fn forge_data_dir(&self) -> PathBuf {
+        let s = self.settings.read();
+        let set = |p: &Option<PathBuf>, var: &str| {
+            p.clone()
+                .filter(|p| !p.as_os_str().is_empty())
+                .or_else(|| std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from))
+        };
+        set(&s.forge_data_dir, "MM_FORGE_DATA_DIR").unwrap_or_else(|| {
+            set(&s.forge_dir, "MM_FORGE_DIR")
+                .unwrap_or_else(|| self.home.join("forge"))
+                .join("data")
+        })
     }
 
     /// Where image models are looked for: `<home>/images` first (everything in it is an image model), then the
@@ -913,6 +951,7 @@ impl Engine {
         if let Some(t) = opts.threads {
             args.extend(["-t".into(), t.to_string()]);
         }
+        args.extend(moe_args(entry, opts));
         let extras = self.extras(&entry.id);
         if opts.reranking {
             args.push("--reranking".into());
@@ -1410,6 +1449,51 @@ mod job {
 
 #[cfg(test)]
 mod tests {
+
+    fn moe_entry(native: bool, experts: u64) -> ModelEntry {
+        let mut meta = serde_json::Map::new();
+        meta.insert("general.architecture".into(), "qwen35moe".into());
+        meta.insert("qwen35moe.expert_count".into(), experts.into());
+        ModelEntry {
+            id: "m".into(),
+            source: "folder",
+            path: PathBuf::from("m.gguf"),
+            size_bytes: 1,
+            mmproj: None,
+            meta,
+            native: native.then(|| crate::catalog::Native {
+                family: "dusty".into(),
+                name: "Dusty-1.0".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn experts_go_to_the_cpu_for_native_moe_models_and_when_asked() {
+        let none = LoadOpts::default();
+        // native MoE: on by default; off when the load says so; a count wins
+        assert_eq!(moe_args(&moe_entry(true, 64), &none), ["--cpu-moe"]);
+        let off = LoadOpts {
+            cpu_moe: Some(false),
+            ..none.clone()
+        };
+        assert!(moe_args(&moe_entry(true, 64), &off).is_empty());
+        let n = LoadOpts {
+            n_cpu_moe: Some(12),
+            cpu_moe: Some(true),
+            ..none.clone()
+        };
+        assert_eq!(moe_args(&moe_entry(true, 64), &n), ["--n-cpu-moe", "12"]);
+        // any other MoE model: only when asked
+        assert!(moe_args(&moe_entry(false, 64), &none).is_empty());
+        let on = LoadOpts {
+            cpu_moe: Some(true),
+            ..none.clone()
+        };
+        assert_eq!(moe_args(&moe_entry(false, 64), &on), ["--cpu-moe"]);
+        // a dense model never gets the flag
+        assert!(moe_args(&moe_entry(true, 0), &on).is_empty());
+    }
     use super::*;
 
     #[test]
@@ -1446,6 +1530,7 @@ mod tests {
                 size_bytes: 1,
                 mmproj: None,
                 meta: Default::default(),
+                native: None,
             })
             .collect();
         let id = |n: &str| match e.resolve(n) {
