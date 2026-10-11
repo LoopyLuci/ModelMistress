@@ -33,6 +33,22 @@ runs on its own.
   picture, find objects with boxes, or get an embedding vector, through `/v1/vision/classify`, `/detect` and `/embed`, the
   operation `vision.analyze` and `model-mistress vision resnet50 cat.jpg`. Models are `.onnx` files in
   `<home>/vision` ([docs/vision.md](docs/vision.md)).
+- **Knowledge Modules.** Versioned, tagged, optionally signed packages of knowledge, skills and tools that work beside
+  a model's weights: found by search with an explained score, loaded and unloaded within disk/RAM/VRAM budgets, and
+  verified on every load. A KM never contains code ([docs/native/km-spec.md](docs/native/km-spec.md),
+  [docs/native/km-runtime.md](docs/native/km-runtime.md)).
+- **A Knowledge Module factory.** Give it a goal and sources (files, URLs, skills, tools, other KMs, traces); any model
+  the hub serves plans, writes cited training records, a second model checks them, tags are proposed against a
+  controlled vocabulary with a review queue, and data and memory KMs are built, evaluated and published under a
+  promotion policy. Every step is resumable and observable
+  ([docs/native/km-factory.md](docs/native/km-factory.md), [docs/native/km-factory-runtime.md](docs/native/km-factory-runtime.md)).
+- **The model's thoughts, visible.** Any chat can be traced: every token with its probability, the alternatives the
+  model weighed and its entropy, the reasoning kept apart from the answer, stage timings and resources. Traces can be
+  rerun with changes (ablation) and compared. A dashboard at `/ui` (any browser, and the desktop app) shows traces,
+  Knowledge Modules, residency, training data and factory tasks ([docs/native/observability.md](docs/native/observability.md)).
+- **Its own models, in progress.** Dusty (Qwen3.5-4B turned into a mixture of experts whose experts come from Knowledge
+  Modules) and Misty (trained from scratch), with a training system ("the Forge"), consolidation of what a KM does
+  well into the weights, and gated self-training ([docs/native/architecture.md](docs/native/architecture.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 
@@ -77,12 +93,17 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `POST /v1/audio/speech` | OpenAI text to speech (JSON in; WAV or PCM out) |
 | `POST /v1/images/generations` | OpenAI image generation (PNG as `b64_json` or `url`); `/v1/images/edits` answers 501 |
 | `POST /v1/vision/classify`, `/v1/vision/detect`, `/v1/vision/embed` | image recognition (feature `vision`; JSON with a base64 `image`) |
+| `/v1/km/...` | Knowledge Modules: list, search, import/export, load/unload, pin/ban, channels, residency, data records, vocabulary (owner only) |
+| `/v1/factory/...` | factory tasks, plans, review queue, settings (owner only) |
+| `GET /v1/native/traces`, `/traces/{id}`, `/traces/{id}/tokens`, `/stream` (SSE); `POST /traces/{id}/rerun` | traces of the model's thoughts (owner only) |
+| `GET /ui` | the dashboard |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
 `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
 `chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `vision.analyze`, `quantize`, `lora`, `speculative`, `embeddings.create`,
 `rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
-`config.set`.
+`config.set`, and the families `km.*`, `factory.*` and `trace.*` (`GET /v1/operations` lists every one with its
+schema). Every operation is also an MCP tool.
 
 ## Development
 

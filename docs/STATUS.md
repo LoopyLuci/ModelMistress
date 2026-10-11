@@ -73,9 +73,46 @@ transparency masks do not map cleanly).
 Runtime (`ort` 2.0.0-rc.13, CPU) with PNG and JPEG decoding from the `image` crate; models are `.onnx` files in
 `<home>/vision` with an optional `<name>.json` ([vision.md](vision.md)). Tested: everything that needs no model
 (preprocessing, softmax and top-k, NMS, YOLO v5 and v8 decoding, kind guessing, sidecars, requests) in every build, and
-with the feature a hand-written ONNX model through the real session and the hub routes on Windows 10. Not tested: any real
-model (ResNet, YOLO, CLIP), GPU execution providers, JPEG inputs through a model, float16 or multi-input models (refused
+with the feature a hand-written ONNX model through the real session and the hub routes on Windows 10. Not tested: GPU execution
+providers, JPEG inputs through a model, float16 or multi-input models (refused
 with a clear error).
+
+Checked with real models (2026-10): ResNet-50, CLIP ViT-B/32 and YOLOv8n agree with ONNX Runtime's Python reference
+after the preprocessing fix (letterboxed detectors, classifier crop_pct, antialiased resize): YOLOv8n dog 68.5% vs
+68.3%, ResNet-50 Samoyed 97.3% vs 97.3%, CLIP cosine 0.999.
+
+## Knowledge Modules
+
+The runtime of `docs/native/km-spec.md` (104 tests): manifests for every kind, `.mmkm` packing that refuses links,
+absolute paths, `..`, device names and unlisted files; SHA-256 of every payload checked on load; ed25519 signatures
+with a per-source trust policy; a SQLite index with full-text search; selection with every score term reported and
+every exclusion explained; disk/RAM/VRAM budgets with pins and in-flight protection; memory, data (with revision
+history), skill and tool KMs; a controlled tag vocabulary with origin and confidence per tag. Not yet: attaching
+`experts`, `projector` and `router` KMs to a running model (they are verified and tracked), the learned router,
+choosing KMs automatically for chat, using skill/tool KMs at inference.
+
+## The Knowledge Module factory
+
+Tasks run plan → gather → generate → verify → tag → build → evaluate → publish (64 tests). Run for real with
+Qwen3-1.7B as author and reviewer on the CPU: 20 records generated, 11 rejected (8 duplicates, 3 unsupported by their
+sources), data and memory KMs built and imported, uplift measured, promotion held by the gate. A 0.6B reviewer accepted
+everything, so reviewers should be about 1.7B or larger. Not yet: adapter training (needs the Forge), executable code
+checks (the hook exists; tool-call schema checks are built in), learning the quality scorer from review decisions,
+automatic resume after a hub restart (a task is marked `interrupted` and resumes on request).
+
+## Observability and the dashboard
+
+Chat requests can be traced (25 tests, and a real run with Qwen3-0.6B): tokens with probability, top-k alternatives and
+entropy; reasoning apart from the answer; the templated prompt; stage timings; RAM. Rerun with changes and diff two
+traces. The dashboard at `/ui` (embedded in the binary) works in any browser and in the desktop app: Thoughts, Traces,
+Knowledge, residency, Data studio, Vocabulary, Factory. Not yet: expert-routing capture (needs a llama.cpp
+evaluation callback; the heat map is ready for it), GPU memory (llama-server does not report it), tracing peers'
+requests.
+
+## Native models
+
+Designed (`docs/native/architecture.md`); the training system and Dusty-1.0's conversion are being built. Nothing of
+Misty exists yet.
 
 ## Not done yet
 
@@ -83,10 +120,8 @@ with a clear error).
 - Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
   multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
-- Training (what Unsloth does). It needs Python and PyTorch, so it can only be an optional add-on.
-- The desktop app's Tauri shell (`desktop-app/src/main.rs`) and its Vue pages were written against the hub API but never
-  built or run: Tauri's build dependencies were not available where this was done. Its API, command and model-list
-  modules are tested.
+- Training: being built as the Forge (an optional, self-installed Python/PyTorch environment).
+- The desktop app builds (Tauri, release) but its older pages (Overview, Models, Swarm, Settings) are placeholders.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
 
 ## Legacy code
