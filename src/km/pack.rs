@@ -544,7 +544,7 @@ mod tests {
             .build()
     }
 
-    fn tmp() -> PathBuf {
+    fn tmp() -> crate::testing::TestDir {
         crate::testing::temp_home()
     }
 

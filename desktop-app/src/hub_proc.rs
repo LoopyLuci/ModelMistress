@@ -311,20 +311,17 @@ mod tests {
 
     #[test]
     fn the_bundled_hub_is_the_program_next_to_the_app() {
-        let d = std::env::temp_dir().join(format!("mm-desktop-test-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = model_mistress::testing::TestDir::new("mm-desktop-test");
         let exe = d.join("app.exe");
         assert!(bundled_hub(&exe).is_none());
         let name = if cfg!(windows) { "model-mistress.exe" } else { "model-mistress" };
         std::fs::write(d.join(name), b"x").unwrap();
         assert_eq!(bundled_hub(&exe), Some(d.join(name)));
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]
     async fn a_missing_hub_does_not_answer_and_ready_reports_failure() {
-        let d = std::env::temp_dir().join(format!("mm-desktop-test-home-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = model_mistress::testing::TestDir::new("mm-desktop-test-home");
         assert!(!hub_answers(&d).await);
         let shell = Shell::new(d.clone());
         shell
@@ -333,6 +330,5 @@ mod tests {
         let e = shell.ready().await.unwrap_err();
         assert!(format!("{e}").contains("no hub could be started"));
         assert!(!shell.stop_owned().await, "nothing was started, so nothing is stopped");
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

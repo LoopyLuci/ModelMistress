@@ -447,8 +447,7 @@ mod tests {
 
     #[test]
     fn finding_voices() {
-        let d = std::env::temp_dir().join(format!("mm-voices-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testing::TestDir::new("mm-voices");
         std::fs::write(d.join("anna.mp3"), b"x").unwrap();
         std::fs::write(d.join("bob.wav"), b"x").unwrap();
         assert_eq!(find_voice(&d, "anna", None).unwrap(), Some(d.join("anna.mp3")));

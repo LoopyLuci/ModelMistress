@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn keys_are_stored_hashed_and_survive_a_restart() {
-        let home = std::env::temp_dir().join(format!("mm-keys-{}", uuid::Uuid::new_v4()));
+        let home = crate::testing::TestDir::lazy("mm-keys");
         let k = Keys::open(&home);
         let (info, s) = k
             .create(

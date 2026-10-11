@@ -23,10 +23,8 @@ fn system_python() -> Option<PathBuf> {
     None
 }
 
-fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("mm-forge-hub-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn tmp() -> crate::testing::TestDir {
+    crate::testing::TestDir::new("mm-forge-hub")
 }
 
 const FAKE_MAIN: &str = r#"
@@ -62,7 +60,7 @@ elif step == "boom":
 "#;
 
 struct Fx {
-    home: PathBuf,
+    home: crate::testing::TestDir,
     hub: Hub,
 }
 

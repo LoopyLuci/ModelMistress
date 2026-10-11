@@ -16,7 +16,7 @@ use super::*;
 use crate::engine::Settings;
 use crate::hub::{self, Hub};
 
-fn setup() -> (PathBuf, Hub, Arc<Km>, Arc<Recorder>) {
+fn setup() -> (crate::testing::TestDir, Hub, Arc<Km>, Arc<Recorder>) {
     let home = crate::testing::temp_home();
     let hub = crate::testing::hub(&home, &[]);
     let km = runtime(&hub.engine).unwrap();

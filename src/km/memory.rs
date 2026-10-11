@@ -162,7 +162,7 @@ mod tests {
     use crate::km::embed::HashEmbedder;
     use crate::km::sample;
 
-    fn kms() -> (std::path::PathBuf, std::path::PathBuf) {
+    fn kms() -> (crate::testing::TestDir, std::path::PathBuf) {
         let home = crate::testing::temp_home();
         let dir = sample::memory(
             &home,

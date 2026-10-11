@@ -1953,7 +1953,8 @@ mod tests {
 
     #[test]
     fn the_model_log_gives_buffers_per_device() {
-        let f = std::env::temp_dir().join(format!("mm-buf-{}.log", std::process::id()));
+        let dir = crate::testing::TestDir::new("mm-buf");
+        let f = dir.join("model.log");
         std::fs::write(
             &f,
             "load_tensors:      Vulkan0 model buffer size = 1234.50 MiB
@@ -2040,10 +2041,8 @@ unrelated line
 
     const MP: &str = "multipart/form-data; boundary=B";
 
-    fn temp_home() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("mm-hub-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn temp_home() -> crate::testing::TestDir {
+        crate::testing::TestDir::new("mm-hub-test")
     }
 
     #[tokio::test]

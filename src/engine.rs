@@ -1498,8 +1498,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_defaults() {
-        let d = std::env::temp_dir().join(format!("mm-settings-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testing::TestDir::new("mm-settings");
         assert_eq!(Settings::load(&d).unwrap().max_loaded, 2);
         std::fs::write(d.join("config.toml"), "max_loaded = 5\nollama_url = \"\"\n").unwrap();
         let s = Settings::load(&d).unwrap();
@@ -1512,8 +1511,7 @@ mod tests {
 
     #[test]
     fn resolving_names() {
-        let d = std::env::temp_dir().join(format!("mm-resolve-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testing::TestDir::new("mm-resolve");
         let e = Engine::new(
             d.clone(),
             Settings {
@@ -1608,8 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn extras_are_saved_and_a_missing_tool_is_501() {
-        let d = std::env::temp_dir().join(format!("mm-extras-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testing::TestDir::new("mm-extras");
         let settings = Settings {
             llama_server: Some(d.join("no-such-llama-server")),
             ollama_url: String::new(),
@@ -1652,8 +1649,7 @@ mod tests {
     #[cfg(feature = "bundled-engine")]
     #[tokio::test]
     async fn running_the_built_in_tools() {
-        let d = std::env::temp_dir().join(format!("mm-tool-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
+        let d = crate::testing::TestDir::new("mm-tool");
         let e = Engine::new(
             d.clone(),
             Settings {

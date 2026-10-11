@@ -799,7 +799,7 @@ mod tests {
     use super::*;
     use crate::km::sample;
 
-    fn setup() -> (PathBuf, Store) {
+    fn setup() -> (crate::testing::TestDir, Store) {
         let home = crate::testing::temp_home();
         let s = Store::open(&home).unwrap();
         (home, s)

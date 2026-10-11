@@ -462,10 +462,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mm-images-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp() -> crate::testing::TestDir {
+        crate::testing::TestDir::new("mm-images")
     }
 
     fn touch(d: &Path, name: &str) -> PathBuf {

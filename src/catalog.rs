@@ -561,11 +561,8 @@ mod tests {
 
     use super::tests_support::gguf;
 
-    fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mm-catalog-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmp(name: &str) -> crate::testing::TestDir {
+        crate::testing::TestDir::new(&format!("mm-catalog-{name}"))
     }
 
     #[test]

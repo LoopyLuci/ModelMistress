@@ -324,8 +324,8 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn store() -> (Store, PathBuf) {
-        let d = std::env::temp_dir().join(format!("mm-forge-store-{}", uuid::Uuid::new_v4()));
+    fn store() -> (Store, crate::testing::TestDir) {
+        let d = crate::testing::TestDir::lazy("mm-forge-store");
         (Store::new(d.join("forge").join("runs.db")), d)
     }
 

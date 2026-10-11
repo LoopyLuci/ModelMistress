@@ -61,7 +61,7 @@ fn entropy_is_zero_for_a_certain_token_and_ln2_for_a_coin() {
     assert!((h - std::f32::consts::LN_2).abs() < 1e-5);
 }
 
-fn open() -> (Store, std::path::PathBuf) {
+fn open() -> (Store, crate::testing::TestDir) {
     let home = testing::temp_home();
     (Store::open(&home.join("trace")).unwrap(), home)
 }
@@ -372,7 +372,7 @@ struct Rig {
     url: String,
     http: reqwest::Client,
     fake: Fake,
-    home: std::path::PathBuf,
+    home: crate::testing::TestDir,
     _server: tokio::task::JoinHandle<()>,
 }
 

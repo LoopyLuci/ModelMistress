@@ -425,8 +425,8 @@ mod tests {
         }
     }
 
-    fn store() -> (Store, PathBuf) {
-        let d = std::env::temp_dir().join(format!("mm-forge-run-{}", uuid::Uuid::new_v4()));
+    fn store() -> (Store, crate::testing::TestDir) {
+        let d = crate::testing::TestDir::lazy("mm-forge-run");
         let s = Store::new(d.join("runs.db"));
         s.create_run("r", "t", &json!({})).unwrap();
         (s, d)

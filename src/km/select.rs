@@ -383,9 +383,9 @@ mod tests {
     use crate::km::pack::{SigState, Source};
     use crate::km::sample::{self, Builder};
     use crate::km::store::Trust;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    fn setup() -> (PathBuf, Store) {
+    fn setup() -> (crate::testing::TestDir, Store) {
         let home = crate::testing::temp_home();
         let s = Store::open(&home).unwrap();
         (home, s)

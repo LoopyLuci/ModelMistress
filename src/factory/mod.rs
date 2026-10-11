@@ -154,6 +154,13 @@ pub fn runtime(engine: &Arc<Engine>) -> Res<Arc<Factory>> {
     Ok(f)
 }
 
+/// Let go of the factory of a home folder (tests, before they remove it).
+pub(crate) fn forget_runtime(home: &Path) {
+    if let Some(m) = RUNTIMES.get() {
+        m.lock().remove(home);
+    }
+}
+
 impl Factory {
     pub fn open(home: &Path) -> Res<Arc<Factory>> {
         let dir = home.join("factory");
