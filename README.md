@@ -35,7 +35,8 @@ runs on its own.
   `<home>/vision` ([docs/vision.md](docs/vision.md)).
 - **Knowledge Modules.** Versioned, tagged, optionally signed packages of knowledge, skills and tools that work beside
   a model's weights: found by search with an explained score, loaded and unloaded within disk/RAM/VRAM budgets, and
-  verified on every load. A KM never contains code ([docs/native/km-spec.md](docs/native/km-spec.md),
+  verified on every load. Experts KMs are assembled into a mixture-of-experts model and hot-swapped in; specialist KMs
+  (speech, images, vision) are callable and traced. A KM never contains code ([docs/native/km-spec.md](docs/native/km-spec.md),
   [docs/native/km-runtime.md](docs/native/km-runtime.md)).
 - **A Knowledge Module factory.** Give it a goal and sources (files, URLs, skills, tools, other KMs, traces); any model
   the hub serves plans, writes cited training records, a second model checks them, tags are proposed against a
@@ -43,7 +44,8 @@ runs on its own.
   promotion policy. Every step is resumable and observable
   ([docs/native/km-factory.md](docs/native/km-factory.md), [docs/native/km-factory-runtime.md](docs/native/km-factory-runtime.md)).
 - **The model's thoughts, visible.** Any chat can be traced: every token with its probability, the alternatives the
-  model weighed and its entropy, the reasoning kept apart from the answer, stage timings and resources. Traces can be
+  model weighed and its entropy, the experts each layer chose (MoE models), the reasoning kept apart from the answer,
+  stage timings and resources. Traces can be
   rerun with changes (ablation) and compared. A dashboard at `/ui` (any browser, and the desktop app) is also where you chat with the models (the Chat page
   streams, keeps conversations locally and shows reasoning apart), manage them (load options such as experts on the
   CPU, downloads) and change settings; it shows traces,

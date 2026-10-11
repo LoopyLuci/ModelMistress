@@ -114,9 +114,14 @@ The runtime of `docs/native/km-spec.md` (104 tests): manifests for every kind, `
 absolute paths, `..`, device names and unlisted files; SHA-256 of every payload checked on load; ed25519 signatures
 with a per-source trust policy; a SQLite index with full-text search; selection with every score term reported and
 every exclusion explained; disk/RAM/VRAM budgets with pins and in-flight protection; memory, data (with revision
-history), skill and tool KMs; a controlled tag vocabulary with origin and confidence per tag. Not yet: attaching
-`experts`, `projector` and `router` KMs to a running model (they are verified and tracked), the learned router,
-choosing KMs automatically for chat, using skill/tool KMs at inference.
+history), skill and tool KMs; a controlled tag vocabulary with origin and confidence per tag. **Experts KMs** are
+assembled into their core (the routed-expert slots they declare are byte-copied into a copy of the base GGUF, no
+requantising; mismatches refused) and the model is hot-swapped onto it; evicting the last one returns to the base.
+Each change copies the whole base (about 24 GB for Dusty Q8_0), and it has not yet run against the real Dusty.
+**Specialist KMs** (speech to text, text to speech, images, vision) are callable with `km.specialist.call`: the
+input is checked against the KM's schema and each call is traced. KM search can use a real embedder
+(`factory.embedder.setup`; Qwen3-Embedding-0.6B tested). Not yet: attaching `projector` and `router` KMs, the learned
+router, choosing KMs automatically for chat, using skill/tool KMs at inference, a core calling a specialist itself.
 
 ## The Knowledge Module factory
 
@@ -132,9 +137,10 @@ automatic resume after a hub restart (a task is marked `interrupted` and resumes
 Chat requests can be traced (25 tests, and a real run with Qwen3-0.6B): tokens with probability, top-k alternatives and
 entropy; reasoning apart from the answer; the templated prompt; stage timings; RAM. Rerun with changes and diff two
 traces. The dashboard at `/ui` (embedded in the binary) works in any browser and in the desktop app: Thoughts, Traces,
-Knowledge, residency, Data studio, Vocabulary, Factory. Not yet: expert-routing capture (needs a llama.cpp
-evaluation callback; the heat map is ready for it), GPU memory (llama-server does not report it), tracing peers'
-requests.
+Knowledge, residency, Data studio, Vocabulary, Factory. **Expert routing** is captured per token for MoE models (a small
+patch to the bundled llama.cpp; tracing setting `routing` or `"mm_routing": true`): checked with Qwen3-Coder-30B-A3B
+on Vulkan, no cost when off, about 4.5x slower generation while on. Not yet: GPU memory (llama-server does not report
+it), tracing peers' requests.
 
 ## Native models
 
@@ -151,8 +157,6 @@ probabilities identical). Not yet: training Dusty's experts, consolidation, the 
   multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training beyond the Forge's conversion and checks: expert training, distillation, adapters.
-- The desktop app: a usable Chat, Models (including native models), Settings, Speech, Images and Vision, a shell
-  that starts its own hub and an installer are being built for 0.2.1; today's older pages are placeholders.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
 
 ## Legacy code
