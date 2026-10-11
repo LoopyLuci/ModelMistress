@@ -25,10 +25,10 @@
             <option v-for="k in KINDS" :key="k" :value="k">{{ k }}</option>
           </select>
         </label>
-        <label class="field">base (ranks for a core)
+        <label class="field">base (works with)
           <select v-model="f.base" @change="run">
             <option value="">any</option>
-            <option v-for="b in ['dusty', 'misty', 'any']" :key="b" :value="b">{{ b }}</option>
+            <option v-for="b in bases" :key="b" :value="b">{{ b }}</option>
           </select>
         </label>
         <label class="field">channel
@@ -85,7 +85,7 @@
     <div v-else class="card tablewrap">
       <table class="t" aria-label="installed Knowledge Modules">
         <thead>
-          <tr><th>name</th><th>version</th><th>kind</th><th>domain</th><th>channels</th><th>state</th><th class="num">size</th></tr>
+          <tr><th>name</th><th>version</th><th>kind</th><th>domain</th><th>base</th><th>channels</th><th>state</th><th class="num">size</th></tr>
         </thead>
         <tbody>
           <tr v-for="k in filteredList" :key="k.key">
@@ -97,6 +97,7 @@
             <td class="mono">{{ k.version }}</td>
             <td>{{ k.kind }}</td>
             <td class="muted">{{ k.domain }}</td>
+            <td class="small">{{ k.base || '-' }}<span v-if="k.base_version" class="muted"> {{ k.base_version }}</span><span v-if="k.arch" class="muted"> {{ k.arch }}</span></td>
             <td><span v-for="c in k.channels" :key="c" class="pill">{{ c }}</span></td>
             <td><span v-for="s in statusOf(k.key)" :key="s" class="pill" :class="s">{{ s }}</span></td>
             <td class="num">{{ fmtBytes(k.bytes) }}</td>
@@ -138,7 +139,10 @@ function statusOf(key: string): string[] {
   return [k.resident && 'resident', k.pinned && 'pinned', k.banned && 'banned', absorbed(k) && 'absorbed', k.misdeclared && 'misdeclared'].filter(Boolean) as string[]
 }
 const keep = (key: string) => !f.status || statusOf(key).includes(f.status)
-const filteredList = computed(() => list.value.filter((k) => keep(k.key) && (!f.kind || k.kind === f.kind)))
+// km.list carries base, base_version and arch, so the base filter needs no search; 'any' KMs fit every base.
+const bases = computed(() => [...new Set([...list.value.map((k) => k.base).filter(Boolean), f.base].filter(Boolean))].sort() as string[])
+const fitsBase = (k: KmItem) => !f.base || k.base === f.base || k.base === 'any'
+const filteredList = computed(() => list.value.filter((k) => keep(k.key) && (!f.kind || k.kind === f.kind) && fitsBase(k)))
 const shown = computed<SearchHit[]>(() => (search.value?.results || []).filter((h) => keep(h.key)))
 const embedderText = computed(() => {
   const e = search.value?.embedder
@@ -151,7 +155,7 @@ async function run() {
   loading.value = true
   router.replace({ query: Object.fromEntries(Object.entries(f).filter(([, v]) => v)) })
   try {
-    if (f.q.trim() || f.base) {
+    if (f.q.trim()) {
       search.value = await km.search({
         query: f.q, top_k: 50, include_absorbed: true,
         ...(f.kind ? { kinds: [f.kind] } : {}), ...(f.base ? { base: f.base } : {}), ...(f.channel ? { channel: f.channel } : {}),

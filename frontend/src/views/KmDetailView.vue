@@ -88,15 +88,28 @@
             <h3>Payload files</h3>
             <div class="tablewrap">
               <table class="t" aria-label="payload files">
-                <thead><tr><th>path</th><th>role</th><th>format</th><th class="num">size</th><th>sha256</th></tr></thead>
+                <thead><tr><th>path</th><th>role</th><th>format</th><th class="num">size</th><th>sha256</th><th></th></tr></thead>
                 <tbody>
                   <tr v-for="p in d.payload" :key="p.path">
                     <td class="mono">{{ p.path }}</td><td>{{ p.role }}</td><td>{{ p.format }}</td>
                     <td class="num">{{ fmtBytes(p.bytes) }}</td>
                     <td class="mono" :title="p.sha256">{{ (p.sha256 || '').slice(0, 16) }}...</td>
+                    <td>
+                      <button v-if="isText(p)" class="btn" :disabled="previewBusy" :aria-label="`preview ${p.path}`" @click="preview(p.path)">Preview</button>
+                    </td>
                   </tr>
                 </tbody>
               </table>
+            </div>
+            <p v-if="previewError" class="error-box" role="alert">{{ previewError }}</p>
+            <div v-if="pv" class="pv">
+              <div class="row small">
+                <span class="mono">{{ pv.path }}</span>
+                <span class="muted">{{ fmtBytes(pv.bytes) }}<template v-if="pv.truncated">, the first part</template></span>
+                <span class="grow"></span>
+                <button class="btn" @click="pv = null">Close</button>
+              </div>
+              <pre class="mono pvtext" tabindex="0" aria-label="file preview">{{ pv.text }}</pre>
             </div>
           </div>
         </div>
@@ -226,6 +239,23 @@ const busy = ref(false)
 const pending = ref<{ title: string; text: string; action: string; done: string; run: () => Promise<any> } | null>(null)
 let removed = false
 const mv = reactive({ channel: 'stable', version: '' })
+const pv = ref<{ path: string; bytes: number; truncated: boolean; text: string } | null>(null)
+const previewBusy = ref(false)
+const previewError = ref('')
+const TEXT = /\.(jsonl?|md|txt|toml|ya?ml|csv|tsv|xml|html?|rs|py|js|ts)$/i
+const isText = (p: { path: string; format?: string }) => TEXT.test(p.path) || /^(jsonl?|md|markdown|text|txt|toml|ya?ml|csv)$/i.test(p.format || '')
+async function preview(path: string) {
+  previewBusy.value = true
+  previewError.value = ''
+  try {
+    pv.value = await km.fileGet(rec.value.id, path, rec.value.version)
+  } catch (e: any) {
+    pv.value = null
+    previewError.value = e.message
+  } finally {
+    previewBusy.value = false
+  }
+}
 
 const rec = computed(() => d.value.record)
 const m = computed(() => d.value.manifest || {})
@@ -258,6 +288,7 @@ function brief(x: any): string {
 
 async function load() {
   error.value = ''
+  pv.value = null
   try {
     d.value = await km.show(props.id, (route.query.version as string) || undefined)
     mv.version = rec.value.version
@@ -344,6 +375,8 @@ function confirmed() {
 .meter { display: inline-block; width: 70px; height: 8px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; vertical-align: middle; overflow: hidden; }
 .meter > span { display: block; height: 100%; background: var(--accent); }
 .mv { margin-top: 10px; align-items: flex-end; }
+.pv { margin-top: 10px; }
+.pvtext { max-height: 320px; overflow: auto; padding: 8px; background: var(--panel-2); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8rem; }
 .hist { list-style: none; font-size: 0.85rem; }
 .hist li { padding: 2px 0; border-bottom: 1px solid var(--border); }
 </style>

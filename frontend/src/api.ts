@@ -7,6 +7,7 @@ export interface Tag { tag: string; origin: string; confidence: number; approved
 export interface KmItem {
   key: string; id: string; version: string; kind: string; name: string; description: string; domain: string
   tags: string[]; bytes: number; content_id: string; signature: string; source: string; misdeclared: string | null
+  base?: string | null; base_version?: string | null; arch?: string | null
   has_centroid: boolean; channels: string[]; resident: boolean; pinned: boolean; banned: boolean
   consolidation: Record<string, { state?: string; uplift?: number; last_step?: number; steps?: number }> | null
 }
@@ -76,9 +77,13 @@ export const km = {
   residency: (): Promise<Residency> => call('km.residency'),
   events: (a: { since?: number; limit?: number; kind?: string } = {}): Promise<{ last_seq: number | null; events: KmEvent[] }> =>
     call('km.events', a),
+  /** A text file of an installed KM (path as in km.show payload), at most max_bytes (ceiling 1 MiB). */
+  fileGet: (id: string, path: string, version?: string, max_bytes = 20000): Promise<{ key: string; path: string; bytes: number; truncated: boolean; text: string }> =>
+    call('km.file.get', { id, path, ...(version ? { version } : {}), max_bytes }),
   vocabularyGet: (): Promise<Vocabulary> => call('km.vocabulary.get'),
   vocabularyEdit: (a: Record<string, unknown>) => call('km.vocabulary.edit', a),
   data: {
+    /** Filters (all server-side): status, split, tag, task, text, min_quality, source_kind, limit, offset. */
     list: (id: string, a: Record<string, unknown> = {}): Promise<any> => call('km.data.list', { id, ...a }),
     get: (id: string, record: string, history = true): Promise<DataRecord & { history?: Revision[] }> =>
       call('km.data.get', { id, record, history }),
@@ -91,37 +96,88 @@ export const km = {
   },
 }
 
-// ---- Factory (km-factory.md §2). The backend may not be there: pages show "not available" on a 404 -------------
+// ---- Factory (src/factory/ops.rs). The backend may not be there: pages show "not available" on a 404 -----------
+export interface FactoryUsage { tokens?: number; prompt_tokens?: number; completion_tokens?: number; calls?: number; retries?: number; wall_ms?: number }
+
 export interface FactoryTask {
-  id: string; goal: string; status: string; step?: string; progress?: number; created_ms?: number; updated_ms?: number
-  error?: string | null; [k: string]: any
+  id: string; name?: string; goal: string; state: string; status: string; step?: string | null; created_ms?: number; updated_ms?: number
+  error?: string | null; records?: number; usage?: FactoryUsage; [k: string]: any
 }
 
-/** The create-task JSON of km-factory.md §2. */
+/** The create-task JSON (factory.task.create). */
 export interface FactorySpec {
   goal: string; kinds: string[]; domain: string; sources: Record<string, string>[]; author: string; reviewer?: string
-  base: string; size: { records?: number; max_tokens?: number }; tagging: { vocabulary: string; review: string }
-  approval: string; budget: { gpu_hours?: number }
+  base?: string; size: { records?: number; max_tokens?: number }; tagging: { vocabulary: string; review: string }
+  approval: string; budget: { wall_s?: number; max_records?: number; gpu_hours?: number }
+  device?: Record<string, string>; plan_approval?: boolean; eval_sets?: Record<string, unknown>[]; think?: boolean
+  per_call?: number; name?: string; start?: boolean; license?: string
+}
+
+export interface ReviewItem {
+  id: number; type: 'record' | 'tag' | 'vocab' | 'promotion'; kind: string; task: string; ref: string; record_id: any; tag: any
+  confidence: number | null; origin: any; record: any; reason: string; data: any; state: string; decision: string | null
+  decided_by: string | null; note: string | null; created: number; decided: number | null
+}
+
+export interface FactorySettings {
+  embedder: string; embed_model: string; promotion: string; min_uplift: number; auto_add_vocabulary: boolean
+  review_threshold: number; tag_threshold: number; tag_floor: number; dedupe_threshold: number; leak_threshold: number
+  chunk_chars: number; max_file_bytes: number; max_files: number; max_total_bytes: number; max_url_bytes: number
+  max_retries: number; gen_max_tokens: number; eval_notes: number
 }
 
 export const FACTORY_STEPS = ['plan', 'gather', 'generate', 'verify', 'tag', 'build', 'evaluate', 'publish']
+/** Task states: created, running, awaiting_approval, budget, failed, cancelled, interrupted, done. */
+export const FACTORY_STATES = ['created', 'running', 'awaiting_approval', 'budget', 'failed', 'cancelled', 'interrupted', 'done']
+export const stateLabel = (st: string) => (st === 'awaiting_approval' ? 'awaiting approval' : st === 'budget' ? 'budget reached' : st)
+/** Whether a task in this state can be resumed (the hub refuses a running or a done one). */
+export const resumable = (st: string) => ['budget', 'interrupted', 'failed', 'cancelled', 'created', 'awaiting_approval'].includes(st)
+
+/** Step-based progress, 0..100: finished steps of the eight, plus a half for the one running. */
+export function stepProgress(state: string, step?: string | null, steps?: { name: string; status: string }[]): number {
+  if (state === 'done') return 100
+  let done: number
+  if (steps && steps.length) {
+    done = steps.filter((x) => x.status === 'done' || x.status === 'skipped').length
+    if (steps.some((x) => x.status === 'running')) done += 0.5
+  } else {
+    const i = FACTORY_STEPS.indexOf(String(step || ''))
+    done = i < 0 ? 0 : i + (state === 'running' ? 0.5 : state === 'awaiting_approval' ? 1 : 0)
+  }
+  return Math.round(Math.max(0, Math.min(100, (done / FACTORY_STEPS.length) * 100)))
+}
+
+export const fmtDuration = (ms?: number | null) => {
+  const s = Math.round((ms || 0) / 1000)
+  return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`
+}
 
 export const factory = {
   create: (spec: FactorySpec): Promise<any> => call('factory.task.create', spec as any),
+  /** factory.task.list answers a plain array. */
   list: async (a: Record<string, unknown> = {}): Promise<FactoryTask[]> => {
     const r = await call('factory.task.list', a)
     return Array.isArray(r) ? r : r?.items || r?.tasks || []
   },
-  get: (id: string): Promise<any> => call('factory.task.get', { id }),
-  planEdit: (id: string, a: { plan?: unknown; approve?: boolean }) => call('factory.task.plan.edit', { id, ...a }),
-  resume: (id: string) => call('factory.task.resume', { id }),
+  /** records: how many records to include as record_items; review: include the open review items. */
+  get: (id: string, a: { records?: number; logs?: number; review?: boolean; status?: string } = {}): Promise<any> =>
+    call('factory.task.get', { id, ...a }),
+  /** plan replaces the plan; changes is a merge patch (null removes a key). */
+  planEdit: (id: string, a: { plan?: unknown; changes?: Record<string, unknown>; approve?: boolean }) => call('factory.task.plan.edit', { id, ...a }),
+  /** from re-opens that step and the ones after it; changes may raise budgets or change models first. */
+  resume: (id: string, a: { from?: string; changes?: Record<string, unknown> } = {}) => call('factory.task.resume', { id, ...a }),
   cancel: (id: string) => call('factory.task.cancel', { id }),
-  reviewList: async (a: Record<string, unknown> = {}): Promise<any[]> => {
+  /** {total, items}; state defaults to open (approved, rejected, edited or all show decided ones). */
+  reviewList: async (a: Record<string, unknown> = {}): Promise<{ total: number; items: ReviewItem[] }> => {
     const r = await call('factory.review.list', a)
-    return Array.isArray(r) ? r : r?.items || []
+    return Array.isArray(r) ? { total: r.length, items: r } : { total: r?.total ?? (r?.items || []).length, items: r?.items || [] }
   },
-  decide: (item: string, decision: 'approve' | 'edit' | 'reject', extra: Record<string, unknown> = {}) =>
-    call('factory.review.decide', { item, decision, ...extra }),
+  /** item is the review item's number; edit takes changes ({input, output, tags} of a record). */
+  decide: (item: number | string, decision: 'approve' | 'edit' | 'reject', extra: Record<string, unknown> = {}) =>
+    call('factory.review.decide', { item, decision, by: 'owner', ...extra }),
+  settings: (): Promise<FactorySettings> => call('factory.settings', {}),
+  setSettings: (settings: Record<string, unknown>): Promise<FactorySettings> => call('factory.settings', { settings }),
+  embedderSetup: (model: string, a: Record<string, unknown> = {}): Promise<any> => call('factory.embedder.setup', { model, ...a }),
 }
 
 /** True when the hub answered that the operation does not exist (the factory backend is not built in). */

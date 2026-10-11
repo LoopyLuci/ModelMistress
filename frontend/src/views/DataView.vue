@@ -42,13 +42,11 @@
           <input v-model="f.tag" type="text" placeholder="tag e.g. lang:rust" style="width: 150px" aria-label="tag" />
           <input v-model="f.task" type="text" placeholder="task" style="width: 90px" aria-label="task" />
           <input v-model.number="f.quality" type="number" min="0" max="1" step="0.1" placeholder="min quality" style="width: 110px" aria-label="minimum quality" />
-          <select v-model="f.source" aria-label="source kind">
-            <option value="">any source</option>
-            <option v-for="s in sourceKinds" :key="s" :value="s">{{ s }}</option>
-          </select>
+          <input v-model="f.source" type="text" list="source-kinds" placeholder="source kind" style="width: 120px" aria-label="source kind" />
+          <datalist id="source-kinds"><option v-for="s in sourceKinds" :key="s" :value="s"></option></datalist>
           <button class="btn primary">Filter</button>
         </div>
-        <p class="muted small">Status, split, tag, task and text are applied by the hub; quality and source kind to the page of records shown.</p>
+        <p class="muted small">Every filter is applied by the hub, so the counts and pages are of the matching records.</p>
       </form>
 
       <div class="split">
@@ -261,13 +259,8 @@ const confirmCommit = ref(false)
 const confirmAllPending = ref(false)
 
 const rows = computed<DataRecord[]>(() => listing.value?.records || [])
-const sourceKinds = computed(() => [...new Set(rows.value.map((r) => r.source?.kind).filter(Boolean))] as string[])
-const visible = computed(() =>
-  rows.value.filter(
-    (r) =>
-      (f.quality == null || (Number(r.labels?.quality) || 0) >= f.quality) && (!f.source || r.source?.kind === f.source),
-  ),
-)
+const sourceKinds = computed(() => [...new Set(['teacher', 'owner', 'trace', 'import', ...rows.value.map((r) => r.source?.kind).filter(Boolean)])] as string[])
+const visible = rows // the hub applies every filter
 const allPicked = computed(() => visible.value.length > 0 && visible.value.every((r) => picked.value.includes(r.id)))
 const otherSource = computed(() => Object.fromEntries(Object.entries(draft.value?.source || {}).filter(([k]) => !['kind', 'model', 'trace'].includes(k))))
 const lastUser = (r: DataRecord) => [...(r.input || [])].reverse().find((m) => m.role === 'user')?.content || r.input?.[0]?.content || ''
@@ -306,7 +299,8 @@ async function reload(reset = false) {
   try {
     listing.value = await km.data.list(current.value, {
       limit: size, offset: offset.value,
-      ...Object.fromEntries(Object.entries({ status: f.status, split: f.split, tag: f.tag, task: f.task, text: f.text }).filter(([, v]) => v)),
+      ...Object.fromEntries(Object.entries({ status: f.status, split: f.split, tag: f.tag, task: f.task, text: f.text, source_kind: f.source.trim() }).filter(([, v]) => v)),
+      ...(f.quality != null && !Number.isNaN(f.quality) ? { min_quality: f.quality } : {}),
     })
     picked.value = picked.value.filter((p) => rows.value.some((r) => r.id === p))
   } catch (e: any) {

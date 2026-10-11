@@ -3,11 +3,14 @@
     <div class="row bar">
       <h2 class="grow">Factory</h2>
       <router-link to="/factory/review" class="btn">Review queue</router-link>
+      <button class="btn" :disabled="gone" @click="showSettings = !showSettings">{{ showSettings ? 'Hide settings' : 'Factory settings' }}</button>
       <button class="btn primary" :disabled="gone" @click="showForm = !showForm">{{ showForm ? 'Hide form' : 'New task' }}</button>
     </div>
     <Unavailable v-if="gone" what="Factory" op="factory.task.list" />
     <p v-else-if="error" class="error-box" role="alert">{{ error }}</p>
     <p v-if="note" class="muted" role="status">{{ note }}</p>
+
+    <FactorySettingsPanel v-if="showSettings && !gone" />
 
     <form v-if="showForm && !gone" class="card" aria-label="new factory task" @submit.prevent="create">
       <h3>New task</h3>
@@ -28,17 +31,20 @@
         <label class="field">Reviewer model
           <input v-model="s.reviewer" type="text" list="models" />
         </label>
-        <label class="field">Base core
-          <select v-model="s.base"><option v-for="b in ['dusty', 'misty', 'any']" :key="b" :value="b">{{ b }}</option></select>
+        <label class="field">Base model
+          <input v-model="s.base" type="text" list="models" placeholder="default: the author" />
         </label>
         <label class="field">Records (target)
           <input v-model.number="s.size.records" type="number" min="1" />
         </label>
-        <label class="field">Max tokens
+        <label class="field">Max tokens (hard stop)
           <input v-model.number="s.size.max_tokens" type="number" min="1" />
         </label>
-        <label class="field">GPU hours (budget)
-          <input v-model.number="s.budget.gpu_hours" type="number" min="0" step="0.5" />
+        <label class="field">Wall time budget (s)
+          <input v-model.number="s.budget.wall_s" type="number" min="1" />
+        </label>
+        <label class="field">Max records (budget)
+          <input v-model.number="s.budget.max_records" type="number" min="1" />
         </label>
         <label class="field">Vocabulary
           <input v-model="s.tagging.vocabulary" type="text" />
@@ -51,6 +57,38 @@
         </label>
       </div>
       <datalist id="models"><option v-for="m in models" :key="m" :value="m"></option></datalist>
+
+      <details class="adv">
+        <summary>Advanced</summary>
+        <div class="formgrid">
+          <label class="field">Name (names the KMs)
+            <input v-model="s.name" type="text" />
+          </label>
+          <label class="field">Records per model call
+            <input v-model.number="s.per_call" type="number" min="1" max="12" />
+          </label>
+          <label class="field">GPU hours (recorded for the Forge)
+            <input v-model.number="s.budget.gpu_hours" type="number" min="0" step="0.5" />
+          </label>
+          <label class="field">License
+            <input v-model="s.license" type="text" />
+          </label>
+          <div v-for="d in DEVICES" :key="d" class="field">
+            <label>Device: {{ d }}
+              <select v-model="dev[d].mode" :aria-label="`device of the ${d}`">
+                <option v-for="m in ['auto', 'gpu', 'cpu', 'layers']" :key="m" :value="m">{{ m === 'layers' ? 'layers N' : m }}</option>
+              </select>
+            </label>
+            <input v-if="dev[d].mode === 'layers'" v-model.number="dev[d].layers" type="number" min="0" :aria-label="`layers of the ${d}`" />
+          </div>
+        </div>
+        <label class="row small"><input v-model="s.plan_approval" type="checkbox" /> Stop after planning until I approve the plan</label>
+        <label class="row small"><input v-model="s.think" type="checkbox" /> Let reasoning models think (slower, spends tokens)</label>
+        <label class="row small"><input v-model="s.start" type="checkbox" /> Start the pipeline now</label>
+        <label class="field">Evaluation sets the records must not leak (one per line: a JSONL path on the hub, or ids:a,b or hashes:a,b)
+          <textarea v-model="evalText" rows="2" spellcheck="false"></textarea>
+        </label>
+      </details>
 
       <fieldset class="srcs">
         <legend>Sources</legend>
@@ -76,19 +114,23 @@
 
     <div v-if="!gone" class="card tablewrap">
       <table class="t" aria-label="factory tasks">
-        <thead><tr><th>task</th><th>status</th><th>step</th><th>progress</th><th>updated</th></tr></thead>
+        <thead><tr><th>task</th><th>state</th><th>step</th><th>progress</th><th class="num">records</th><th>updated</th></tr></thead>
         <tbody>
           <tr v-for="t in tasks" :key="t.id">
             <td>
               <router-link :to="`/factory/${encodeURIComponent(t.id)}`"><strong>{{ t.goal || t.id }}</strong></router-link>
               <div class="mono muted small">{{ t.id }}</div>
             </td>
-            <td><span class="pill" :class="statusClass(t.status)">{{ t.status }}</span></td>
+            <td>
+              <span class="pill" :class="t.state">{{ stateLabel(t.state) }}</span>
+              <div v-if="t.error" class="small muted errline" :title="t.error">{{ t.error }}</div>
+            </td>
             <td>{{ t.step || '-' }}</td>
             <td>
               <span class="meter" role="progressbar" :aria-valuenow="pct(t)" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: pct(t) + '%' }"></span></span>
               <span class="small"> {{ pct(t) }}%</span>
             </td>
+            <td class="num">{{ t.records ?? '' }}</td>
             <td class="muted small">{{ fmtWhen(t.updated_ms || t.created_ms) }}</td>
           </tr>
         </tbody>
@@ -101,12 +143,14 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import Unavailable from '@/components/Unavailable.vue'
-import { factory, modelIds, unavailable, type FactorySpec, type FactoryTask } from '@/api'
+import FactorySettingsPanel from '@/components/FactorySettingsPanel.vue'
+import { factory, modelIds, stateLabel, stepProgress, unavailable, type FactorySpec, type FactoryTask } from '@/api'
 import { fmtWhen } from '@/util'
 
 const KINDS = ['data', 'memory', 'adapter', 'skill', 'tool']
-// The field each kind of source is described by (km-factory.md §2).
-const SRC: Record<string, string> = { dir: 'path', url: 'url', km: 'id', skill: 'path', tool: 'name', traces: 'query' }
+// The field each kind of source is described by.
+const SRC: Record<string, string> = { dir: 'path', file: 'path', url: 'url', km: 'id', skill: 'path', tool: 'name', traces: 'query' }
+const DEVICES = ['author', 'reviewer', 'base', 'embedder'] as const
 
 const tasks = ref<FactoryTask[]>([])
 const models = ref<string[]>([])
@@ -116,32 +160,58 @@ const error = ref('')
 const note = ref('')
 const busy = ref(false)
 const showForm = ref(false)
+const showSettings = ref(false)
+const evalText = ref('')
+const dev = reactive(
+  Object.fromEntries(DEVICES.map((d) => [d, { mode: 'auto', layers: 0 }])) as Record<string, { mode: string; layers: number }>,
+)
 const s = reactive({
   goal: '', kinds: ['data', 'memory'] as string[], domain: '', sources: [{ kind: 'dir', path: '' }] as Record<string, string>[],
-  author: '', reviewer: '', base: 'dusty', size: { records: 500 as number | undefined, max_tokens: undefined as number | undefined },
-  tagging: { vocabulary: 'default', review: 'auto' }, approval: 'gated', budget: { gpu_hours: undefined as number | undefined },
+  author: '', reviewer: '', base: '', name: '', license: '', per_call: undefined as number | undefined,
+  plan_approval: false, think: false, start: true,
+  size: { records: 500 as number | undefined, max_tokens: undefined as number | undefined },
+  tagging: { vocabulary: 'default', review: 'auto' }, approval: 'gated',
+  budget: { wall_s: undefined as number | undefined, max_records: undefined as number | undefined, gpu_hours: undefined as number | undefined },
 })
 let timer = 0
 
 const clean = <T extends Record<string, any>>(o: T): T =>
   Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null && v !== '' && !Number.isNaN(v))) as T
+function devices(): Record<string, string> | undefined {
+  const d = Object.fromEntries(
+    Object.entries(dev).map(([k, v]) => [k, v.mode === 'layers' ? `layers ${Math.max(0, Math.floor(Number(v.layers) || 0))}` : v.mode]),
+  )
+  return Object.values(d).every((v) => v === 'auto') ? undefined : d
+}
+function evalSets(): Record<string, unknown>[] {
+  return evalText.value
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const m = /^(ids|hashes):(.*)$/.exec(l)
+      return m ? { [m[1]]: m[2].split(',').map((x) => x.trim()).filter(Boolean) } : { path: l }
+    })
+}
 function spec(): FactorySpec {
+  const dv = devices()
+  const ev = evalSets()
   return {
     goal: s.goal.trim(), kinds: s.kinds, domain: s.domain.trim(),
     sources: s.sources.filter((x) => x[SRC[x.kind]]?.trim()).map((x) => ({ kind: x.kind, [SRC[x.kind]]: x[SRC[x.kind]].trim() })),
-    author: s.author.trim(), ...(s.reviewer.trim() ? { reviewer: s.reviewer.trim() } : {}), base: s.base, size: clean(s.size), tagging: { ...s.tagging },
-    approval: s.approval, budget: clean(s.budget),
+    author: s.author.trim(), ...(s.reviewer.trim() ? { reviewer: s.reviewer.trim() } : {}), ...(s.base.trim() ? { base: s.base.trim() } : {}),
+    size: clean(s.size), tagging: { ...s.tagging }, approval: s.approval, budget: clean(s.budget),
+    ...(s.name.trim() ? { name: s.name.trim() } : {}), ...(s.license.trim() ? { license: s.license.trim() } : {}),
+    ...(s.per_call ? { per_call: s.per_call } : {}), ...(s.plan_approval ? { plan_approval: true } : {}), ...(s.think ? { think: true } : {}),
+    ...(s.start ? {} : { start: false }), ...(dv ? { device: dv } : {}), ...(ev.length ? { eval_sets: ev } : {}),
   }
 }
 const resetSource = (src: Record<string, string>) => {
   for (const k of Object.keys(src)) if (k !== 'kind') delete src[k]
   src[SRC[src.kind]] = ''
 }
-const pct = (t: FactoryTask) => {
-  const p = Number(t.progress) || 0 // 0..1, or already a percentage
-  return Math.round(Math.max(0, Math.min(100, p > 1 ? p : p * 100)))
-}
-const statusClass = (st: string) => (['done', 'complete', 'completed', 'published'].includes(st) ? 'done' : ['failed', 'error'].includes(st) ? 'failed' : st === 'cancelled' ? 'cancelled' : ['running', 'planning'].includes(st) ? 'running' : st === 'awaiting_approval' ? 'pending' : '')
+// Progress follows the eight steps: the list gives the current step, not per-step results.
+const pct = (t: FactoryTask) => stepProgress(t.state, t.step)
 
 async function load() {
   try {
@@ -160,8 +230,9 @@ async function create() {
   error.value = ''
   try {
     const r = await factory.create(spec())
-    note.value = `Created task ${r?.id || r?.task || ''}.`
+    note.value = `Created task ${r?.task || r?.id || ''} (${r?.state || 'created'}).`
     showForm.value = false
+    window.clearTimeout(timer)
     await load()
   } catch (e: any) {
     if (unavailable(e)) gone.value = true
@@ -184,8 +255,10 @@ onBeforeUnmount(() => window.clearTimeout(timer))
 .srcs { display: block; }
 .kinds legend, .srcs legend { padding: 0 6px; color: var(--muted); font-size: 0.85rem; }
 .src { margin-bottom: 6px; flex-wrap: nowrap; }
-.json { margin: 10px 0; }
+.json, .adv { margin: 10px 0; }
+.adv summary { cursor: pointer; color: var(--muted); }
 .json pre { overflow-x: auto; padding: 8px; background: var(--panel-2); border-radius: 8px; }
+.errline { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .meter { display: inline-block; width: 90px; height: 8px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; vertical-align: middle; overflow: hidden; }
 .meter > span { display: block; height: 100%; background: var(--accent); }
 </style>
