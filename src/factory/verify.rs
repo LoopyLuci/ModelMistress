@@ -50,16 +50,18 @@ pub fn load_eval_sets(sets: &[Value]) -> Result<EvalSet, String> {
                 if let Some(id) = v["id"].as_str() {
                     out.ids.insert(id.to_string());
                 }
-                let q = ["input", "question", "prompt", "text", "query"].iter().find_map(|k| match &v[*k] {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Array(a) => a
-                        .iter()
-                        .rev()
-                        .find(|m| m["role"] == "user")
-                        .and_then(|m| m["content"].as_str())
-                        .map(str::to_string),
-                    _ => None,
-                });
+                let q = ["input", "question", "prompt", "text", "query"]
+                    .iter()
+                    .find_map(|k| match &v[*k] {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Array(a) => a
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"] == "user")
+                            .and_then(|m| m["content"].as_str())
+                            .map(str::to_string),
+                        _ => None,
+                    });
                 if let Some(q) = q.filter(|q| !q.trim().is_empty()) {
                     out.hashes.insert(text_hash(&q));
                     out.texts.push(q);
@@ -129,7 +131,10 @@ async fn review_one(run: &Run, row: &RecordRow, chunks: &HashMap<String, ChunkRo
             .join("\n\n");
         let answer = rec["output"].as_str().unwrap_or("");
         let calls = rec["tool_calls"].as_array().map(|c| {
-            format!("\n(The assistant also called: {})", serde_json::to_string(c).unwrap_or_default())
+            format!(
+                "\n(The assistant also called: {})",
+                serde_json::to_string(c).unwrap_or_default()
+            )
         });
         let out_text = format!("{answer}{}", calls.unwrap_or_default());
         let user = user_text(&rec);
@@ -140,12 +145,17 @@ async fn review_one(run: &Run, row: &RecordRow, chunks: &HashMap<String, ChunkRo
             &[("chunks", &fenced), ("input", &user), ("output", &out_text)],
         );
         let res = run
-            .ask_json(Role::Reviewer, "verify", &system, &prompt_text, 400, &|v| {
-                match v["verdict"].as_str() {
+            .ask_json(
+                Role::Reviewer,
+                "verify",
+                &system,
+                &prompt_text,
+                400,
+                &|v| match v["verdict"].as_str() {
                     Some("supported" | "partial" | "unsupported") => Ok(()),
                     _ => Err("verdict must be supported, partial or unsupported".to_string()),
-                }
-            })
+                },
+            )
             .await?;
         match res {
             Ok((v, reply)) => {
@@ -174,7 +184,13 @@ async fn review_one(run: &Run, row: &RecordRow, chunks: &HashMap<String, ChunkRo
 
 pub async fn run(run: &Run) -> StepRes<StepEnd> {
     let s = run.f.settings();
-    let chunks: HashMap<String, ChunkRow> = run.f.db.chunks(&run.id).into_iter().map(|c| (c.id.clone(), c)).collect();
+    let chunks: HashMap<String, ChunkRow> = run
+        .f
+        .db
+        .chunks(&run.id)
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
 
     // A: one review per record, each kept as it is made
     let todo: Vec<RecordRow> = run
@@ -230,8 +246,8 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 rows[*i].emb = Some(e);
             }
         }
-        let eval = load_eval_sets(&run.spec.eval_sets)
-            .map_err(|e| super::run::Halt::Fail(crate::engine::Fail::invalid(e)))?;
+        let eval =
+            load_eval_sets(&run.spec.eval_sets).map_err(|e| super::run::Halt::Fail(crate::engine::Fail::invalid(e)))?;
         let eval_embs: Vec<Vec<f32>> = if eval.texts.is_empty() {
             vec![]
         } else {
@@ -296,7 +312,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             }
             kept.push((rows[i].id.clone(), rows[i].hash.clone(), emb));
             let _ = user;
-            let verdict = rows[i].json["verify"]["verdict"].as_str().unwrap_or("partial").to_string();
+            let verdict = rows[i].json["verify"]["verdict"]
+                .as_str()
+                .unwrap_or("partial")
+                .to_string();
             let clean = verdict == "supported" && rows[i].score >= s.review_threshold;
             let review = run.spec.tagging.review.as_str();
             let (status, queue) = match (review, clean) {
@@ -349,7 +368,13 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             .collect();
         run.f.db.put_records(&run.id, &picked)?;
     }
-    counts["heldout"] = json!(run.f.db.records(&run.id, None).iter().filter(|r| r.split == "heldout" && r.status != "rejected").count());
+    counts["heldout"] = json!(run
+        .f
+        .db
+        .records(&run.id, None)
+        .iter()
+        .filter(|r| r.split == "heldout" && r.status != "rejected")
+        .count());
     counts["rejected_total"] = json!(run.f.db.records(&run.id, Some("rejected")).len());
     Ok(StepEnd::Done(counts))
 }
@@ -369,8 +394,10 @@ mod tests {
 
     #[test]
     fn quality_weighs_support_the_reviewer_and_length() {
-        let good = json!({"output": "A complete answer of decent length.", "verify": {"verdict": "supported", "score": 0.9}});
-        let part = json!({"output": "A complete answer of decent length.", "verify": {"verdict": "partial", "score": 0.9}});
+        let good =
+            json!({"output": "A complete answer of decent length.", "verify": {"verdict": "supported", "score": 0.9}});
+        let part =
+            json!({"output": "A complete answer of decent length.", "verify": {"verdict": "partial", "score": 0.9}});
         let short = json!({"output": "no", "verify": {"verdict": "supported", "score": 0.9}});
         assert!(quality(&good) > quality(&part) && quality(&good) > quality(&short));
         assert!(quality(&good) > 0.9 && quality(&json!({"verify": {"verdict": "unsupported", "score": 0.0}})) < 0.2);
@@ -387,7 +414,9 @@ mod tests {
         .unwrap();
         let e = load_eval_sets(&[json!({"path": p}), json!({"ids": ["x"]}), json!({"hashes": ["abc"]})]).unwrap();
         assert!(e.ids.contains("e1") && e.ids.contains("x") && e.hashes.contains("abc"));
-        assert!(e.hashes.contains(&text_hash("what is a future")) && e.hashes.contains(&text_hash("How do I join tasks")));
+        assert!(
+            e.hashes.contains(&text_hash("what is a future")) && e.hashes.contains(&text_hash("How do I join tasks"))
+        );
         assert_eq!(e.texts.len(), 2);
         assert!(load_eval_sets(&[json!({"path": d.join("none.jsonl")})]).is_err());
         let _ = std::fs::remove_dir_all(d);

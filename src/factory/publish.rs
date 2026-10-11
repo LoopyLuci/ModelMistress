@@ -35,7 +35,12 @@ pub fn finals(run: &Run) -> Vec<(String, String, String)> {
 
 fn recorded_uplift(run: &Run, id: &str, version: &str) -> Option<f64> {
     let dir = run.km.store.dir_of(&format!("{id}@{version}"));
-    Manifest::from_file(&dir.join("km.toml")).ok()?.quality.scores.get("uplift").copied()
+    Manifest::from_file(&dir.join("km.toml"))
+        .ok()?
+        .quality
+        .scores
+        .get("uplift")
+        .copied()
 }
 
 /// Promotes `id@version` to stable; returns what the channel pointed at before.
@@ -48,7 +53,9 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     let policy = run.spec.approval.clone().unwrap_or_else(|| s.promotion.clone());
     let kms = finals(run);
     if policy == "off" {
-        return Ok(StepEnd::Done(json!({"policy": policy, "published": [], "note": "promotion policy is off: nothing was published"})));
+        return Ok(StepEnd::Done(
+            json!({"policy": policy, "published": [], "note": "promotion policy is off: nothing was published"}),
+        ));
     }
     let mut published = vec![];
     for (id, version, _) in &kms {
@@ -92,7 +99,9 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             let mut reasons = vec![];
             match uplift {
                 None => reasons.push("no evaluation: there is no uplift to judge by".to_string()),
-                Some(u) if u < s.min_uplift => reasons.push(format!("uplift {u:.3} is below the required {:.3}", s.min_uplift)),
+                Some(u) if u < s.min_uplift => {
+                    reasons.push(format!("uplift {u:.3} is below the required {:.3}", s.min_uplift))
+                }
                 _ => {}
             }
             if open > 0 {
@@ -105,7 +114,9 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 let stable = run.km.store.channel_get(id, "stable");
                 if let (Some(st), Some(u)) = (stable.as_deref().and_then(|v| recorded_uplift(run, id, v)), uplift) {
                     if st >= u {
-                        reasons.push(format!("{id}: the stable version's uplift {st:.3} is not beaten ({u:.3})"));
+                        reasons.push(format!(
+                            "{id}: the stable version's uplift {st:.3} is not beaten ({u:.3})"
+                        ));
                     }
                 }
                 let _ = version;
@@ -122,6 +133,8 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             }
         }
     }
-    Ok(StepEnd::Done(json!({"policy": policy, "published": published, "promoted": promoted, "held_back": held_back,
-                            "uplift": uplift, "open_review_items": open})))
+    Ok(StepEnd::Done(
+        json!({"policy": policy, "published": published, "promoted": promoted, "held_back": held_back,
+                            "uplift": uplift, "open_review_items": open}),
+    ))
 }

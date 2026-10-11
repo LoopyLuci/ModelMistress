@@ -1,7 +1,7 @@
 {
- "passed": true,
- "at": "20261007-190052",
- "seconds": 122.4,
+ "passed": false,
+ "at": "20261010-212006",
+ "seconds": 1.2,
  "stages": [
   {
    "stage": "preflight",
@@ -11,27 +11,9 @@
   },
   {
    "stage": "static",
-   "ok": true,
-   "seconds": 0.9,
-   "message": ""
-  },
-  {
-   "stage": "tests",
-   "ok": true,
-   "seconds": 1.2,
-   "message": ""
-  },
-  {
-   "stage": "build",
-   "ok": true,
-   "seconds": 108.4,
-   "message": ""
-  },
-  {
-   "stage": "smoke",
-   "ok": true,
-   "seconds": 12.0,
-   "message": ""
+   "ok": false,
+   "seconds": 1.1,
+   "message": "rustfmt: these files need formatting (rustfmt --edition 2021 <file>):\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:135:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:146:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:159:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:236:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:250:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:320:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:353:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:407:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:421:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:439:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:452:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:474:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:486:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:506:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:537:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:572:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:595:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:635:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:671:\nDiff in \\\\?\\X:\\Dev\\work\\mm-audio\\src\\factory\\build.rs:704:"
   }
  ]
 }

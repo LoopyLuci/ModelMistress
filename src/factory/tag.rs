@@ -39,9 +39,44 @@ fn has_word(text: &str, w: &str) -> bool {
 }
 
 const TASK_WORDS: [(&str, &[&str]); 8] = [
-    ("codegen", &["write a function", "implement", "write code", "fn ", "def ", "```", "snippet", "example code"]),
-    ("debug", &["error", "bug", "fix", "panic", "exception", "fails", "failing", "not working"]),
-    ("explain", &["explain", "what is", "what does", "why ", "how does", "meaning of", "difference between"]),
+    (
+        "codegen",
+        &[
+            "write a function",
+            "implement",
+            "write code",
+            "fn ",
+            "def ",
+            "```",
+            "snippet",
+            "example code",
+        ],
+    ),
+    (
+        "debug",
+        &[
+            "error",
+            "bug",
+            "fix",
+            "panic",
+            "exception",
+            "fails",
+            "failing",
+            "not working",
+        ],
+    ),
+    (
+        "explain",
+        &[
+            "explain",
+            "what is",
+            "what does",
+            "why ",
+            "how does",
+            "meaning of",
+            "difference between",
+        ],
+    ),
     ("summarise", &["summarise", "summarize", "summary", "tl;dr"]),
     ("translate", &["translate", "translation"]),
     ("plan", &["plan", "roadmap", "outline", "steps to", "strategy"]),
@@ -49,10 +84,29 @@ const TASK_WORDS: [(&str, &[&str]); 8] = [
     ("chat", &["hello", "thanks", "help me"]),
 ];
 const LANGS: [&str; 14] = [
-    "rust", "python", "javascript", "typescript", "go", "java", "kotlin", "swift", "sql", "bash", "c++", "c#", "ruby",
+    "rust",
+    "python",
+    "javascript",
+    "typescript",
+    "go",
+    "java",
+    "kotlin",
+    "swift",
+    "sql",
+    "bash",
+    "c++",
+    "c#",
+    "ruby",
     "haskell",
 ];
-const SECURITY: [&str; 6] = ["password", "secret key", "exploit", "vulnerability", "api key", "credential"];
+const SECURITY: [&str; 6] = [
+    "password",
+    "secret key",
+    "exploit",
+    "vulnerability",
+    "api key",
+    "credential",
+];
 
 fn looks_like_pii(text: &str) -> bool {
     let is_email = |w: &str| {
@@ -63,7 +117,9 @@ fn looks_like_pii(text: &str) -> bool {
                     && l.chars().all(|c| c.is_ascii_alphanumeric() || "._%+-".contains(c))
                     && d.contains('.')
                     && d.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
-                    && d.rsplit('.').next().is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
+                    && d.rsplit('.')
+                        .next()
+                        .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
             }
             None => false,
         }
@@ -98,20 +154,32 @@ pub fn rule_tags(
     for (task, ws) in TASK_WORDS {
         let hits = ws.iter().filter(|w| text.contains(*w)).count();
         if hits > 0 {
-            out.push((format!("task:{task}"), (0.45 + 0.15 * hits as f64).min(0.9), "classifier"));
+            out.push((
+                format!("task:{task}"),
+                (0.45 + 0.15 * hits as f64).min(0.9),
+                "classifier",
+            ));
         }
     }
     if !tool_calls.is_empty() {
         out.push(("task:tool-use".into(), 0.95, "classifier"));
         for c in &tool_calls {
             if let Some(n) = c["name"].as_str() {
-                out.push((format!("tool:{}", super::util::slug(n).replace('.', "-")), 0.95, "classifier"));
+                out.push((
+                    format!("tool:{}", super::util::slug(n).replace('.', "-")),
+                    0.95,
+                    "classifier",
+                ));
             }
         }
     }
     for l in LANGS {
         if has_word(&text, l) {
-            out.push((format!("lang:{}", l.replace("c++", "cpp").replace("c#", "csharp")), 0.7, "classifier"));
+            out.push((
+                format!("lang:{}", l.replace("c++", "cpp").replace("c#", "csharp")),
+                0.7,
+                "classifier",
+            ));
         }
     }
     if has_word(&text, "the") && has_word(&text, "and") {
@@ -125,8 +193,10 @@ pub fn rule_tags(
     }
     // other closed namespaces of the vocabulary: a value whose words all appear
     for (ns, n) in &vocab.namespaces {
-        if matches!(ns.as_str(), "task" | "lang" | "lib" | "modality" | "skill" | "tool" | "source" | "license" | "quality" | "risk")
-            || n.open
+        if matches!(
+            ns.as_str(),
+            "task" | "lang" | "lib" | "modality" | "skill" | "tool" | "source" | "license" | "quality" | "risk"
+        ) || n.open
         {
             continue;
         }
@@ -145,7 +215,11 @@ pub fn rule_tags(
     };
     out.push((risk.0.into(), risk.1, "classifier"));
     for l in licenses {
-        out.push((format!("license:{}", l.to_lowercase().replace(' ', "-")), 0.9, "classifier"));
+        out.push((
+            format!("license:{}", l.to_lowercase().replace(' ', "-")),
+            0.9,
+            "classifier",
+        ));
     }
     // what the owner's decisions taught: more or less sure of the tags they approved or refused for these words
     for (tag, n) in feedback {
@@ -169,8 +243,16 @@ pub fn combine(cands: &Cands) -> BTreeMap<String, (f64, &'static str)> {
     by.into_iter()
         .map(|(t, v)| {
             let miss: f64 = v.iter().map(|x| 1.0 - x.0).product();
-            let best = v.iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            (t, (((1.0 - miss) * 1000.0).round() / 1000.0, best.map_or("classifier", |b| b.1)))
+            let best = v
+                .iter()
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            (
+                t,
+                (
+                    ((1.0 - miss) * 1000.0).round() / 1000.0,
+                    best.map_or("classifier", |b| b.1),
+                ),
+            )
         })
         .collect()
 }
@@ -191,7 +273,9 @@ fn vocab_text(v: &Vocabulary) -> String {
 
 fn valid_tag_shape(t: &str) -> bool {
     t.split_once(':').is_some_and(|(n, v)| {
-        let ok = |s: &str| !s.is_empty() && s.len() <= 64 && s.chars().all(|c| !c.is_whitespace() && !c.is_control() && c != ':');
+        let ok = |s: &str| {
+            !s.is_empty() && s.len() <= 64 && s.chars().all(|c| !c.is_whitespace() && !c.is_control() && c != ':')
+        };
         ok(n) && ok(v)
     })
 }
@@ -218,10 +302,19 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.embed_model.as_deref() == Some(model_id.as_str()))
-        .filter_map(|r| r.centroid.as_ref().map(|c| (r.key.clone(), f16_to_f32(c), r.tags.clone())))
+        .filter_map(|r| {
+            r.centroid
+                .as_ref()
+                .map(|c| (r.key.clone(), f16_to_f32(c), r.tags.clone()))
+        })
         .collect();
-    let chunks: std::collections::HashMap<String, super::store::ChunkRow> =
-        run.f.db.chunks(&run.id).into_iter().map(|c| (c.id.clone(), c)).collect();
+    let chunks: std::collections::HashMap<String, super::store::ChunkRow> = run
+        .f
+        .db
+        .chunks(&run.id)
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
 
     let todo: Vec<RecordRow> = run
         .f
@@ -272,11 +365,18 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         let (system, ptext) = prompt(
             run.home(),
             "tag",
-            &[("vocabulary", &vt), ("input", &user), ("output", rec["output"].as_str().unwrap_or(""))],
+            &[
+                ("vocabulary", &vt),
+                ("input", &user),
+                ("output", rec["output"].as_str().unwrap_or("")),
+            ],
         );
         let res = run
             .ask_json(Role::Author, "tag", &system, &ptext, 400, &|v| {
-                v["tags"].as_array().map(|_| ()).ok_or_else(|| "tags must be a list".to_string())
+                v["tags"]
+                    .as_array()
+                    .map(|_| ())
+                    .ok_or_else(|| "tags must be a list".to_string())
             })
             .await?;
         let mut proposals: Vec<(String, String)> = vec![];
@@ -302,7 +402,13 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             for p in v["propose"].as_array().into_iter().flatten() {
                 let tag = p["tag"].as_str().unwrap_or("").trim().to_lowercase();
                 if valid_tag_shape(&tag) && vocab.problem(&tag).is_some() {
-                    proposals.push((tag, p["reason"].as_str().unwrap_or("proposed by the author model").to_string()));
+                    proposals.push((
+                        tag,
+                        p["reason"]
+                            .as_str()
+                            .unwrap_or("proposed by the author model")
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -355,7 +461,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                     &run.id,
                     "tag",
                     &format!("{}|{tag}", row.id),
-                    &format!("{tag} with confidence {conf:.2} ({origin}); attached at {:.2}", s.tag_threshold),
+                    &format!(
+                        "{tag} with confidence {conf:.2} ({origin}); attached at {:.2}",
+                        s.tag_threshold
+                    ),
                     &json!({"record": row.id, "tag": tag, "confidence": conf, "origin": origin}),
                 )?;
                 queued += 1;
@@ -371,9 +480,11 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     if vocab_changed {
         vocab.save(&run.km.store.root)?;
     }
-    Ok(StepEnd::Done(json!({"records": done, "tags_attached": attached, "tags_queued": queued,
+    Ok(StepEnd::Done(
+        json!({"records": done, "tags_attached": attached, "tags_queued": queued,
                             "values_proposed": proposed, "vocabulary_changed": vocab_changed,
-                            "nearest_kms_compared": kms.len()})))
+                            "nearest_kms_compared": kms.len()}),
+    ))
 }
 
 #[cfg(test)]
@@ -385,21 +496,34 @@ mod tests {
     }
 
     fn tags_of(c: &Cands) -> Vec<String> {
-        combine(c).into_iter().filter(|(_, (conf, _))| *conf >= 0.6).map(|(t, _)| t).collect()
+        combine(c)
+            .into_iter()
+            .filter(|(_, (conf, _))| *conf >= 0.6)
+            .map(|(t, _)| t)
+            .collect()
     }
 
     #[test]
     fn the_classifier_reads_the_vocabulary() {
         let v = Vocabulary::default();
         let c = rule_tags(
-            &rec("Explain why this Rust code panics", "The function panics because of an unwrap on None. Fix: ..."),
+            &rec(
+                "Explain why this Rust code panics",
+                "The function panics because of an unwrap on None. Fix: ...",
+            ),
             &v,
             &[],
             &["Apache-2.0".into()],
             &[],
         );
         let t = tags_of(&c);
-        for want in ["modality:text", "quality:synthetic", "lang:rust", "license:apache-2.0", "risk:none"] {
+        for want in [
+            "modality:text",
+            "quality:synthetic",
+            "lang:rust",
+            "license:apache-2.0",
+            "risk:none",
+        ] {
             assert!(t.contains(&want.to_string()), "{want} in {t:?}");
         }
         assert!(combine(&c)["task:explain"].0 > 0.3 && combine(&c).contains_key("task:debug"));
@@ -411,7 +535,10 @@ mod tests {
         r["tool_calls"] = json!([{"name": "send_mail", "arguments": {}}]);
         let t = tags_of(&rule_tags(&r, &Vocabulary::default(), &[], &[], &[]));
         assert!(t.contains(&"task:tool-use".to_string()) && t.contains(&"tool:send_mail".replace('_', "-")));
-        assert!(t.contains(&"risk:pii".to_string()) || combine(&rule_tags(&r, &Vocabulary::default(), &[], &[], &[]))["risk:pii"].0 > 0.5);
+        assert!(
+            t.contains(&"risk:pii".to_string())
+                || combine(&rule_tags(&r, &Vocabulary::default(), &[], &[], &[]))["risk:pii"].0 > 0.5
+        );
     }
 
     #[test]
@@ -436,7 +563,10 @@ mod tests {
         assert!(boosted["task:translate"].0 > plain["task:translate"].0);
         assert!(refused["task:translate"].0 < plain["task:translate"].0);
         let new = combine(&rule_tags(&r, &v, &[], &[], &[("task:plan".into(), 6.0)]));
-        assert!(new.contains_key("task:plan"), "a tag the owner approved before is a candidate again");
+        assert!(
+            new.contains_key("task:plan"),
+            "a tag the owner approved before is a candidate again"
+        );
     }
 
     #[test]

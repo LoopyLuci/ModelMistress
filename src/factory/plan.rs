@@ -11,7 +11,10 @@ use crate::engine::Fail;
 
 /// Checks (and tidies) a plan: it needs subtopics, each with a name.
 pub fn normalize_plan(v: &Value, spec_domain: &str) -> Result<Value, String> {
-    let subs = v["subtopics"].as_array().filter(|a| !a.is_empty()).ok_or("subtopics must be a non-empty list")?;
+    let subs = v["subtopics"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("subtopics must be a non-empty list")?;
     let mut out = vec![];
     for (i, s) in subs.iter().enumerate() {
         // a bare string is a subtopic name
@@ -62,7 +65,10 @@ pub fn normalize_plan(v: &Value, spec_domain: &str) -> Result<Value, String> {
 
 pub async fn run(run: &Run) -> StepRes<StepEnd> {
     if let Some((rev, plan, approved)) = run.f.db.plan(&run.id) {
-        run.log("info", &format!("plan revision {rev} already stored; not drafting another"));
+        run.log(
+            "info",
+            &format!("plan revision {rev} already stored; not drafting another"),
+        );
         return Ok(StepEnd::Done(json!({"rev": rev, "approved": approved,
                                         "subtopics": plan["subtopics"].as_array().map(|a| a.len())})));
     }
@@ -87,9 +93,23 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         "plan",
         &[
             ("goal", &run.spec.goal),
-            ("domain", if run.spec.domain.is_empty() { "(choose one)" } else { &run.spec.domain }),
+            (
+                "domain",
+                if run.spec.domain.is_empty() {
+                    "(choose one)"
+                } else {
+                    &run.spec.domain
+                },
+            ),
             ("kinds", &run.spec.kinds.join(", ")),
-            ("tools", &if tools.is_empty() { "none".to_string() } else { tools.join("; ") }),
+            (
+                "tools",
+                &if tools.is_empty() {
+                    "none".to_string()
+                } else {
+                    tools.join("; ")
+                },
+            ),
             ("sources", &fence("SOURCES", &truncate(&preview, 4000))),
             ("subtopics", &n_sub.to_string()),
             ("questions", "3"),
@@ -98,7 +118,9 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     run.progress(0, 1, "drafting the outline");
     let domain = run.spec.domain.clone();
     let res = run
-        .ask_json(Role::Author, "plan", &system, &user, 1500, &|v| normalize_plan(v, &domain).map(|_| ()))
+        .ask_json(Role::Author, "plan", &system, &user, 1500, &|v| {
+            normalize_plan(v, &domain).map(|_| ())
+        })
         .await?;
     let (v, reply) = res.map_err(|e| {
         Halt::Fail(Fail::new(
@@ -110,7 +132,15 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     let plan = normalize_plan(&v, &domain).map_err(|e| Halt::Fail(Fail::invalid(e)))?;
     let approved = !run.spec.plan_approval;
     let rev = run.f.db.put_plan(&run.id, &plan, approved, "author model")?;
-    run.log("info", &format!("plan drafted: {} subtopics", plan["subtopics"].as_array().map_or(0, |a| a.len())));
-    Ok(StepEnd::Done(json!({"rev": rev, "approved": approved, "trace": reply.trace,
-                            "subtopics": plan["subtopics"].as_array().map(|a| a.len())})))
+    run.log(
+        "info",
+        &format!(
+            "plan drafted: {} subtopics",
+            plan["subtopics"].as_array().map_or(0, |a| a.len())
+        ),
+    );
+    Ok(StepEnd::Done(
+        json!({"rev": rev, "approved": approved, "trace": reply.trace,
+                            "subtopics": plan["subtopics"].as_array().map(|a| a.len())}),
+    ))
 }

@@ -166,7 +166,11 @@ impl Run {
             // `base` may name a core (dusty) rather than a hub model: then the author answers
             Role::Base => {
                 let b = self.spec.base_model();
-                let m = if self.hub.engine.resolve(&b).is_ok() { b } else { self.spec.author.clone() };
+                let m = if self.hub.engine.resolve(&b).is_ok() {
+                    b
+                } else {
+                    self.spec.author.clone()
+                };
                 (m, self.spec.dev("base"))
             }
         }
@@ -191,7 +195,10 @@ impl Run {
             json: json_out,
             think: self.spec.think,
             device,
-            scope: Scope::new(Some(&self.job_id).filter(|j| !j.is_empty()).map(String::as_str), Some(&self.id)),
+            scope: Scope::new(
+                Some(&self.job_id).filter(|j| !j.is_empty()).map(String::as_str),
+                Some(&self.id),
+            ),
             purpose: format!("{}:{purpose}", self.step.lock()),
         };
         let gen = self.f.generator();
@@ -220,7 +227,10 @@ impl Run {
         self.ask_messages(
             role,
             purpose,
-            vec![json!({"role": "system", "content": system}), json!({"role": "user", "content": user})],
+            vec![
+                json!({"role": "system", "content": system}),
+                json!({"role": "user", "content": user}),
+            ],
             max_tokens,
             false,
         )
@@ -240,16 +250,28 @@ impl Run {
         max_tokens: u32,
         validate: &(dyn Fn(&Value) -> Result<(), String> + Sync),
     ) -> StepRes<Result<(Value, GenReply), String>> {
-        let mut messages = vec![json!({"role": "system", "content": system}), json!({"role": "user", "content": user})];
+        let mut messages = vec![
+            json!({"role": "system", "content": system}),
+            json!({"role": "user", "content": user}),
+        ];
         let mut last = String::new();
         let tries = self.f.settings().max_retries;
         for attempt in 0..=tries {
-            let reply = self.ask_messages(role, purpose, messages.clone(), max_tokens, true).await?;
+            let reply = self
+                .ask_messages(role, purpose, messages.clone(), max_tokens, true)
+                .await?;
             match extract_json(&reply.text).and_then(|v| validate(&v).map(|_| v)) {
                 Ok(v) => return Ok(Ok((v, reply))),
                 Err(e) => {
                     last = e.clone();
-                    self.log("warn", &format!("{purpose}: answer refused ({e}); attempt {} of {}", attempt + 1, tries + 1));
+                    self.log(
+                        "warn",
+                        &format!(
+                            "{purpose}: answer refused ({e}); attempt {} of {}",
+                            attempt + 1,
+                            tries + 1
+                        ),
+                    );
                     {
                         self.usage.lock().retries += 1;
                     }

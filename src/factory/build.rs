@@ -135,8 +135,15 @@ pub fn write_dir(d: &Draft, root: &Path, files: &BTreeMap<String, Vec<u8>>) -> R
     if d.files.iter().any(|f| f.role == "centroid") {
         t.push_str("centroid = \"payload/centroid.f16\"\n");
     }
-    let total: u64 = d.files.iter().map(|f| files.get(&f.path).map_or(0, |b| b.len() as u64)).sum();
-    t.push_str(&format!("\n[resources]\nram_bytes = {total}\nvram_bytes = {}\n", if d.kind == "adapter" { total } else { 0 }));
+    let total: u64 = d
+        .files
+        .iter()
+        .map(|f| files.get(&f.path).map_or(0, |b| b.len() as u64))
+        .sum();
+    t.push_str(&format!(
+        "\n[resources]\nram_bytes = {total}\nvram_bytes = {}\n",
+        if d.kind == "adapter" { total } else { 0 }
+    ));
     if d.eval_set.is_some() || !d.scores.is_empty() {
         t.push_str("\n[quality]\n");
         if let Some(e) = &d.eval_set {
@@ -146,7 +153,12 @@ pub fn write_dir(d: &Draft, root: &Path, files: &BTreeMap<String, Vec<u8>>) -> R
             t.push_str(&format!("eval_hash = {}\n", q(h)));
         }
         if !d.scores.is_empty() {
-            let s = d.scores.iter().map(|(k, v)| format!("{k} = {v}")).collect::<Vec<_>>().join(", ");
+            let s = d
+                .scores
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             t.push_str(&format!("scores = {{ {s} }}\n"));
         }
     }
@@ -159,7 +171,12 @@ pub fn write_dir(d: &Draft, root: &Path, files: &BTreeMap<String, Vec<u8>>) -> R
     if !d.tags.is_empty() {
         t.push_str("\n[tag_info]\n");
         for g in &d.tags {
-            t.push_str(&format!("{} = {{ origin = {}, confidence = {} }}\n", q(&g.tag), q(&g.origin), g.confidence));
+            t.push_str(&format!(
+                "{} = {{ origin = {}, confidence = {} }}\n",
+                q(&g.tag),
+                q(&g.origin),
+                g.confidence
+            ));
         }
     }
     if !d.kind_table.is_empty() {
@@ -236,9 +253,10 @@ pub fn km_tags(rows: &[&RecordRow], plan_tags: &[String], vocab: &Vocabulary, ex
     for r in rows {
         if let Some(info) = r.json["tag_info"].as_object() {
             for (t, i) in info {
-                by.entry(t.clone())
-                    .or_default()
-                    .push((i["origin"].as_str().unwrap_or("classifier").to_string(), i["confidence"].as_f64().unwrap_or(0.5)));
+                by.entry(t.clone()).or_default().push((
+                    i["origin"].as_str().unwrap_or("classifier").to_string(),
+                    i["confidence"].as_f64().unwrap_or(0.5),
+                ));
             }
         }
     }
@@ -250,7 +268,11 @@ pub fn km_tags(rows: &[&RecordRow], plan_tags: &[String], vocab: &Vocabulary, ex
             let mean = v.iter().map(|x| x.1).sum::<f64>() / v.len() as f64;
             let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
             v.iter().for_each(|x| *counts.entry(x.0.as_str()).or_default() += 1);
-            let origin = counts.into_iter().max_by_key(|c| c.1).map_or("classifier", |c| c.0).to_string();
+            let origin = counts
+                .into_iter()
+                .max_by_key(|c| c.1)
+                .map_or("classifier", |c| c.0)
+                .to_string();
             TagDraft {
                 tag,
                 origin,
@@ -320,7 +342,14 @@ impl Ctx<'_> {
     }
 }
 
-fn add_file(d: &mut Draft, files: &mut BTreeMap<String, Vec<u8>>, path: &str, role: &str, format: &str, bytes: Vec<u8>) {
+fn add_file(
+    d: &mut Draft,
+    files: &mut BTreeMap<String, Vec<u8>>,
+    path: &str,
+    role: &str,
+    format: &str,
+    bytes: Vec<u8>,
+) {
     d.files.push(FileSpec {
         path: path.into(),
         role: role.into(),
@@ -353,8 +382,19 @@ fn build_data(c: &Ctx, rows: &[&RecordRow]) -> Result<(Draft, BTreeMap<String, V
         &format!("{} (records)", plan_title(&c.plan, &c.run.spec.goal)),
         &format!("Training records for: {}", truncate(&c.run.spec.goal, 200)),
     );
-    add_file(&mut d, &mut files, "payload/records.jsonl", "records", "jsonl", jsonl.into_bytes());
-    let embs: Vec<&[f32]> = rows.iter().filter(|r| r.split != "heldout").filter_map(|r| r.emb.as_deref()).collect();
+    add_file(
+        &mut d,
+        &mut files,
+        "payload/records.jsonl",
+        "records",
+        "jsonl",
+        jsonl.into_bytes(),
+    );
+    let embs: Vec<&[f32]> = rows
+        .iter()
+        .filter(|r| r.split != "heldout")
+        .filter_map(|r| r.emb.as_deref())
+        .collect();
     add_centroid(&mut d, &mut files, centroid_file(&embs));
     Ok((d, files))
 }
@@ -407,7 +447,14 @@ fn build_memory(c: &Ctx) -> Result<(Draft, BTreeMap<String, Vec<u8>>), Fail> {
     d.kind_table = format!(
         "[memory]\nchunks = \"payload/chunks.jsonl\"\nembeddings = \"payload/emb.f16\"\ndim = {dim}\nindex = \"flat\""
     );
-    add_file(&mut d, &mut files, "payload/chunks.jsonl", "chunks", "jsonl", jsonl.into_bytes());
+    add_file(
+        &mut d,
+        &mut files,
+        "payload/chunks.jsonl",
+        "chunks",
+        "jsonl",
+        jsonl.into_bytes(),
+    );
     add_file(&mut d, &mut files, "payload/emb.f16", "embeddings", "f16", emb);
     let embs: Vec<&[f32]> = chunks.iter().filter_map(|ch| ch.emb.as_deref()).collect();
     add_centroid(&mut d, &mut files, centroid_file(&embs));
@@ -421,10 +468,19 @@ fn build_tool(c: &Ctx, t: &ToolDef, rows: &[&RecordRow]) -> Result<(Draft, BTree
     }
     let mut files = BTreeMap::new();
     let mut d = c.draft("tool", &id, &format!("Tool {}", t.name), &truncate(&t.description, 300));
-    d.description = if d.description.is_empty() { format!("Use of the tool {}", t.name) } else { d.description };
+    d.description = if d.description.is_empty() {
+        format!("Use of the tool {}", t.name)
+    } else {
+        d.description
+    };
     let mut ex = String::new();
     for r in rows {
-        for call in r.json["tool_calls"].as_array().into_iter().flatten().filter(|x| x["name"] == t.name.as_str()) {
+        for call in r.json["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|x| x["name"] == t.name.as_str())
+        {
             ex.push_str(
                 &json!({"input": super::verify::user_text(&r.json), "call": call, "output": r.json["output"],
                         "record": r.id})
@@ -439,9 +495,17 @@ fn build_tool(c: &Ctx, t: &ToolDef, rows: &[&RecordRow]) -> Result<(Draft, BTree
         q(&t.provider),
         q(&t.name),
         q(&truncate(&t.description, 500)),
-        q(if matches!(side, "none" | "read" | "write") { side } else { "none" }),
+        q(if matches!(side, "none" | "read" | "write") {
+            side
+        } else {
+            "none"
+        }),
         q(&serde_json::to_string(&t.input_schema).unwrap_or_default()),
-        if ex.is_empty() { "" } else { "\nexamples = \"payload/examples.jsonl\"" }
+        if ex.is_empty() {
+            ""
+        } else {
+            "\nexamples = \"payload/examples.jsonl\""
+        }
     );
     add_file(
         &mut d,
@@ -452,7 +516,14 @@ fn build_tool(c: &Ctx, t: &ToolDef, rows: &[&RecordRow]) -> Result<(Draft, BTree
         serde_json::to_vec_pretty(&t.to_json()).unwrap_or_default(),
     );
     if !ex.is_empty() {
-        add_file(&mut d, &mut files, "payload/examples.jsonl", "examples", "jsonl", ex.into_bytes());
+        add_file(
+            &mut d,
+            &mut files,
+            "payload/examples.jsonl",
+            "examples",
+            "jsonl",
+            ex.into_bytes(),
+        );
     }
     let tool_tag = format!("tool:{}", super::util::slug(&t.name).replace('.', "-"));
     if !d.tags.iter().any(|g| g.tag == tool_tag) {
@@ -474,7 +545,11 @@ fn build_tool(c: &Ctx, t: &ToolDef, rows: &[&RecordRow]) -> Result<(Draft, BTree
     Ok((d, files))
 }
 
-fn build_skill(c: &Ctx, data_key: Option<&str>, tool_ids: &[String]) -> Result<(Draft, BTreeMap<String, Vec<u8>>), Fail> {
+fn build_skill(
+    c: &Ctx,
+    data_key: Option<&str>,
+    tool_ids: &[String],
+) -> Result<(Draft, BTreeMap<String, Vec<u8>>), Fail> {
     let src = c
         .run
         .spec
@@ -486,7 +561,10 @@ fn build_skill(c: &Ctx, data_key: Option<&str>, tool_ids: &[String]) -> Result<(
     let instr = std::fs::read(root.join("SKILL.md"))
         .map_err(|e| Fail::invalid(format!("skill source {}: {e}", root.display())))?;
     let mut files = BTreeMap::new();
-    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "skill".into());
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "skill".into());
     let id = format!("skill.{}", super::util::slug(&name).replace('.', "-"));
     let mut d = c.draft(
         "skill",
@@ -506,7 +584,8 @@ fn build_skill(c: &Ctx, data_key: Option<&str>, tool_ids: &[String]) -> Result<(
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.filter_map(Result::ok) {
             let n = e.file_name().to_string_lossy().into_owned();
-            let ok_ext = ["md", "txt", "json", "yaml", "yml", "toml"].contains(&n.rsplit('.').next().unwrap_or("").to_lowercase().as_str());
+            let ok_ext = ["md", "txt", "json", "yaml", "yml", "toml"]
+                .contains(&n.rsplit('.').next().unwrap_or("").to_lowercase().as_str());
             if n != "SKILL.md" && ok_ext && e.metadata().is_ok_and(|m| m.is_file() && m.len() < 256 * 1024) {
                 extra.push(n);
             }
@@ -537,12 +616,7 @@ fn build_skill(c: &Ctx, data_key: Option<&str>, tool_ids: &[String]) -> Result<(
 }
 
 /// Writes, validates, packs and imports one KM; records it as an artifact. Blocking work runs off the runtime.
-pub async fn publish_version(
-    run: &Run,
-    d: Draft,
-    files: BTreeMap<String, Vec<u8>>,
-    stage: &str,
-) -> StepRes<Value> {
+pub async fn publish_version(run: &Run, d: Draft, files: BTreeMap<String, Vec<u8>>, stage: &str) -> StepRes<Value> {
     let build_dir = run.dir().join("build");
     let out_dir = run.dir().join("out");
     // remembered before it is imported, so a crash here leaves the same version to finish
@@ -572,9 +646,11 @@ pub async fn publish_version(
     row.imported = true;
     run.f.db.put_artifact(&run.id, &row)?;
     run.log("info", &format!("built {} ({} bytes)", d.key(), res["bytes"]));
-    Ok(json!({"id": d.id, "version": d.version, "kind": d.kind, "key": d.key(), "content_id": res["content_id"],
+    Ok(
+        json!({"id": d.id, "version": d.version, "kind": d.kind, "key": d.key(), "content_id": res["content_id"],
               "bytes": res["bytes"], "tags": d.tags.len(), "unapproved_tags": res["unapproved_tags"],
-              "warnings": res["warnings"], "already_installed": res["already_installed"]}))
+              "warnings": res["warnings"], "already_installed": res["already_installed"]}),
+    )
 }
 
 fn find_built<'a>(existing: &'a [ArtifactRow], id: &str) -> Option<&'a ArtifactRow> {
@@ -595,8 +671,16 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         .map(str::to_string)
         .collect();
     let domain = {
-        let d = plan["taxonomy"]["domain"].as_str().unwrap_or("").trim_matches('/').to_string();
-        if d.is_empty() { spec.domain.trim_matches('/').to_string() } else { d }
+        let d = plan["taxonomy"]["domain"]
+            .as_str()
+            .unwrap_or("")
+            .trim_matches('/')
+            .to_string();
+        if d.is_empty() {
+            spec.domain.trim_matches('/').to_string()
+        } else {
+            d
+        }
     };
     let licenses: Vec<String> = {
         let mut l: Vec<String> = run
@@ -635,7 +719,11 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         embed_model: run.embedder().model_id(),
         descriptor,
         keywords,
-        license: if licenses.len() == 1 { licenses.first().cloned() } else { spec.license.clone() },
+        license: if licenses.len() == 1 {
+            licenses.first().cloned()
+        } else {
+            spec.license.clone()
+        },
         teachers: vec![spec.author.clone()],
     };
     let existing = run.f.db.artifacts(&run.id);
@@ -671,7 +759,11 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 add(json!({"id": a.id, "version": a.version, "kind": "data", "key": a.key, "reused": true}));
             }
         } else if rows.is_empty() {
-            return Err(Halt::Fail(Fail::new(422, "no_records", "no record survived verification; nothing to build a data KM from")));
+            return Err(Halt::Fail(Fail::new(
+                422,
+                "no_records",
+                "no record survived verification; nothing to build a data KM from",
+            )));
         } else {
             let (d, f) = build_data(&c, &rows)?;
             data_key = Some(d.key());
@@ -704,9 +796,14 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             add(adapter.clone());
         }
     }
-    let unapproved: Vec<Value> = built.iter().flat_map(|b| b["unapproved_tags"].as_array().cloned().unwrap_or_default()).collect();
-    Ok(StepEnd::Done(json!({"kms": built, "adapter": if adapter.is_null() { Value::Null } else { adapter["status"].clone() },
-                            "unapproved_tags": unapproved, "notes": notes})))
+    let unapproved: Vec<Value> = built
+        .iter()
+        .flat_map(|b| b["unapproved_tags"].as_array().cloned().unwrap_or_default())
+        .collect();
+    Ok(StepEnd::Done(
+        json!({"kms": built, "adapter": if adapter.is_null() { Value::Null } else { adapter["status"].clone() },
+                            "unapproved_tags": unapproved, "notes": notes}),
+    ))
 }
 
 async fn build_adapter(
@@ -719,14 +816,18 @@ async fn build_adapter(
     let run = c.run;
     let id = format!("adapter.{}", run.spec.name_slug());
     if let Some(a) = find_built(existing, &id) {
-        return Ok(json!({"id": a.id, "version": a.version, "kind": "adapter", "key": a.key, "reused": true, "status": "built"}));
+        return Ok(
+            json!({"id": a.id, "version": a.version, "kind": "adapter", "key": a.key, "reused": true, "status": "built"}),
+        );
     }
     let Some(trainer) = run.f.trainer() else {
         notes.push("adapter KM: pending: forge (no trainer is registered; the Forge provides LoRA training)".into());
         return Ok(json!({"status": "pending: forge", "id": id}));
     };
     let Some(data_key) = data_key else {
-        return Err(Halt::Fail(Fail::invalid("an adapter KM needs the data KM it is trained from (add kind data)")));
+        return Err(Halt::Fail(Fail::invalid(
+            "an adapter KM needs the data KM it is trained from (add kind data)",
+        )));
     };
     // training records: approved, split train
     let dir = run.dir().join("train");
@@ -760,7 +861,12 @@ async fn build_adapter(
         .await?;
     let bytes = std::fs::read(&out.adapter)
         .map_err(|e| Halt::Fail(Fail::new(500, "io", format!("{}: {e}", out.adapter.display()))))?;
-    let mut d = c.draft("adapter", &id, &format!("{} (adapter)", plan_title(&c.plan, &run.spec.goal)), &format!("LoRA trained on: {}", truncate(&run.spec.goal, 200)));
+    let mut d = c.draft(
+        "adapter",
+        &id,
+        &format!("{} (adapter)", plan_title(&c.plan, &run.spec.goal)),
+        &format!("LoRA trained on: {}", truncate(&run.spec.goal, 200)),
+    );
     d.base = out.core.clone();
     d.arch = out.arch.clone();
     d.base_hash = out.base_hash.clone();
@@ -813,7 +919,14 @@ mod tests {
             files: vec![],
         };
         let mut files = BTreeMap::new();
-        add_file(&mut d, &mut files, "payload/records.jsonl", "records", "jsonl", b"{\"id\":\"r-1\"}\n".to_vec());
+        add_file(
+            &mut d,
+            &mut files,
+            "payload/records.jsonl",
+            "records",
+            "jsonl",
+            b"{\"id\":\"r-1\"}\n".to_vec(),
+        );
         let dir = write_dir(&d, &root, &files).unwrap();
         let m = Manifest::from_file(&dir.join("km.toml")).unwrap();
         assert_eq!(m.key(), "data.demo@0.1.0");
@@ -848,7 +961,10 @@ mod tests {
         let rows = vec![&a, &b, &c, &d];
         let tags = km_tags(&rows, &["task:plan".to_string()], &Vocabulary::default(), &[]);
         let names: Vec<&str> = tags.iter().map(|t| t.tag.as_str()).collect();
-        assert!(names.contains(&"lang:rust") && names.contains(&"task:plan"), "{names:?}");
+        assert!(
+            names.contains(&"lang:rust") && names.contains(&"task:plan"),
+            "{names:?}"
+        );
         assert!(!names.contains(&"task:debug"), "one record in four is too few");
         assert!(!names.contains(&"bogus:x"), "outside the vocabulary");
     }

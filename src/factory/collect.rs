@@ -85,6 +85,8 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     files.sort();
     files.dedup();
     let tools: Vec<Value> = run.tools().iter().map(|t| json!(t.name)).collect();
-    Ok(StepEnd::Done(json!({"chunks": chunks.len(), "origins": files.len(), "tools": tools,
-                            "embed_model": run.embedder().model_id()})))
+    Ok(StepEnd::Done(
+        json!({"chunks": chunks.len(), "origins": files.len(), "tools": tools,
+                            "embed_model": run.embedder().model_id()}),
+    ))
 }

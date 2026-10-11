@@ -51,9 +51,13 @@ fn between<'a>(s: &'a str, a: &str, b: &str) -> &'a str {
 
 /// The body of the fence labelled `label`, whatever length its rule is.
 fn fenced(s: &str, label: &str) -> String {
-    let Some(i) = s.find(&format!("BEGIN {label}")) else { return String::new() };
+    let Some(i) = s.find(&format!("BEGIN {label}")) else {
+        return String::new();
+    };
     let rest = &s[i..];
-    let Some(nl) = rest.find('\n') else { return String::new() };
+    let Some(nl) = rest.find('\n') else {
+        return String::new();
+    };
     let body = &rest[nl + 1..];
     body.split("\n==").next().unwrap_or("").to_string()
 }
@@ -78,11 +82,16 @@ fn purpose_of(system: &str) -> &'static str {
 async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
     let msgs = req["messages"].as_array().cloned().unwrap_or_default();
     let system = msgs[0]["content"].as_str().unwrap_or("").to_string();
-    let user = msgs.last().and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
+    let user = msgs
+        .last()
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("")
+        .to_string();
     let purpose = purpose_of(&system);
     let (delay, fail, usage) = {
         let mut k = f.0.lock();
-        k.calls.push((purpose.to_string(), req["model"].as_str().unwrap_or("").to_string()));
+        k.calls
+            .push((purpose.to_string(), req["model"].as_str().unwrap_or("").to_string()));
         (k.delay_ms, k.fail_after.is_some_and(|n| k.calls.len() > n), k.tokens)
     };
     if delay > 0 {
@@ -133,7 +142,15 @@ async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
                     .split("\n[c")
                     .nth(1 + n % ids.len().max(1))
                     .or_else(|| user.split("\n[c").nth(1))
-                    .map(|t| t.split("=====").next().unwrap_or("").lines().skip(1).collect::<Vec<_>>().join(" "))
+                    .map(|t| {
+                        t.split("=====")
+                            .next()
+                            .unwrap_or("")
+                            .lines()
+                            .skip(1)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                     .unwrap_or_default()
                     .chars()
                     .take(110)
@@ -195,7 +212,11 @@ async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
                     .collect()
             };
             let (r, c) = (words(&reference), words(&cand));
-            let score = if r.is_empty() { 0.0 } else { 10.0 * r.intersection(&c).count() as f64 / r.len() as f64 };
+            let score = if r.is_empty() {
+                0.0
+            } else {
+                10.0 * r.intersection(&c).count() as f64 / r.len() as f64
+            };
             json!({"score": score, "reason": "word overlap with the reference"}).to_string()
         }
         "answer_with_km" => {
@@ -208,9 +229,11 @@ async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
         }
         _ => "I do not know.".to_string(),
     };
-    Json(json!({"model": req["model"], "choices": [{"index": 0, "finish_reason": "stop",
+    Json(
+        json!({"model": req["model"], "choices": [{"index": 0, "finish_reason": "stop",
                 "message": {"role": "assistant", "content": text}}],
-                "usage": {"prompt_tokens": usage.0, "completion_tokens": usage.1, "total_tokens": usage.0 + usage.1}}))
+                "usage": {"prompt_tokens": usage.0, "completion_tokens": usage.1, "total_tokens": usage.0 + usage.1}}),
+    )
     .into_response()
 }
 
@@ -239,7 +262,9 @@ async fn rig() -> Rig {
         tokens: (10, 20),
         ..Default::default()
     })));
-    let app = Router::new().route("/v1/chat/completions", post(fake_chat)).with_state(fake.clone());
+    let app = Router::new()
+        .route("/v1/chat/completions", post(fake_chat))
+        .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
@@ -247,8 +272,10 @@ async fn rig() -> Rig {
     });
     let abort = task.abort_handle();
     let abort2 = task.abort_handle();
-    hub.engine.adopt("author", port, "k", Some(Box::new(move || abort.abort())));
-    hub.engine.adopt("reviewer", port, "k", Some(Box::new(move || abort2.abort())));
+    hub.engine
+        .adopt("author", port, "k", Some(Box::new(move || abort.abort())));
+    hub.engine
+        .adopt("reviewer", port, "k", Some(Box::new(move || abort2.abort())));
     let src = home.join("src");
     std::fs::create_dir_all(src.join("sub")).unwrap();
     std::fs::write(src.join("a.md"), format!("{DOC}\n")).unwrap();
@@ -293,7 +320,10 @@ impl Rig {
     }
 
     async fn create(&self, body: Value) -> String {
-        self.ok("factory.task.create", body).await["task"].as_str().unwrap().to_string()
+        self.ok("factory.task.create", body).await["task"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Waits until the task's job has ended; returns the task.
@@ -344,7 +374,10 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
     let r = rig().await;
     let mut b = r.body();
     b["kinds"] = json!(["data", "memory", "tool"]);
-    b["sources"].as_array_mut().unwrap().push(json!({"kind": "tool", "name": "km.list"}));
+    b["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind": "tool", "name": "km.list"}));
     b["approval"] = json!("auto");
     let (id, t) = r.run(b).await;
     assert_eq!(t["state"], "done", "{}", failure(&t));
@@ -367,7 +400,11 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
         "data.docs.demo@0.1.1",
         "memory.docs.demo@0.1.1",
     ] {
-        let rec = km.store.get(key).unwrap().unwrap_or_else(|| panic!("{key} is not installed"));
+        let rec = km
+            .store
+            .get(key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{key} is not installed"));
         let m = Manifest::from_file(&km.store.dir_of(&rec.key).join("km.toml")).unwrap();
         crate::km::pack::verify_dir(&km.store.dir_of(&rec.key), &m).unwrap();
         assert_eq!(m.provenance.created_by, "auto");
@@ -375,7 +412,12 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
     }
     let m = Manifest::from_file(&km.store.dir_of("data.docs.demo@0.1.1").join("km.toml")).unwrap();
     assert_eq!(m.parent.as_deref(), Some("data.docs.demo@0.1.0"));
-    assert!(m.quality.scores["uplift"] > 0.0, "{:?} {:?}", m.quality.scores, r.f.db.evals(&id));
+    assert!(
+        m.quality.scores["uplift"] > 0.0,
+        "{:?} {:?}",
+        m.quality.scores,
+        r.f.db.evals(&id)
+    );
     assert!(m.quality.scores.contains_key("score_with_km") && m.quality.eval_set.is_some());
     assert_eq!(m.routing.embed_model.as_deref(), Some("hash-384"));
     assert!(m.routing.centroid.is_some() && !m.routing.descriptor.is_empty());
@@ -384,8 +426,14 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
     assert!(m.tag_meta.contains_key("task:explain"));
 
     // published: candidate everywhere; policy auto promoted them
-    assert_eq!(km.store.channel_get("data.docs.demo", "candidate").as_deref(), Some("0.1.1"));
-    assert_eq!(km.store.channel_get("memory.docs.demo", "stable").as_deref(), Some("0.1.1"));
+    assert_eq!(
+        km.store.channel_get("data.docs.demo", "candidate").as_deref(),
+        Some("0.1.1")
+    );
+    assert_eq!(
+        km.store.channel_get("memory.docs.demo", "stable").as_deref(),
+        Some("0.1.1")
+    );
     assert_eq!(t["summary"]["publish"]["policy"], "auto");
 
     // the memory KM answers with citations, the data KM lists its records
@@ -396,7 +444,9 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
         )
         .await;
     assert!(q["hits"][0]["text"].as_str().unwrap().contains("cancel"), "{q}");
-    let l = r.ok("km.data.list", json!({"id": "data.docs.demo", "limit": 100})).await;
+    let l = r
+        .ok("km.data.list", json!({"id": "data.docs.demo", "limit": 100}))
+        .await;
     assert!(l["matching"].as_u64().unwrap() >= 8);
 
     // records: every citation names a gathered chunk, every tag is in the vocabulary
@@ -415,16 +465,27 @@ async fn the_pipeline_runs_every_step_and_its_kms_import() {
             .iter()
             .all(|c| chunks.contains(&c.as_str().unwrap().to_string())));
         assert!(
-            rec["source"]["origins"][0]["path"].as_str().is_none_or(|p| p.contains('/')) && rec["source"]["origins"][0]["kind"].is_string(),
+            rec["source"]["origins"][0]["path"]
+                .as_str()
+                .is_none_or(|p| p.contains('/'))
+                && rec["source"]["origins"][0]["kind"].is_string(),
             "origin keeps the file: {rec}"
         );
-        assert!(rec["tags"].as_array().unwrap().iter().all(|t| vocab.problem(t.as_str().unwrap()).is_none()));
+        assert!(rec["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| vocab.problem(t.as_str().unwrap()).is_none()));
         assert!(rec["verify"]["verdict"] == "supported" && rec["labels"]["quality"].as_f64().unwrap() > 0.5);
     }
     assert!(live >= 8);
     assert_eq!(tk["summary"]["records"]["heldout"].as_u64(), Some(1));
     assert!(tk["records"]["data.docs.demo"].as_u64().unwrap() >= 8);
-    assert!(tk["kms"].as_array().unwrap().iter().any(|k| k == "data.docs.demo@0.1.1"));
+    assert!(tk["kms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "data.docs.demo@0.1.1"));
 
     // tool records were checked against the tool's schema; the tool KM refers to the hub operation
     let tool = Manifest::from_file(&km.store.dir_of("tool.km.list@0.1.0").join("km.toml")).unwrap();
@@ -478,7 +539,10 @@ async fn a_plan_that_needs_approval_stops_the_task_and_can_be_edited() {
     assert_eq!(r.calls("generate"), 0);
     // an edit that breaks the plan is refused
     let bad = r
-        .call("factory.task.plan.edit", json!({"id": id, "changes": {"subtopics": []}}))
+        .call(
+            "factory.task.plan.edit",
+            json!({"id": id, "changes": {"subtopics": []}}),
+        )
         .await
         .unwrap_err();
     assert!(bad.message.contains("subtopics"));
@@ -517,7 +581,10 @@ async fn a_record_without_a_real_citation_is_never_trained_on() {
         .filter(|x| x.reason.as_deref().is_some_and(|r| r.starts_with("citation:")))
         .collect();
     assert!(
-        !refused.is_empty() && refused.iter().all(|x| x.status == "rejected" && x.reason.as_ref().unwrap().contains("c999"))
+        !refused.is_empty()
+            && refused
+                .iter()
+                .all(|x| x.status == "rejected" && x.reason.as_ref().unwrap().contains("c999"))
     );
     let km = crate::km::runtime(&r.hub.engine).unwrap();
     let data = std::fs::read_to_string(km.store.dir_of("data.docs.demo@0.1.0").join("payload/records.jsonl")).unwrap();
@@ -549,9 +616,19 @@ async fn near_and_exact_duplicates_are_dropped_keeping_the_best() {
     r2.f.set_settings(&json!({"dedupe_threshold": 0.5})).unwrap();
     let (id2, t2) = r2.run(r2.body()).await;
     assert_eq!(t2["state"], "done", "{}", failure(&t2));
-    let live2 = r2.f.db.records(&id2, None).iter().filter(|x| x.status != "rejected").count();
+    let live2 =
+        r2.f.db
+            .records(&id2, None)
+            .iter()
+            .filter(|x| x.status != "rejected")
+            .count();
     assert!(live2 < 4, "{live2} left");
-    let v = t2["steps"].as_array().unwrap().iter().find(|s| s["name"] == "verify").unwrap();
+    let v = t2["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "verify")
+        .unwrap();
     assert!(v["result"]["duplicates"].as_u64().unwrap() > 0);
 }
 
@@ -591,13 +668,12 @@ async fn evaluation_questions_never_leak_into_the_records() {
     let mut b = r2.body();
     b["eval_sets"] = json!([{"path": r2.home.join("eval.jsonl").to_string_lossy()}]);
     let (id2, _) = r2.run(b).await;
-    let rec = r2
-        .f
-        .db
-        .records(&id2, None)
-        .into_iter()
-        .find(|x| x.json["input"][0]["content"] == "Explain point 3 of the notes")
-        .unwrap();
+    let rec =
+        r2.f.db
+            .records(&id2, None)
+            .into_iter()
+            .find(|x| x.json["input"][0]["content"] == "Explain point 3 of the notes")
+            .unwrap();
     assert!(rec.reason.unwrap_or_default().contains("nearly identical"));
 }
 
@@ -616,15 +692,31 @@ async fn tags_stay_inside_the_vocabulary_and_new_values_wait_for_approval() {
     let rows = r.f.db.records(&id, None);
     let vocab = crate::km::runtime(&r.hub.engine).unwrap().vocabulary().unwrap();
     for x in rows.iter().filter(|x| x.status != "rejected") {
-        let tags: Vec<&str> = x.json["tags"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        let tags: Vec<&str> = x.json["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
         assert!(!tags.contains(&"task:dancing"), "{tags:?}");
-        assert!(tags.contains(&"lang:rust") && tags.contains(&"task:explain"), "{tags:?}");
+        assert!(
+            tags.contains(&"lang:rust") && tags.contains(&"task:explain"),
+            "{tags:?}"
+        );
         assert!(tags.iter().all(|t| vocab.problem(t).is_none()));
         assert!(x.json["tag_info"]["task:explain"]["confidence"].as_f64().unwrap() > 0.6);
     }
     let q = r.ok("factory.review.list", json!({"task": id, "kind": "vocab"})).await;
-    let refs: Vec<&str> = q["items"].as_array().unwrap().iter().map(|i| i["ref"].as_str().unwrap()).collect();
-    assert!(refs.contains(&"colour:red") && refs.contains(&"task:dancing"), "{refs:?}");
+    let refs: Vec<&str> = q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ref"].as_str().unwrap())
+        .collect();
+    assert!(
+        refs.contains(&"colour:red") && refs.contains(&"task:dancing"),
+        "{refs:?}"
+    );
     // approving one adds it to the vocabulary
     let item = q["items"]
         .as_array()
@@ -634,9 +726,16 @@ async fn tags_stay_inside_the_vocabulary_and_new_values_wait_for_approval() {
         .unwrap()["id"]
         .as_i64()
         .unwrap();
-    r.ok("factory.review.decide", json!({"item": item, "decision": "approve", "by": "me"})).await;
+    r.ok(
+        "factory.review.decide",
+        json!({"item": item, "decision": "approve", "by": "me"}),
+    )
+    .await;
     let v = r.ok("factory.vocabulary.get", json!({})).await;
-    assert!(v["namespaces"]["task"]["values"].as_array().unwrap().contains(&json!("dancing")));
+    assert!(v["namespaces"]["task"]["values"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("dancing")));
     let again = r
         .call("factory.review.decide", json!({"item": item, "decision": "reject"}))
         .await
@@ -651,12 +750,9 @@ async fn tags_stay_inside_the_vocabulary_and_new_values_wait_for_approval() {
     assert_eq!(t2["state"], "done", "{}", failure(&t2));
     let vocab2 = crate::km::runtime(&r2.hub.engine).unwrap().vocabulary().unwrap();
     assert!(vocab2.problem("task:dancing").is_none());
-    assert!(r2
-        .f
-        .db
-        .records(&id2, None)
-        .iter()
-        .any(|x| x.json["tags"].as_array().is_some_and(|t| t.contains(&json!("task:dancing")))));
+    assert!(r2.f.db.records(&id2, None).iter().any(|x| x.json["tags"]
+        .as_array()
+        .is_some_and(|t| t.contains(&json!("task:dancing")))));
 }
 
 #[tokio::test]
@@ -688,7 +784,8 @@ async fn doubtful_records_and_uncertain_tags_go_to_the_review_queue_and_decision
         items[1]["id"].as_i64().unwrap(),
         items[2]["id"].as_i64().unwrap(),
     );
-    r.ok("factory.review.decide", json!({"item": a, "decision": "approve"})).await;
+    r.ok("factory.review.decide", json!({"item": a, "decision": "approve"}))
+        .await;
     r.ok(
         "factory.review.decide",
         json!({"item": b.to_string(), "decision": "reject", "note": "wrong"}),
@@ -705,10 +802,17 @@ async fn doubtful_records_and_uncertain_tags_go_to_the_review_queue_and_decision
     let st = |i: &Value| r.f.db.record(&id, i["record_id"].as_str().unwrap()).unwrap();
     assert_eq!(st(&items[0]).status, "approved");
     let rej = st(&items[1]);
-    assert_eq!((rej.status.as_str(), rej.reason.as_deref()), ("rejected", Some("rejected by owner")));
+    assert_eq!(
+        (rej.status.as_str(), rej.reason.as_deref()),
+        ("rejected", Some("rejected by owner"))
+    );
     let ed = st(&items[2]);
     assert_eq!(
-        (ed.json["output"].as_str(), ed.json["rev"].as_i64(), ed.json["edited_by"].as_str()),
+        (
+            ed.json["output"].as_str(),
+            ed.json["rev"].as_i64(),
+            ed.json["edited_by"].as_str()
+        ),
         (Some("A better answer, written by the owner."), Some(2), Some("me"))
     );
 
@@ -722,14 +826,28 @@ async fn doubtful_records_and_uncertain_tags_go_to_the_review_queue_and_decision
         .as_array()
         .unwrap()
         .contains(&json!("lib:tokio")));
-    r.ok("factory.review.decide", json!({"item": ti["id"], "decision": "approve"})).await;
+    r.ok(
+        "factory.review.decide",
+        json!({"item": ti["id"], "decision": "approve"}),
+    )
+    .await;
     let rec = r.f.db.record(&id, &rid).unwrap();
     assert!(rec.json["tags"].as_array().unwrap().contains(&json!("lib:tokio")));
     assert_eq!(rec.json["tag_info"]["lib:tokio"]["origin"], "owner");
-    let fb = r.f.db.feedback(&super::util::words(&format!("{} {}", super::verify::user_text(&rec.json), rec.json["output"].as_str().unwrap())));
+    let fb = r.f.db.feedback(&super::util::words(&format!(
+        "{} {}",
+        super::verify::user_text(&rec.json),
+        rec.json["output"].as_str().unwrap()
+    )));
     assert!(fb.iter().any(|(t, n)| t == "lib:tokio" && *n > 0.0), "{fb:?}");
-    assert!(r.call("factory.review.decide", json!({"item": 9999, "decision": "approve"})).await.is_err());
-    assert!(r.call("factory.review.decide", json!({"item": a, "decision": "maybe"})).await.is_err());
+    assert!(r
+        .call("factory.review.decide", json!({"item": 9999, "decision": "approve"}))
+        .await
+        .is_err());
+    assert!(r
+        .call("factory.review.decide", json!({"item": a, "decision": "maybe"}))
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -915,7 +1033,8 @@ async fn tool_calls_are_checked_against_the_tools_schema() {
     r.knobs().tool_bad_every = Some(2);
     let mut b = r.body();
     b["kinds"] = json!(["data", "tool"]);
-    b["sources"] = json!([{"kind": "tool", "name": "km.list"}, {"kind": "file", "path": r.src.join("a.md").to_string_lossy()}]);
+    b["sources"] =
+        json!([{"kind": "tool", "name": "km.list"}, {"kind": "file", "path": r.src.join("a.md").to_string_lossy()}]);
     let (id, t) = r.run(b).await;
     assert_eq!(t["state"], "done", "{}", failure(&t));
     let rows = r.f.db.records(&id, None);
@@ -923,7 +1042,10 @@ async fn tool_calls_are_checked_against_the_tools_schema() {
     assert!(!tool_rows.is_empty());
     let bad: Vec<_> = tool_rows.iter().filter(|x| x.status == "rejected").collect();
     assert!(
-        !bad.is_empty() && bad.iter().all(|x| x.reason.as_deref().unwrap().starts_with("check tool-schema")),
+        !bad.is_empty()
+            && bad
+                .iter()
+                .all(|x| x.reason.as_deref().unwrap().starts_with("check tool-schema")),
         "{bad:?}"
     );
     assert!(tool_rows
@@ -945,13 +1067,20 @@ async fn tool_calls_are_checked_against_the_tools_schema() {
 struct FakeForge(Mutex<Vec<String>>);
 
 impl Trainer for FakeForge {
-    fn train<'a>(&'a self, _hub: &'a Hub, req: TrainRequest) -> BoxFuture<'a, Result<TrainOutcome, crate::engine::Fail>> {
+    fn train<'a>(
+        &'a self,
+        _hub: &'a Hub,
+        req: TrainRequest,
+    ) -> BoxFuture<'a, Result<TrainOutcome, crate::engine::Fail>> {
         Box::pin(async move {
             self.0
                 .lock()
                 .push(format!("{} {} {}", req.km_id, req.data_km, req.base));
             let body = std::fs::read_to_string(&req.records).unwrap();
-            assert!(body.lines().all(|l| l.contains("\"approved\"")), "only approved records are trained on");
+            assert!(
+                body.lines().all(|l| l.contains("\"approved\"")),
+                "only approved records are trained on"
+            );
             std::fs::create_dir_all(&req.out_dir).unwrap();
             let p = req.out_dir.join("lora.gguf");
             std::fs::write(&p, b"GGUF-not-really").unwrap();
@@ -988,7 +1117,10 @@ async fn an_adapter_is_pending_without_the_forge_and_built_through_the_trait_wit
     assert!(forge.0.lock()[0].starts_with("adapter.docs.demo data.docs.demo@0.1.0"));
     let km = crate::km::runtime(&r2.hub.engine).unwrap();
     let m = Manifest::from_file(&km.store.dir_of("adapter.docs.demo@0.1.0").join("km.toml")).unwrap();
-    assert_eq!((m.compat.base.as_str(), m.compat.arch.as_deref()), ("dusty", Some("qwen3")));
+    assert_eq!(
+        (m.compat.base.as_str(), m.compat.arch.as_deref()),
+        ("dusty", Some("qwen3"))
+    );
     assert_eq!(m.provenance.training_run.as_deref(), Some("forge-run-1"));
     assert_eq!(m.provenance.data, ["data.docs.demo@0.1.0"]);
 }
@@ -1065,7 +1197,9 @@ async fn sources_keep_their_origin_and_respect_the_limits() {
     let paths: Vec<_> = g.chunks.iter().filter_map(|c| c.origin["path"].as_str()).collect();
     assert!(paths.iter().all(|p| p.starts_with("src/")), "{paths:?}");
     assert!(paths.contains(&"src/a.md"));
-    assert!(!paths.iter().any(|p| p.contains("sub/") || p.ends_with("blob.bin") || p.ends_with("big.md")));
+    assert!(!paths
+        .iter()
+        .any(|p| p.contains("sub/") || p.ends_with("blob.bin") || p.ends_with("big.md")));
     assert!(g.notes.iter().any(|n| n.contains("big.md") && n.contains("limit")));
     assert!(g.notes.iter().any(|n| n.contains("binary")));
     let a = g.chunks.iter().find(|c| c.origin["path"] == "src/a.md").unwrap();
@@ -1128,9 +1262,16 @@ async fn sources_keep_their_origin_and_respect_the_limits() {
     );
     km.import_sync(&k.to_string_lossy(), crate::km::pack::Source::Own, false, None)
         .unwrap();
-    let g = gather::gather(&r.hub.engine, &km, &[json!({"kind": "km", "id": "docs.other"})], &limits, None, &|| false)
-        .await
-        .unwrap();
+    let g = gather::gather(
+        &r.hub.engine,
+        &km,
+        &[json!({"kind": "km", "id": "docs.other"})],
+        &limits,
+        None,
+        &|| false,
+    )
+    .await
+    .unwrap();
     assert_eq!(g.chunks.len(), 2);
     assert_eq!(g.chunks[0].origin["km"], "docs.other@1.0.0");
     srv.abort();
@@ -1211,7 +1352,9 @@ async fn extra_checks_can_be_added() {
     r.f.add_check(Arc::new(Picky));
     let (id, _) = r.run(r.body()).await;
     let bad = r.f.db.records(&id, Some("rejected"));
-    assert!(bad.iter().any(|x| x.reason.as_deref() == Some("check picky: no notes 3")));
+    assert!(bad
+        .iter()
+        .any(|x| x.reason.as_deref() == Some("check picky: no notes 3")));
 }
 
 // ---- API -----------------------------------------------------------------------------------------------------
@@ -1228,7 +1371,10 @@ async fn http(hub: &Hub, method: &str, path: &str, auth: &str, body: Option<Valu
         }
         None => axum::body::Body::empty(),
     };
-    let resp = crate::hub::router(hub.clone()).oneshot(req.body(b).unwrap()).await.unwrap();
+    let resp = crate::hub::router(hub.clone())
+        .oneshot(req.body(b).unwrap())
+        .await
+        .unwrap();
     let st = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap();
     (st, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
@@ -1249,13 +1395,26 @@ async fn the_rest_routes_mirror_the_operations_and_peers_are_kept_out() {
         (st, v["result"][0]["id"].as_str(), v["result"][0]["status"].as_str()),
         (200, Some(id.as_str()), Some("created"))
     );
-    let (st, v) = http(&r.hub, "GET", &format!("/v1/factory/task/get?id={id}&logs=5"), &tok, None).await;
+    let (st, v) = http(
+        &r.hub,
+        "GET",
+        &format!("/v1/factory/task/get?id={id}&logs=5"),
+        &tok,
+        None,
+    )
+    .await;
     assert_eq!(
         (st, v["result"]["goal"].as_str()),
         (200, Some("How tokio tasks start, stop and share work"))
     );
-    assert_eq!(http(&r.hub, "GET", "/v1/factory/task/cancel?id=x", &tok, None).await.0, 405);
-    assert_eq!(http(&r.hub, "GET", "/v1/factory/task/get?id=nope", &tok, None).await.0, 404);
+    assert_eq!(
+        http(&r.hub, "GET", "/v1/factory/task/cancel?id=x", &tok, None).await.0,
+        405
+    );
+    assert_eq!(
+        http(&r.hub, "GET", "/v1/factory/task/get?id=nope", &tok, None).await.0,
+        404
+    );
     let (st, v) = http(
         &r.hub,
         "POST",
@@ -1321,7 +1480,9 @@ async fn the_rest_routes_mirror_the_operations_and_peers_are_kept_out() {
         assert_eq!(st, 403, "{p}: {v}");
     }
     assert_eq!(
-        http(&r.hub, "POST", "/v1/call/factory.task.list", &secret, Some(json!({}))).await.0,
+        http(&r.hub, "POST", "/v1/call/factory.task.list", &secret, Some(json!({})))
+            .await
+            .0,
         403
     );
     assert_eq!(http(&r.hub, "GET", "/v1/factory/task/list", "wrong", None).await.0, 401);
@@ -1336,16 +1497,27 @@ async fn the_promotion_policies_decide_what_reaches_stable() {
     let (id, t) = r.run(b).await;
     assert_eq!(t["state"], "done", "{}", failure(&t));
     let km = crate::km::runtime(&r.hub.engine).unwrap();
-    assert_eq!(km.store.channel_get("data.docs.demo", "candidate").as_deref(), Some("0.1.1"));
+    assert_eq!(
+        km.store.channel_get("data.docs.demo", "candidate").as_deref(),
+        Some("0.1.1")
+    );
     assert_eq!(km.store.channel_get("data.docs.demo", "stable"), None);
-    let q = r.ok("factory.review.list", json!({"task": id, "kind": "promotion"})).await;
+    let q = r
+        .ok("factory.review.list", json!({"task": id, "kind": "promotion"}))
+        .await;
     r.ok(
         "factory.review.decide",
         json!({"item": q["items"][0]["id"], "decision": "approve"}),
     )
     .await;
-    assert_eq!(km.store.channel_get("data.docs.demo", "stable").as_deref(), Some("0.1.1"));
-    assert_eq!(km.store.channel_get("memory.docs.demo", "stable").as_deref(), Some("0.1.1"));
+    assert_eq!(
+        km.store.channel_get("data.docs.demo", "stable").as_deref(),
+        Some("0.1.1")
+    );
+    assert_eq!(
+        km.store.channel_get("memory.docs.demo", "stable").as_deref(),
+        Some("0.1.1")
+    );
 
     // gated: needs the uplift and no open review items
     let r = rig().await;
@@ -1354,7 +1526,10 @@ async fn the_promotion_policies_decide_what_reaches_stable() {
     b["approval"] = json!("gated");
     let (_, t) = r.run(b).await;
     let km = crate::km::runtime(&r.hub.engine).unwrap();
-    assert_eq!(km.store.channel_get("data.docs.demo", "candidate").as_deref(), Some("0.1.1"));
+    assert_eq!(
+        km.store.channel_get("data.docs.demo", "candidate").as_deref(),
+        Some("0.1.1")
+    );
     assert_eq!(
         km.store.channel_get("data.docs.demo", "stable"),
         None,
@@ -1395,7 +1570,10 @@ async fn settings_persist_and_the_embedder_can_be_set_up() {
     assert!(r.f.set_settings(&json!({"nonsense": 1})).is_err());
     assert!(r.f.set_settings(&json!({"embedder": "magic"})).is_err());
     let v = r
-        .ok("factory.embedder.setup", json!({"model": "reviewer", "name": "mm-embed-1"}))
+        .ok(
+            "factory.embedder.setup",
+            json!({"model": "reviewer", "name": "mm-embed-1"}),
+        )
         .await;
     assert!(["linked", "copied"].contains(&v["how"].as_str().unwrap()), "{v}");
     assert!(r.home.join("models").join("mm-embed-1.gguf").exists());
@@ -1403,7 +1581,10 @@ async fn settings_persist_and_the_embedder_can_be_set_up() {
     assert_eq!(r.hub.engine.settings().km.embed_model.as_deref(), Some("mm-embed-1"));
     assert_eq!(r.f.settings().embedder, "hub");
     assert!(r
-        .call("factory.embedder.setup", json!({"model": "reviewer", "name": "bad name"}))
+        .call(
+            "factory.embedder.setup",
+            json!({"model": "reviewer", "name": "bad name"})
+        )
         .await
         .is_err());
 }
@@ -1419,7 +1600,12 @@ async fn tasks_are_listed_and_a_task_with_no_usable_source_fails_with_a_reason()
     assert_eq!(step_status(&t, "gather"), "failed");
     let l = r.ok("factory.task.list", json!({"state": "failed"})).await;
     assert_eq!(l[0]["id"], id.as_str());
-    assert!(r.ok("factory.task.list", json!({"state": "done"})).await.as_array().unwrap().is_empty());
+    assert!(r
+        .ok("factory.task.list", json!({"state": "done"}))
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
     // fix the source and resume
     let mut spec = r.f.db.task(&id).unwrap().spec;
     spec["sources"][0]["path"] = json!(r.src.to_string_lossy());
@@ -1441,15 +1627,30 @@ async fn km_files_can_be_read_and_records_filtered_by_quality_and_source() {
     low["labels"]["quality"] = json!(0.2);
     low["source"]["kind"] = json!("owner");
     let dir = crate::km::sample::data(&r.home.join("kms"), "data.demo", "1.0.0", &[recs[0].clone(), low]);
-    km.import_sync(&dir.to_string_lossy(), crate::km::pack::Source::Own, false, None).unwrap();
-    let f = r.ok("km.file.get", json!({"id": "data.demo", "path": "payload/records.jsonl"})).await;
+    km.import_sync(&dir.to_string_lossy(), crate::km::pack::Source::Own, false, None)
+        .unwrap();
+    let f = r
+        .ok(
+            "km.file.get",
+            json!({"id": "data.demo", "path": "payload/records.jsonl"}),
+        )
+        .await;
     assert!(f["text"].as_str().unwrap().contains("answer one") && f["truncated"] == false);
     for bad in ["../x", "SIGNATURE", "payload/none", "/etc/passwd"] {
-        assert!(r.call("km.file.get", json!({"id": "data.demo", "path": bad})).await.is_err(), "{bad}");
+        assert!(
+            r.call("km.file.get", json!({"id": "data.demo", "path": bad}))
+                .await
+                .is_err(),
+            "{bad}"
+        );
     }
-    let l = r.ok("km.data.list", json!({"id": "data.demo", "min_quality": 0.5})).await;
+    let l = r
+        .ok("km.data.list", json!({"id": "data.demo", "min_quality": 0.5}))
+        .await;
     assert_eq!(l["matching"], 1);
-    let l = r.ok("km.data.list", json!({"id": "data.demo", "source_kind": "owner"})).await;
+    let l = r
+        .ok("km.data.list", json!({"id": "data.demo", "source_kind": "owner"}))
+        .await;
     assert_eq!(l["records"][0]["id"], "r2");
     assert_eq!(r.ok("km.list", json!({})).await[0]["base"], "any");
 }

@@ -40,8 +40,7 @@ impl HubEmbedding {
         if *self.loaded.lock() {
             return Ok(());
         }
-        if let (Ok(Target::Llama(entry)), Some(layers)) = (self.engine.resolve(&self.model), self.device.gpu_layers())
-        {
+        if let (Ok(Target::Llama(entry)), Some(layers)) = (self.engine.resolve(&self.model), self.device.gpu_layers()) {
             if !self.engine.is_loaded(&entry.id) {
                 let opts = LoadOpts {
                     gpu_layers: Some(layers),
@@ -73,7 +72,10 @@ impl HubEmbedding {
             return Err(Fail::new(
                 502,
                 "backend_error",
-                format!("{model}: {}", v["error"]["message"].as_str().unwrap_or("embedding failed")),
+                format!(
+                    "{model}: {}",
+                    v["error"]["message"].as_str().unwrap_or("embedding failed")
+                ),
             ));
         }
         let mut rows: Vec<(u64, Vec<f32>)> = v["data"]

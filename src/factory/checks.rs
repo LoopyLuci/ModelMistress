@@ -266,11 +266,19 @@ mod tests {
 
     #[test]
     fn a_valid_call_passes_and_a_bad_one_says_why() {
-        let ok = run(json!({"tool_calls": [{"name": "cargo_check", "arguments": {"path": ".", "jobs": 4, "mode": "debug"}}]}));
+        let ok = run(
+            json!({"tool_calls": [{"name": "cargo_check", "arguments": {"path": ".", "jobs": 4, "mode": "debug"}}]}),
+        );
         assert!(ok.ran && ok.ok, "{ok:?}");
-        let bad = run(json!({"tool_calls": [{"name": "cargo_check", "arguments": {"jobs": 0, "mode": "fast", "x": 1}}]}));
+        let bad =
+            run(json!({"tool_calls": [{"name": "cargo_check", "arguments": {"jobs": 0, "mode": "fast", "x": 1}}]}));
         assert!(bad.ran && !bad.ok);
-        for part in ["missing required \"path\"", "below the minimum", "not one of", "unexpected property"] {
+        for part in [
+            "missing required \"path\"",
+            "below the minimum",
+            "not one of",
+            "unexpected property",
+        ] {
             assert!(bad.note.contains(part), "{part} in {}", bad.note);
         }
         let unknown = run(json!({"tool_calls": [{"name": "rm_rf", "arguments": {}}]}));
@@ -283,10 +291,7 @@ mod tests {
     fn records_without_calls_are_not_checked_and_the_default_is_a_no_op() {
         let r = json!({"input": [], "output": "x"});
         assert_eq!(run(r.clone()), CheckOutcome::skipped());
-        let n = NoopCheck.run(&CheckInput {
-            record: &r,
-            tools: &[],
-        });
+        let n = NoopCheck.run(&CheckInput { record: &r, tools: &[] });
         assert!(!n.ran && n.ok);
     }
 

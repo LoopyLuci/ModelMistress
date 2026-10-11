@@ -138,17 +138,20 @@ impl Default for TaskSpec {
 
 impl TaskSpec {
     pub fn from_json(v: &Value) -> Result<TaskSpec, Fail> {
-        let mut s: TaskSpec =
-            serde_json::from_value(v.clone()).map_err(|e| Fail::invalid(format!("task: {e}")))?;
+        let mut s: TaskSpec = serde_json::from_value(v.clone()).map_err(|e| Fail::invalid(format!("task: {e}")))?;
         s.goal = s.goal.trim().to_string();
         if s.goal.is_empty() {
             return Err(Fail::invalid("goal is required: say what the Knowledge Module is for"));
         }
         if s.author.trim().is_empty() {
-            return Err(Fail::invalid("author is required: a hub model id (model.list shows them)"));
+            return Err(Fail::invalid(
+                "author is required: a hub model id (model.list shows them)",
+            ));
         }
         if s.kinds.is_empty() {
-            return Err(Fail::invalid("kinds must name at least one of data, memory, skill, tool, adapter"));
+            return Err(Fail::invalid(
+                "kinds must name at least one of data, memory, skill, tool, adapter",
+            ));
         }
         for k in &s.kinds {
             if !KINDS.contains(&k.as_str()) {
@@ -212,7 +215,9 @@ impl TaskSpec {
             }
         }
         if s.kinds.iter().any(|k| k == "skill") && !s.sources.iter().any(|x| x["kind"] == "skill") {
-            return Err(Fail::invalid("a skill KM needs a source of kind skill (a folder with SKILL.md)"));
+            return Err(Fail::invalid(
+                "a skill KM needs a source of kind skill (a folder with SKILL.md)",
+            ));
         }
         if s.kinds.iter().any(|k| k == "tool") && !s.sources.iter().any(|x| x["kind"] == "tool") {
             return Err(Fail::invalid("a tool KM needs a source of kind tool"));
@@ -238,11 +243,17 @@ impl TaskSpec {
     }
 
     pub fn reviewer_model(&self) -> String {
-        self.reviewer.clone().filter(|r| !r.is_empty()).unwrap_or_else(|| self.author.clone())
+        self.reviewer
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| self.author.clone())
     }
 
     pub fn base_model(&self) -> String {
-        self.base.clone().filter(|r| !r.is_empty()).unwrap_or_else(|| self.author.clone())
+        self.base
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| self.author.clone())
     }
 
     pub fn wants(&self, kind: &str) -> bool {
@@ -283,7 +294,8 @@ mod tests {
         assert_eq!(s.reviewer_model(), "m");
         assert_eq!(s.name_slug(), "async-rust");
         let s = TaskSpec::from_json(&json!({"goal": "g", "author": "m", "domain": "code/rust/async",
-                                            "sources": [{"kind": "file", "path": "a"}]})).unwrap();
+                                            "sources": [{"kind": "file", "path": "a"}]}))
+        .unwrap();
         assert_eq!(s.name_slug(), "code.rust.async");
     }
 
@@ -299,7 +311,11 @@ mod tests {
         bad(ok(), &|v| v["kinds"] = json!(["data", "weights"]), "weights");
         bad(ok(), &|v| v["device"] = json!({"author": "tpu"}), "device.author");
         bad(ok(), &|v| v["sources"] = json!([{"kind": "ftp"}]), "ftp");
-        bad(ok(), &|v| v["sources"] = json!([{"kind": "url", "url": "file:///etc/passwd"}]), "http");
+        bad(
+            ok(),
+            &|v| v["sources"] = json!([{"kind": "url", "url": "file:///etc/passwd"}]),
+            "http",
+        );
         bad(ok(), &|v| v["sources"] = json!([{"kind": "dir"}]), "path");
         bad(ok(), &|v| v["kinds"] = json!(["skill"]), "skill");
         bad(ok(), &|v| v["approval"] = json!("whenever"), "approval");

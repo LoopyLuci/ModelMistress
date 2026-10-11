@@ -52,7 +52,9 @@ use crate::hub::Hub;
 
 pub type Res<T> = Result<T, Fail>;
 
-pub const STEPS: [&str; 8] = ["plan", "gather", "generate", "verify", "tag", "build", "evaluate", "publish"];
+pub const STEPS: [&str; 8] = [
+    "plan", "gather", "generate", "verify", "tag", "build", "evaluate", "publish",
+];
 
 /// How a step ended when it ended normally.
 pub enum StepEnd {
@@ -227,7 +229,10 @@ impl Factory {
 pub async fn drive(run: &Run) -> Result<Outcome, Halt> {
     for (i, name) in STEPS.iter().enumerate() {
         let st = run.f.db.step(&run.id, name);
-        if st.as_ref().is_some_and(|s| matches!(s.status.as_str(), "done" | "skipped")) {
+        if st
+            .as_ref()
+            .is_some_and(|s| matches!(s.status.as_str(), "done" | "skipped"))
+        {
             continue;
         }
         run.check()?;
@@ -262,7 +267,9 @@ pub async fn drive(run: &Run) -> Result<Outcome, Halt> {
                 run.log("info", &format!("step {name} done"));
             }
             Ok(StepEnd::Skipped(why)) => {
-                run.f.db.set_step(&run.id, name, "skipped", Some(&json!({"skipped": why})), None)?;
+                run.f
+                    .db
+                    .set_step(&run.id, name, "skipped", Some(&json!({"skipped": why})), None)?;
                 run.log("info", &format!("step {name} skipped: {why}"));
             }
             Err(Halt::Fail(f)) => {
@@ -290,7 +297,9 @@ pub fn summarize(run: &Run) -> Value {
     let built = step("build");
     let kms: Vec<Value> = publish::finals(run)
         .into_iter()
-        .map(|(id, version, kind)| json!({"id": id, "version": version, "kind": kind, "key": format!("{id}@{version}")}))
+        .map(
+            |(id, version, kind)| json!({"id": id, "version": version, "kind": kind, "key": format!("{id}@{version}")}),
+        )
         .collect();
     let (_, open_items) = (0, db.review_open_count(&run.id));
     json!({
@@ -327,7 +336,11 @@ pub fn finish(run: &Run, out: Result<Outcome, Halt>) -> Res<Value> {
         Err(Halt::Cancelled) => {
             db.set_state(&run.id, "cancelled", None, None)?;
             let _ = db.set_cancel(&run.id, false);
-            Err(Fail::new(499, "cancelled", "the task was cancelled; resume continues it"))
+            Err(Fail::new(
+                499,
+                "cancelled",
+                "the task was cancelled; resume continues it",
+            ))
         }
         Err(Halt::Budget(m)) => {
             db.set_state(&run.id, "budget", None, Some(&m))?;
@@ -345,7 +358,11 @@ pub fn start(hub: &Hub, f: &Arc<Factory>, id: &str) -> Res<Value> {
     let t = f.db.task(id)?;
     if let Some(j) = t.job.as_deref().and_then(|j| hub.jobs.get(j)) {
         if j.status() == "running" {
-            return Err(Fail::new(409, "running", format!("task {id} is already running as job {}", j.id)));
+            return Err(Fail::new(
+                409,
+                "running",
+                format!("task {id} is already running as job {}", j.id),
+            ));
         }
     }
     let spec = TaskSpec::from_json(&t.spec)?;

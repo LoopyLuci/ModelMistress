@@ -185,10 +185,15 @@ impl DataStore {
             if f.task.as_ref().is_some_and(|x| v["task"].as_str() != Some(x)) {
                 continue;
             }
-            if f.min_quality.is_some_and(|q| v["labels"]["quality"].as_f64().is_none_or(|x| x < q)) {
+            if f.min_quality
+                .is_some_and(|q| v["labels"]["quality"].as_f64().is_none_or(|x| x < q))
+            {
                 continue;
             }
-            if f.source_kind.as_ref().is_some_and(|k| v["source"]["kind"].as_str() != Some(k)) {
+            if f.source_kind
+                .as_ref()
+                .is_some_and(|k| v["source"]["kind"].as_str() != Some(k))
+            {
                 continue;
             }
             if let Some(t) = &f.tag {

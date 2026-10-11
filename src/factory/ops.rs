@@ -16,7 +16,15 @@ use crate::engine::{Fail, Target};
 use crate::hub::{ApiError, Hub};
 use crate::km::vocab::Vocabulary;
 
-fn op(id: &str, summary: &str, mutating: bool, destructive: bool, props: Value, required: &[&str], open: bool) -> Value {
+fn op(
+    id: &str,
+    summary: &str,
+    mutating: bool,
+    destructive: bool,
+    props: Value,
+    required: &[&str],
+    open: bool,
+) -> Value {
     json!({"id": id, "group": "factory", "summary": summary, "mutating": mutating, "destructive": destructive,
            "input_schema": {"type": "object", "properties": props, "required": required, "additionalProperties": open}})
 }
@@ -136,16 +144,15 @@ fn reopen(f: &Factory, id: &str, step: &str) -> Res<()> {
         // new calls are added up to the (possibly raised) target; none are discarded
     }
     if i <= at("tag") {
-        let rows: Vec<_> = f
-            .db
-            .records(id, None)
-            .into_iter()
-            .filter(|r| r.status != "rejected")
-            .map(|mut r| {
-                r.tagged = false;
-                r
-            })
-            .collect();
+        let rows: Vec<_> =
+            f.db.records(id, None)
+                .into_iter()
+                .filter(|r| r.status != "rejected")
+                .map(|mut r| {
+                    r.tagged = false;
+                    r
+                })
+                .collect();
         f.db.put_records(id, &rows)?;
     }
     if i <= at("build") {
@@ -163,7 +170,11 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
     Ok(match id {
         "factory.task.create" => {
             let mut body = a.clone();
-            let go = body.as_object_mut().and_then(|o| o.remove("start")).and_then(|v| v.as_bool()).unwrap_or(true);
+            let go = body
+                .as_object_mut()
+                .and_then(|o| o.remove("start"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let spec = TaskSpec::from_json(&body)?;
             for m in [spec.author.clone(), spec.reviewer_model()] {
                 model_known(hub, &m)?;
@@ -184,10 +195,12 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let rows = f.db.tasks(os(a, "state"), a["limit"].as_u64().unwrap_or(50) as usize)?;
             json!(rows
                 .iter()
-                .map(|t| json!({"id": t.id, "name": t.name, "state": t.state, "status": t.state, "step": t.step,
+                .map(
+                    |t| json!({"id": t.id, "name": t.name, "state": t.state, "status": t.state, "step": t.step,
                                 "error": t.error, "goal": t.spec["goal"], "created": t.created, "updated": t.updated,
                                 "created_ms": t.created, "updated_ms": t.updated, "job": t.job,
-                                "records": f.db.usable_count(&t.id)}))
+                                "records": f.db.usable_count(&t.id)})
+                )
                 .collect::<Vec<_>>())
         }
         "factory.task.get" => {
@@ -209,7 +222,13 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             }
             v["records"] = Value::Object(per_km);
             v["record_count"] = json!(usable);
-            v["kms"] = json!(f.db.artifacts(&t.id).iter().filter(|a| a.imported).map(|a| format!("{}@{}", a.id, a.version)).collect::<Vec<_>>());
+            v["kms"] = json!(f
+                .db
+                .artifacts(&t.id)
+                .iter()
+                .filter(|a| a.imported)
+                .map(|a| format!("{}@{}", a.id, a.version))
+                .collect::<Vec<_>>());
             let logs = a["logs"].as_u64().unwrap_or(20) as usize;
             v["logs"] = json!(f.db.logs(&t.id, logs, a["since"].as_i64().unwrap_or(0)));
             v["running"] = json!(running_job(hub, &f, &t.id));
@@ -218,8 +237,10 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                 .db
                 .artifacts(&t.id)
                 .iter()
-                .map(|x| json!({"id": x.id, "version": x.version, "kind": x.kind, "stage": x.stage, "key": x.key,
-                                "imported": x.imported}))
+                .map(
+                    |x| json!({"id": x.id, "version": x.version, "kind": x.kind, "stage": x.stage, "key": x.key,
+                                "imported": x.imported})
+                )
                 .collect::<Vec<_>>());
             let n = a["records"].as_u64().unwrap_or(0) as usize;
             if n > 0 {
@@ -238,7 +259,13 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                     .collect::<Vec<_>>());
             }
             if a["review"].as_bool().unwrap_or(false) {
-                v["review"] = json!(f.db.review_list(Some(&t.id), None, Some("open"), 200, 0).1.iter().map(|r| r.to_json()).collect::<Vec<_>>());
+                v["review"] = json!(f
+                    .db
+                    .review_list(Some(&t.id), None, Some("open"), 200, 0)
+                    .1
+                    .iter()
+                    .map(|r| r.to_json())
+                    .collect::<Vec<_>>());
             }
             v
         }
@@ -246,7 +273,11 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let tid = s(a, "id")?;
             let t = f.db.task(tid)?;
             if let Some(j) = running_job(hub, &f, tid) {
-                return Err(Fail::new(409, "running", format!("task {tid} is running as job {j}; cancel it first")));
+                return Err(Fail::new(
+                    409,
+                    "running",
+                    format!("task {tid} is running as job {j}; cancel it first"),
+                ));
             }
             let spec = TaskSpec::from_json(&t.spec)?;
             let cur = f.db.plan(tid);
@@ -261,7 +292,15 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let plan = super::plan::normalize_plan(&plan, &spec.domain).map_err(Fail::invalid)?;
             let approve = a["approve"].as_bool().unwrap_or(false) || !spec.plan_approval;
             let rev = f.db.put_plan(tid, &plan, approve, os(a, "by").unwrap_or("owner"))?;
-            f.db.log(tid, "plan", "info", &format!("plan revision {rev} saved{}", if approve { " and approved" } else { "" }));
+            f.db.log(
+                tid,
+                "plan",
+                "info",
+                &format!(
+                    "plan revision {rev} saved{}",
+                    if approve { " and approved" } else { "" }
+                ),
+            );
             json!({"task": tid, "rev": rev, "approved": approve, "plan": plan,
                    "next": "factory.task.resume continues the pipeline (from generate re-opens generation on the new plan)"})
         }
@@ -269,17 +308,36 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let tid = s(a, "id")?;
             let t = f.db.task(tid)?;
             if let Some(j) = running_job(hub, &f, tid) {
-                return Err(Fail::new(409, "running", format!("task {tid} is already running as job {j}")));
+                return Err(Fail::new(
+                    409,
+                    "running",
+                    format!("task {tid} is already running as job {j}"),
+                ));
             }
             if let Some(ch) = a.get("changes").filter(|c| c.is_object()) {
                 let mut spec = t.spec.clone();
                 const ALLOWED: [&str; 14] = [
-                    "size", "budget", "device", "approval", "author", "reviewer", "base", "tagging", "plan_approval",
-                    "eval_sets", "think", "per_call", "license", "kinds",
+                    "size",
+                    "budget",
+                    "device",
+                    "approval",
+                    "author",
+                    "reviewer",
+                    "base",
+                    "tagging",
+                    "plan_approval",
+                    "eval_sets",
+                    "think",
+                    "per_call",
+                    "license",
+                    "kinds",
                 ];
                 for (k, v) in ch.as_object().into_iter().flatten() {
                     if !ALLOWED.contains(&k.as_str()) {
-                        return Err(Fail::invalid(format!("{k} cannot be changed on a task (allowed: {})", ALLOWED.join(", "))));
+                        return Err(Fail::invalid(format!(
+                            "{k} cannot be changed on a task (allowed: {})",
+                            ALLOWED.join(", ")
+                        )));
                     }
                     let mut one = json!({});
                     one[k] = v.clone();
@@ -289,17 +347,29 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                 for m in [checked.author.clone(), checked.reviewer_model()] {
                     model_known(hub, &m)?;
                 }
-                f.db.set_spec(tid, &serde_json::to_value(&checked).map_err(|e| Fail::new(500, "internal", e.to_string()))?)?;
+                f.db.set_spec(
+                    tid,
+                    &serde_json::to_value(&checked).map_err(|e| Fail::new(500, "internal", e.to_string()))?,
+                )?;
             }
             match os(a, "from") {
                 Some(step) => reopen(&f, tid, step)?,
                 None if t.state == "done" => {
-                    return Err(Fail::new(409, "done", format!("task {tid} is done; give from to run a step again")))
+                    return Err(Fail::new(
+                        409,
+                        "done",
+                        format!("task {tid} is done; give from to run a step again"),
+                    ))
                 }
                 None => {}
             }
             let mut out = start(hub, &f, tid)?;
-            out["resumed_from"] = json!(f.db.steps(tid).iter().find(|x| !matches!(x.status.as_str(), "done" | "skipped")).map(|x| x.name.clone()));
+            out["resumed_from"] = json!(f
+                .db
+                .steps(tid)
+                .iter()
+                .find(|x| !matches!(x.status.as_str(), "done" | "skipped"))
+                .map(|x| x.name.clone()));
             out
         }
         "factory.task.cancel" => {
@@ -349,10 +419,18 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
 
 fn embedder_setup(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
     let Target::Llama(entry) = hub.engine.resolve(s(a, "model")?)? else {
-        return Err(Fail::invalid("the embedder must be a GGUF model the hub serves, not an Ollama one"));
+        return Err(Fail::invalid(
+            "the embedder must be a GGUF model the hub serves, not an Ollama one",
+        ));
     };
-    let name = os(a, "name").map(str::to_string).unwrap_or_else(|| f.settings().embed_model);
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+    let name = os(a, "name")
+        .map(str::to_string)
+        .unwrap_or_else(|| f.settings().embed_model);
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
         return Err(Fail::invalid("name must be letters, digits, '-', '_' or '.'"));
     }
     let models = hub.engine.home.join("models");
@@ -364,8 +442,7 @@ fn embedder_setup(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
         how = if std::fs::hard_link(&entry.path, &dest).is_ok() {
             "linked"
         } else {
-            std::fs::copy(&entry.path, &dest)
-                .map_err(|e| Fail::new(500, "io", format!("{}: {e}", dest.display())))?;
+            std::fs::copy(&entry.path, &dest).map_err(|e| Fail::new(500, "io", format!("{}: {e}", dest.display())))?;
             "copied"
         };
     }
@@ -401,16 +478,19 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
     let by = os(a, "by").unwrap_or("owner");
     let row = f.db.review_item(item)?;
     if row.state != "open" {
-        return Err(Fail::new(409, "decided", format!("review item {item} was already decided ({})", row.state)));
+        return Err(Fail::new(
+            409,
+            "decided",
+            format!("review item {item} was already decided ({})", row.state),
+        ));
     }
     let km = crate::km::runtime(&hub.engine)?;
     let mut effect = json!({});
     match row.kind.as_str() {
         "record" => {
-            let mut r = f
-                .db
-                .record(&row.task, &row.reference)
-                .ok_or_else(|| Fail::not_found(format!("record {} is gone", row.reference)))?;
+            let mut r =
+                f.db.record(&row.task, &row.reference)
+                    .ok_or_else(|| Fail::not_found(format!("record {} is gone", row.reference)))?;
             match decision {
                 "reject" => {
                     r.status = "rejected".into();
@@ -418,7 +498,10 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
                 }
                 _ => {
                     if decision == "edit" {
-                        let ch = a.get("changes").filter(|c| c.is_object()).ok_or_else(|| Fail::invalid("edit needs changes"))?;
+                        let ch = a
+                            .get("changes")
+                            .filter(|c| c.is_object())
+                            .ok_or_else(|| Fail::invalid("edit needs changes"))?;
                         if let Some(i) = ch["input"].as_str() {
                             r.json["input"] = json!([{"role": "user", "content": i}]);
                             r.emb = None;
@@ -445,11 +528,14 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
         }
         "tag" => {
             let (rid, tag) = row.reference.split_once('|').unwrap_or((&row.reference, ""));
-            let mut r = f
-                .db
-                .record(&row.task, rid)
-                .ok_or_else(|| Fail::not_found(format!("record {rid} is gone")))?;
-            let words = super::util::words(&format!("{} {}", super::verify::user_text(&r.json), r.json["output"].as_str().unwrap_or("")));
+            let mut r =
+                f.db.record(&row.task, rid)
+                    .ok_or_else(|| Fail::not_found(format!("record {rid} is gone")))?;
+            let words = super::util::words(&format!(
+                "{} {}",
+                super::verify::user_text(&r.json),
+                r.json["output"].as_str().unwrap_or("")
+            ));
             if decision == "reject" {
                 f.db.add_feedback(tag, &words, -1.0);
                 effect = json!({"record": rid, "tag": tag, "attached": false});
@@ -462,10 +548,18 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
                             vocab.save(&km.store.root)?;
                         }
                     } else {
-                        return Err(Fail::invalid(format!("{tag} is not in the vocabulary; approve it with add_to_vocabulary")));
+                        return Err(Fail::invalid(format!(
+                            "{tag} is not in the vocabulary; approve it with add_to_vocabulary"
+                        )));
                     }
                 }
-                let mut tags: Vec<String> = r.json["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let mut tags: Vec<String> = r.json["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
                 if !tags.iter().any(|t| t == tag) {
                     tags.push(tag.to_string());
                 }
@@ -490,7 +584,12 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
         "promotion" => {
             if decision != "reject" {
                 let mut moved = vec![];
-                for k in row.data["kms"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                for k in row.data["kms"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
                     if let Some((kid, ver)) = k.split_once('@') {
                         if !kid.starts_with("adapter.") {
                             km.store.channel_set(kid, "stable", ver, None)?;
@@ -509,7 +608,12 @@ async fn decide(hub: &Hub, f: &Factory, a: &Value) -> Res<Value> {
         _ => "edited",
     };
     f.db.review_decide(item, state, decision, by, os(a, "note"))?;
-    f.db.log(&row.task, "review", "info", &format!("item {item} ({}) {decision} by {by}", row.kind));
+    f.db.log(
+        &row.task,
+        "review",
+        "info",
+        &format!("item {item} ({}) {decision} by {by}", row.kind),
+    );
     Ok(json!({"item": item, "kind": row.kind, "state": state, "effect": effect,
               "open_left": f.db.review_open_count(&row.task),
               "note": if row.kind == "record" || row.kind == "tag" { "KMs already built keep their version; resume with from=build to make a new one" } else { "" }}))

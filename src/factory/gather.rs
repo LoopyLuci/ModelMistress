@@ -128,8 +128,10 @@ pub fn chunk_text(text: &str, max: usize) -> Vec<(String, usize, usize)> {
                 }
             }
         }
-        let body = lines[i..end].iter().map(|l| l.1.as_str()).collect::<Vec<_>>().join("
-");
+        let body = lines[i..end].iter().map(|l| l.1.as_str()).collect::<Vec<_>>().join(
+            "
+",
+        );
         if !body.trim().is_empty() {
             out.push((body.trim_end().to_string(), lines[i].0, lines[end - 1].0));
         }
@@ -150,7 +152,9 @@ fn spdx_of(text: &str) -> Option<String> {
 
 fn license_file(dir: &Path) -> Option<String> {
     for n in ["LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING"] {
-        let Ok(t) = std::fs::read_to_string(dir.join(n)) else { continue };
+        let Ok(t) = std::fs::read_to_string(dir.join(n)) else {
+            continue;
+        };
         let head: String = t.chars().take(600).collect::<String>().to_lowercase();
         let id = if head.contains("apache license") {
             "Apache-2.0"
@@ -201,7 +205,11 @@ impl Sink<'_> {
 fn read_text_file(path: &Path, limits: &Limits, notes: &mut Vec<String>, label: &str) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > limits.max_file_bytes {
-        notes.push(format!("{label}: skipped, {} bytes is over the {} byte limit", meta.len(), limits.max_file_bytes));
+        notes.push(format!(
+            "{label}: skipped, {} bytes is over the {} byte limit",
+            meta.len(),
+            limits.max_file_bytes
+        ));
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
@@ -225,7 +233,11 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<(PathBuf, String)>, cap: usize) {
         if ft.is_symlink() {
             continue; // links are never followed
         }
-        let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let r = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         if ft.is_dir() {
             if !SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
                 walk(&e.path(), &r, out, cap);
@@ -249,11 +261,17 @@ fn gather_dir(src: &Value, limits: &Limits, default_license: Option<&str>, sink:
     }
     let globs = strs(src, "globs");
     let exclude = strs(src, "exclude");
-    let max_files = src["max_files"].as_u64().map(|n| n as usize).unwrap_or(limits.max_files);
+    let max_files = src["max_files"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or(limits.max_files);
     let lic_dir = license_file(&root).or_else(|| default_license.map(str::to_string));
     let mut found = vec![];
     walk(&root, "", &mut found, max_files);
-    let base = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut taken = 0usize;
     for (path, rel) in found {
         let wanted = if globs.is_empty() {
@@ -267,11 +285,15 @@ fn gather_dir(src: &Value, limits: &Limits, default_license: Option<&str>, sink:
             continue;
         }
         if taken >= max_files {
-            sink.out.notes.push(format!("{base}: stopped at {max_files} files (size limit)"));
+            sink.out
+                .notes
+                .push(format!("{base}: stopped at {max_files} files (size limit)"));
             break;
         }
         if sink.out.bytes >= limits.max_total_bytes {
-            sink.out.notes.push(format!("{base}: stopped at {} bytes in total", limits.max_total_bytes));
+            sink.out
+                .notes
+                .push(format!("{base}: stopped at {} bytes in total", limits.max_total_bytes));
             break;
         }
         let Some(text) = read_text_file(&path, limits, &mut sink.out.notes, &format!("{base}/{rel}")) else {
@@ -281,7 +303,11 @@ fn gather_dir(src: &Value, limits: &Limits, default_license: Option<&str>, sink:
         sink.out.files += 1;
         sink.out.bytes += text.len() as u64;
         let lic = spdx_of(&text).or_else(|| lic_dir.clone());
-        sink.add_text(&text, "doc", json!({"kind": "file", "path": format!("{base}/{rel}"), "license": lic}));
+        sink.add_text(
+            &text,
+            "doc",
+            json!({"kind": "file", "path": format!("{base}/{rel}"), "license": lic}),
+        );
     }
     Ok(())
 }
@@ -291,7 +317,10 @@ fn gather_file(src: &Value, limits: &Limits, default_license: Option<&str>, sink
     if !path.is_file() {
         return Err(Fail::invalid(format!("source file {}: not a file", path.display())));
     }
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let Some(text) = read_text_file(&path, limits, &mut sink.out.notes, &name) else {
         return Err(Fail::invalid(format!("source file {name}: too large or not text")));
     };
@@ -309,9 +338,15 @@ fn gather_skill(src: &Value, limits: &Limits, sink: &mut Sink) -> Res<()> {
     }
     let skill_md = root.join("SKILL.md");
     if !skill_md.is_file() {
-        return Err(Fail::invalid(format!("skill folder {} has no SKILL.md", root.display())));
+        return Err(Fail::invalid(format!(
+            "skill folder {} has no SKILL.md",
+            root.display()
+        )));
     }
-    let base = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut found = vec![];
     walk(&root, "", &mut found, limits.max_files);
     let lic = license_file(&root);
@@ -386,7 +421,10 @@ async fn gather_url(
     sink: &mut Sink<'_>,
 ) -> Res<()> {
     let url = src["url"].as_str().unwrap_or("");
-    let cap = src["max_bytes"].as_u64().unwrap_or(limits.max_url_bytes).min(limits.max_url_bytes * 8);
+    let cap = src["max_bytes"]
+        .as_u64()
+        .unwrap_or(limits.max_url_bytes)
+        .min(limits.max_url_bytes * 8);
     let mut resp = engine
         .http
         .get(url)
@@ -442,8 +480,8 @@ fn gather_km(km: &Km, src: &Value, sink: &mut Sink) -> Res<()> {
     let m = Manifest::from_file(&dir.join("km.toml"))?;
     let lic = m.license.clone();
     if let Some(mem) = &m.memory {
-        let text = std::fs::read_to_string(dir.join(&mem.chunks))
-            .map_err(|e| Fail::invalid(format!("{}: {e}", rec.key)))?;
+        let text =
+            std::fs::read_to_string(dir.join(&mem.chunks)).map_err(|e| Fail::invalid(format!("{}: {e}", rec.key)))?;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
             let Some(t) = v["text"].as_str() else { continue };
@@ -458,8 +496,8 @@ fn gather_km(km: &Km, src: &Value, sink: &mut Sink) -> Res<()> {
             });
         }
     } else if let Some(p) = m.payload_of("records") {
-        let text = std::fs::read_to_string(dir.join(&p.path))
-            .map_err(|e| Fail::invalid(format!("{}: {e}", rec.key)))?;
+        let text =
+            std::fs::read_to_string(dir.join(&p.path)).map_err(|e| Fail::invalid(format!("{}: {e}", rec.key)))?;
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
             if v["status"] == "rejected" {
@@ -491,8 +529,7 @@ fn gather_km(km: &Km, src: &Value, sink: &mut Sink) -> Res<()> {
     } else {
         return Err(Fail::invalid(format!(
             "{} is a {} KM; only memory, data and skill KMs can be a source",
-            rec.key,
-            rec.kind
+            rec.key, rec.kind
         )));
     }
     Ok(())
@@ -504,7 +541,9 @@ pub fn tool_def(src: &Value) -> Res<ToolDef> {
     if let Some(schema) = src.get("input_schema").filter(|s| s.is_object()) {
         let provider = src["provider"].as_str().unwrap_or("hub");
         if provider != "hub" && !provider.starts_with("mcp:") {
-            return Err(Fail::invalid(format!("tool {name}: provider must be hub or mcp:<server>")));
+            return Err(Fail::invalid(format!(
+                "tool {name}: provider must be hub or mcp:<server>"
+            )));
         }
         return Ok(ToolDef {
             name,
@@ -562,16 +601,25 @@ fn gather_traces(home: &Path, src: &Value, sink: &mut Sink) -> Res<()> {
         }
         let id = it["id"].as_str().unwrap_or("");
         let Ok(Some(full)) = store.get(id, 0) else { continue };
-        let (p, a) = (full["prompt"].as_str().unwrap_or(""), full["answer"].as_str().unwrap_or(""));
+        let (p, a) = (
+            full["prompt"].as_str().unwrap_or(""),
+            full["answer"].as_str().unwrap_or(""),
+        );
         if p.is_empty() || a.is_empty() {
             continue;
         }
         taken += 1;
         sink.out.files += 1;
-        sink.add_text(&format!("User: {p}\nAssistant: {a}"), "doc", json!({"kind": "trace", "trace": id}));
+        sink.add_text(
+            &format!("User: {p}\nAssistant: {a}"),
+            "doc",
+            json!({"kind": "trace", "trace": id}),
+        );
     }
     if taken == 0 {
-        sink.out.notes.push(format!("traces {:?}: no matching traces", src["query"]));
+        sink.out
+            .notes
+            .push(format!("traces {:?}: no matching traces", src["query"]));
     }
     Ok(())
 }
@@ -584,7 +632,12 @@ pub fn preview(sources: &[Value]) -> String {
         std::fs::read(p)
             .ok()
             .filter(|b| !b.iter().take(4096).any(|x| *x == 0))
-            .map(|b| String::from_utf8_lossy(&b[..b.len().min(n * 4)]).chars().take(n).collect())
+            .map(|b| {
+                String::from_utf8_lossy(&b[..b.len().min(n * 4)])
+                    .chars()
+                    .take(n)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     for s in sources.iter().take(6) {
@@ -603,38 +656,64 @@ pub fn preview(sources: &[Value]) -> String {
                         globs.iter().any(|g| glob_match(g, rel))
                     }
                 });
-                out.push_str(&format!("Folder with {} text files, for example:
-", found.len()));
+                out.push_str(&format!(
+                    "Folder with {} text files, for example:
+",
+                    found.len()
+                ));
                 for (_, rel) in found.iter().take(12) {
-                    out.push_str(&format!("- {rel}
-"));
+                    out.push_str(&format!(
+                        "- {rel}
+"
+                    ));
                 }
                 if let Some((p, rel)) = found.first() {
-                    out.push_str(&format!("Start of {rel}:
+                    out.push_str(&format!(
+                        "Start of {rel}:
 {}
-", head(p, 700)));
+",
+                        head(p, 700)
+                    ));
                 }
             }
             "file" => {
                 let p = PathBuf::from(s["path"].as_str().unwrap_or(""));
-                out.push_str(&format!("Start of the file:
+                out.push_str(&format!(
+                    "Start of the file:
 {}
-", head(&p, 900)));
+",
+                    head(&p, 900)
+                ));
             }
             "skill" => {
                 let p = PathBuf::from(s["path"].as_str().unwrap_or("")).join("SKILL.md");
-                out.push_str(&format!("A skill. Start of SKILL.md:
+                out.push_str(&format!(
+                    "A skill. Start of SKILL.md:
 {}
-", head(&p, 900)));
+",
+                    head(&p, 900)
+                ));
             }
-            "url" => out.push_str(&format!("A web page: {}
-", s["url"].as_str().unwrap_or(""))),
-            "km" => out.push_str(&format!("The Knowledge Module {}
-", s["id"].as_str().unwrap_or(""))),
-            "tool" => out.push_str(&format!("The tool {}
-", s["name"].as_str().unwrap_or(""))),
-            "traces" => out.push_str(&format!("Past requests matching {:?}
-", s["query"].as_str().unwrap_or(""))),
+            "url" => out.push_str(&format!(
+                "A web page: {}
+",
+                s["url"].as_str().unwrap_or("")
+            )),
+            "km" => out.push_str(&format!(
+                "The Knowledge Module {}
+",
+                s["id"].as_str().unwrap_or("")
+            )),
+            "tool" => out.push_str(&format!(
+                "The tool {}
+",
+                s["name"].as_str().unwrap_or("")
+            )),
+            "traces" => out.push_str(&format!(
+                "Past requests matching {:?}
+",
+                s["query"].as_str().unwrap_or("")
+            )),
             _ => {}
         }
     }
@@ -685,16 +764,14 @@ pub async fn gather(
                 r.1.map_err(|e| Fail::new(e.status, e.code, format!("sources[{i}] ({kind}): {}", e.message)))?;
             }
             "url" => {
-                let mut sink = Sink {
-                    out: &mut out,
-                    limits,
-                };
+                let mut sink = Sink { out: &mut out, limits };
                 gather_url(engine, src, limits, default_license, &mut sink)
                     .await
                     .map_err(|e| Fail::new(e.status, e.code, format!("sources[{i}] (url): {}", e.message)))?;
             }
             "tool" => {
-                let t = tool_def(src).map_err(|e| Fail::new(e.status, e.code, format!("sources[{i}] (tool): {}", e.message)))?;
+                let t = tool_def(src)
+                    .map_err(|e| Fail::new(e.status, e.code, format!("sources[{i}] (tool): {}", e.message)))?;
                 let ord = out.chunks.len() as i64;
                 out.chunks.push(ChunkRow {
                     id: format!("c{}", ord + 1),
@@ -727,7 +804,10 @@ mod tests {
     #[test]
     fn globs_cross_folders_only_with_double_star() {
         assert!(glob_match("**/*.md", "docs/native/km-spec.md"));
-        assert!(glob_match("*.md", "docs/a.MD"), "a bare pattern matches at any depth, ignoring case");
+        assert!(
+            glob_match("*.md", "docs/a.MD"),
+            "a bare pattern matches at any depth, ignoring case"
+        );
         assert!(glob_match("docs/*.md", "docs/a.md"));
         assert!(!glob_match("docs/*.md", "docs/native/a.md"));
         assert!(glob_match("docs/**", "docs/native/a.md"));
@@ -737,10 +817,17 @@ mod tests {
 
     #[test]
     fn chunks_keep_line_numbers_and_stay_small() {
-        let text = (1..=40).map(|i| format!("line number {i}")).collect::<Vec<_>>().join("\n");
+        let text = (1..=40)
+            .map(|i| format!("line number {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let cs = chunk_text(&text, 100);
         assert!(cs.len() > 3);
-        assert!(cs.iter().all(|c| c.0.chars().count() <= 100), "{:?}", cs.iter().map(|c| c.0.len()).collect::<Vec<_>>());
+        assert!(
+            cs.iter().all(|c| c.0.chars().count() <= 100),
+            "{:?}",
+            cs.iter().map(|c| c.0.len()).collect::<Vec<_>>()
+        );
         assert_eq!(cs[0].1, 1);
         assert_eq!(cs.last().map(|c| c.2), Some(40));
         for w in cs.windows(2) {
@@ -767,7 +854,10 @@ mod tests {
 
     #[test]
     fn licences_are_read_from_headers_and_files() {
-        assert_eq!(spdx_of("// SPDX-License-Identifier: MIT\nfn x(){}").as_deref(), Some("MIT"));
+        assert_eq!(
+            spdx_of("// SPDX-License-Identifier: MIT\nfn x(){}").as_deref(),
+            Some("MIT")
+        );
         assert_eq!(spdx_of("nothing here"), None);
         let d = crate::testing::temp_home();
         std::fs::write(d.join("LICENSE"), "Apache License\nVersion 2.0").unwrap();
@@ -781,7 +871,10 @@ mod tests {
         assert_eq!((t.provider.as_str(), t.side_effects.as_str()), ("hub", "read"));
         assert!(t.input_schema.is_object());
         assert_eq!(tool_def(&json!({"name": "km.import"})).unwrap().side_effects, "write");
-        assert!(tool_def(&json!({"name": "no.such.op"})).unwrap_err().message.contains("not a hub operation"));
+        assert!(tool_def(&json!({"name": "no.such.op"}))
+            .unwrap_err()
+            .message
+            .contains("not a hub operation"));
         let m = tool_def(&json!({"name": "grep", "provider": "mcp:files", "description": "d",
                                  "input_schema": {"type": "object"}}))
         .unwrap();

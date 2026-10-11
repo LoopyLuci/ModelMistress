@@ -58,22 +58,39 @@ fn notes_for(
 }
 
 async fn judge(run: &Run, question: &str, reference: &str, candidate: &str) -> StepRes<(f64, String)> {
-    let (rf, cf, qf) = (fence("REFERENCE", reference), fence("ANSWER", candidate), fence("QUESTION", question));
-    let (system, user) = prompt(run.home(), "judge", &[("question", &qf), ("reference", &rf), ("candidate", &cf)]);
+    let (rf, cf, qf) = (
+        fence("REFERENCE", reference),
+        fence("ANSWER", candidate),
+        fence("QUESTION", question),
+    );
+    let (system, user) = prompt(
+        run.home(),
+        "judge",
+        &[("question", &qf), ("reference", &rf), ("candidate", &cf)],
+    );
     let r = run
         .ask_json(Role::Reviewer, "eval:judge", &system, &user, 300, &|v| {
-            v["score"].as_f64().map(|_| ()).ok_or_else(|| "score must be a number from 0 to 10".to_string())
+            v["score"]
+                .as_f64()
+                .map(|_| ())
+                .ok_or_else(|| "score must be a number from 0 to 10".to_string())
         })
         .await?;
     Ok(match r {
-        Ok((v, _)) => (v["score"].as_f64().unwrap_or(0.0).clamp(0.0, 10.0), v["reason"].as_str().unwrap_or("").to_string()),
+        Ok((v, _)) => (
+            v["score"].as_f64().unwrap_or(0.0).clamp(0.0, 10.0),
+            v["reason"].as_str().unwrap_or("").to_string(),
+        ),
         Err(e) => (0.0, format!("the judge gave no valid score ({e})")),
     })
 }
 
 pub async fn run(run: &Run) -> StepRes<StepEnd> {
     let rows = run.f.db.records(&run.id, None);
-    let held: Vec<&RecordRow> = rows.iter().filter(|r| r.split == "heldout" && r.status != "rejected").collect();
+    let held: Vec<&RecordRow> = rows
+        .iter()
+        .filter(|r| r.split == "heldout" && r.status != "rejected")
+        .collect();
     let built: Vec<_> = run
         .f
         .db
@@ -90,22 +107,41 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         ));
     }
     let docs: Vec<ChunkRow> = if built.iter().any(|a| a.kind == "memory") {
-        run.f.db.chunks(&run.id).into_iter().filter(|c| c.role != "tool").collect()
+        run.f
+            .db
+            .chunks(&run.id)
+            .into_iter()
+            .filter(|c| c.role != "tool")
+            .collect()
     } else {
         vec![]
     };
     let train: Vec<RecordRow> = if built.iter().any(|a| a.kind == "data") {
-        rows.iter().filter(|r| r.split != "heldout" && r.status != "rejected").cloned().collect()
+        rows.iter()
+            .filter(|r| r.split != "heldout" && r.status != "rejected")
+            .cloned()
+            .collect()
     } else {
         vec![]
     };
     let skill_text = if built.iter().any(|a| a.kind == "skill") {
-        run.f.db.chunks(&run.id).into_iter().find(|c| c.role == "skill").map(|c| c.text)
+        run.f
+            .db
+            .chunks(&run.id)
+            .into_iter()
+            .find(|c| c.role == "skill")
+            .map(|c| c.text)
     } else {
         None
     };
     let tool_texts: Vec<String> = if built.iter().any(|a| a.kind == "tool") {
-        run.f.db.chunks(&run.id).into_iter().filter(|c| c.role == "tool").map(|c| c.text).collect()
+        run.f
+            .db
+            .chunks(&run.id)
+            .into_iter()
+            .filter(|c| c.role == "tool")
+            .map(|c| c.text)
+            .collect()
     } else {
         vec![]
     };
@@ -123,7 +159,14 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         let q_emb = run.embed(std::slice::from_ref(&q)).await?.remove(0);
         let (system, user) = prompt(run.home(), "answer", &[("question", &q)]);
         let without = run.ask(Role::Base, "eval:without", &system, &user, 500).await?;
-        let notes = notes_for(&q_emb, &docs, &train.iter().filter(|t| t.id != r.id).cloned().collect::<Vec<_>>(), skill_text.as_deref(), &tool_texts, k);
+        let notes = notes_for(
+            &q_emb,
+            &docs,
+            &train.iter().filter(|t| t.id != r.id).cloned().collect::<Vec<_>>(),
+            skill_text.as_deref(),
+            &tool_texts,
+            k,
+        );
         let nf = fence("NOTES FROM KNOWLEDGE MODULES", &notes);
         let (system, user) = prompt(run.home(), "answer_with_km", &[("notes", &nf), ("question", &q)]);
         let with = run.ask(Role::Base, "eval:with", &system, &user, 500).await?;
@@ -141,7 +184,14 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     }
     let evals = run.f.db.evals(&run.id);
     let cnt = evals.len().max(1) as f64;
-    let mean = |side: &str| evals.iter().map(|e| e.1[side]["score"].as_f64().unwrap_or(0.0)).sum::<f64>() / cnt / 10.0;
+    let mean = |side: &str| {
+        evals
+            .iter()
+            .map(|e| e.1[side]["score"].as_f64().unwrap_or(0.0))
+            .sum::<f64>()
+            / cnt
+            / 10.0
+    };
     let (with_m, without_m) = (mean("with"), mean("without"));
     let uplift = ((with_m - without_m) * 1000.0).round() / 1000.0;
     let scores: BTreeMap<String, f64> = BTreeMap::from([
@@ -163,7 +213,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     let existing = run.f.db.artifacts(&run.id);
     let mut versions = vec![];
     for a in built {
-        if existing.iter().any(|x| x.id == a.id && x.stage == "evaluated" && x.imported) {
+        if existing
+            .iter()
+            .any(|x| x.id == a.id && x.stage == "evaluated" && x.imported)
+        {
             continue;
         }
         if a.kind == "adapter" {
@@ -191,6 +244,8 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         let r = super::build::publish_version(run, d, files, "evaluated").await?;
         versions.push(r);
     }
-    Ok(StepEnd::Done(json!({"evaluated": evals.len(), "uplift": uplift, "score_with_km": with_m,
-                            "score_without_km": without_m, "versions": versions})))
+    Ok(StepEnd::Done(
+        json!({"evaluated": evals.len(), "uplift": uplift, "score_with_km": with_m,
+                            "score_without_km": without_m, "versions": versions}),
+    ))
 }

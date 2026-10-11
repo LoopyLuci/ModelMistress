@@ -50,7 +50,9 @@ pub struct Draft {
 }
 
 fn clean_cite(c: &str) -> String {
-    c.trim().trim_matches(|ch| ch == '[' || ch == ']' || ch == '#' || ch == ' ').to_string()
+    c.trim()
+        .trim_matches(|ch| ch == '[' || ch == ']' || ch == '#' || ch == ' ')
+        .to_string()
 }
 
 /// Checks one record from the model against the chunk ids that were shown to it.
@@ -64,7 +66,12 @@ pub fn check_record(r: &Value, offered: &[String], tool_use: bool) -> Result<Dra
         return Err("output is missing or too short".into());
     }
     let cites: Vec<String> = match &r["cites"] {
-        Value::Array(a) => a.iter().filter_map(Value::as_str).map(clean_cite).filter(|c| !c.is_empty()).collect(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(clean_cite)
+            .filter(|c| !c.is_empty())
+            .collect(),
         Value::String(s) => s.split(',').map(clean_cite).filter(|c| !c.is_empty()).collect(),
         _ => vec![],
     };
@@ -72,7 +79,10 @@ pub fn check_record(r: &Value, offered: &[String], tool_use: bool) -> Result<Dra
         return Err("cites must list the chunk ids the record is based on".into());
     }
     if let Some(bad) = cites.iter().find(|c| !offered.contains(c)) {
-        return Err(format!("cites {bad:?}, which is not one of the chunks shown ({})", offered.join(", ")));
+        return Err(format!(
+            "cites {bad:?}, which is not one of the chunks shown ({})",
+            offered.join(", ")
+        ));
     }
     let mut tool_calls = vec![];
     if tool_use {
@@ -206,7 +216,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 "{} {} {}",
                 s["name"].as_str().unwrap_or(""),
                 s["description"].as_str().unwrap_or(""),
-                s["questions"].as_array().map(|q| q.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default()
+                s["questions"]
+                    .as_array()
+                    .map(|q| q.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default()
             )
         })
         .collect();
@@ -218,7 +231,11 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     loop {
         run.check()?;
         let usable = run.f.db.usable_count(&run.id);
-        run.progress(usable.max(0) as u64, target as u64, &format!("{usable} of {target} records"));
+        run.progress(
+            usable.max(0) as u64,
+            target as u64,
+            &format!("{usable} of {target} records"),
+        );
         if usable >= target {
             break;
         }
@@ -228,7 +245,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 let (p, d, f) = run.f.db.work_counts(&run.id, "generate");
                 let total = p + d + f;
                 if total >= max_calls {
-                    run.log("warn", &format!("stopped after {total} model calls with {usable} of {target} records"));
+                    run.log(
+                        "warn",
+                        &format!("stopped after {total} model calls with {usable} of {target} records"),
+                    );
                     break;
                 }
                 let i = total as usize;
@@ -248,7 +268,9 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         ranked.sort_by(|a, b| {
             let sa = a.emb.as_ref().map_or(0.0, |e| cosine(e, &sub_embs[si]));
             let sb = b.emb.as_ref().map_or(0.0, |e| cosine(e, &sub_embs[si]));
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal).then(a.ord.cmp(&b.ord))
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.ord.cmp(&b.ord))
         });
         let want = if tool_use { 2 } else { 4 }.min(ranked.len());
         let start = (round * 2) % ranked.len().max(1);
@@ -288,8 +310,14 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
                 .collect();
             let skip = qs.len().saturating_sub(15);
             qs.drain(..skip);
-            if qs.is_empty() { "(none yet)".to_string() } else { qs.join("
-") }
+            if qs.is_empty() {
+                "(none yet)".to_string()
+            } else {
+                qs.join(
+                    "
+",
+                )
+            }
         };
         let chunks_text = fence("SOURCE CHUNKS", &blocks);
         let tools_fenced = fence("TOOLS", &tools_text);
@@ -309,7 +337,10 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
         let (system, user) = prompt(run.home(), if tool_use { "generate_tool" } else { "generate" }, &vars);
         let offered_c = offered.clone();
         let validate = move |v: &Value| -> Result<(), String> {
-            let recs = v["records"].as_array().filter(|a| !a.is_empty()).ok_or("records must be a non-empty list")?;
+            let recs = v["records"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or("records must be a non-empty list")?;
             let mut first_err = String::new();
             for r in recs {
                 match check_record(r, &offered_c, tool_use) {
@@ -321,11 +352,20 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
             Err(format!("no usable record: {first_err}"))
         };
         let res = run
-            .ask_json(Role::Author, &format!("generate:{kind}"), &system, &user, run.f.settings().gen_max_tokens, &validate)
+            .ask_json(
+                Role::Author,
+                &format!("generate:{kind}"),
+                &system,
+                &user,
+                run.f.settings().gen_max_tokens,
+                &validate,
+            )
             .await?;
         match res {
             Err(why) => {
-                run.f.db.finish_work(&run.id, "generate", idx, "failed", &json!({"error": why}))?;
+                run.f
+                    .db
+                    .finish_work(&run.id, "generate", idx, "failed", &json!({"error": why}))?;
                 run.log("warn", &format!("call {idx} gave no usable records: {why}"));
                 streak += 1;
                 if streak >= 4 {
@@ -391,11 +431,17 @@ pub async fn run(run: &Run) -> StepRes<StepEnd> {
     }
     let usable = run.f.db.usable_count(&run.id);
     if usable == 0 {
-        return Err(Halt::Fail(Fail::new(422, "no_records", "no usable record was generated")));
+        return Err(Halt::Fail(Fail::new(
+            422,
+            "no_records",
+            "no usable record was generated",
+        )));
     }
     let (p, d, f) = run.f.db.work_counts(&run.id, "generate");
-    Ok(StepEnd::Done(json!({"records": usable, "target": target, "refused_citation": rejected,
-                            "calls": p + d + f, "calls_done": d, "calls_failed": f, "calls_this_run": calls_ok})))
+    Ok(StepEnd::Done(
+        json!({"records": usable, "target": target, "refused_citation": rejected,
+                            "calls": p + d + f, "calls_done": d, "calls_failed": f, "calls_this_run": calls_ok}),
+    ))
 }
 
 #[cfg(test)]

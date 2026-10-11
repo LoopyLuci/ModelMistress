@@ -170,7 +170,10 @@ impl Generate for HubGenerator {
                         return Err(Fail::new(
                             502,
                             "backend_error",
-                            v["error"]["message"].as_str().unwrap_or("the model refused the request").to_string(),
+                            v["error"]["message"]
+                                .as_str()
+                                .unwrap_or("the model refused the request")
+                                .to_string(),
                         ));
                     }
                     (None, v)
@@ -228,8 +231,9 @@ pub fn extract_json(text: &str) -> Result<Value, String> {
     }
     // from the first brace to the last
     match (unfenced.find('{'), unfenced.rfind('}')) {
-        (Some(a), Some(b)) if b > a => serde_json::from_str::<Value>(&unfenced[a..=b])
-            .map_err(|e| format!("not valid JSON: {e}")),
+        (Some(a), Some(b)) if b > a => {
+            serde_json::from_str::<Value>(&unfenced[a..=b]).map_err(|e| format!("not valid JSON: {e}"))
+        }
         _ => Err("no JSON object in the answer".into()),
     }
 }
@@ -259,7 +263,10 @@ mod tests {
 
     #[test]
     fn thinking_is_removed() {
-        assert_eq!(split_think("<think>hmm</think>\n\nYes", ""), ("Yes".into(), "hmm".into()));
+        assert_eq!(
+            split_think("<think>hmm</think>\n\nYes", ""),
+            ("Yes".into(), "hmm".into())
+        );
         assert_eq!(split_think("hmm</think>Yes", ""), ("Yes".into(), "hmm".into()));
         assert_eq!(split_think("plain", "r"), ("plain".into(), "r".into()));
         assert_eq!(split_think("<think>cut", "").0, "");

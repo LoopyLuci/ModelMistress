@@ -58,7 +58,12 @@ pub fn slug(s: &str) -> String {
     }
     let mut out = parts.join(".");
     if out.len() > 60 {
-        out = out.chars().take(60).collect::<String>().trim_end_matches(['.', '-']).to_string();
+        out = out
+            .chars()
+            .take(60)
+            .collect::<String>()
+            .trim_end_matches(['.', '-'])
+            .to_string();
     }
     out
 }
@@ -137,7 +142,10 @@ mod tests {
     #[test]
     fn normalisation_ignores_case_punctuation_and_spacing() {
         assert_eq!(normalize("  How do I -- cancel a Task?  "), "how do i cancel a task");
-        assert_eq!(text_hash("How do I cancel a task?"), text_hash("how  do i CANCEL a task"));
+        assert_eq!(
+            text_hash("How do I cancel a task?"),
+            text_hash("how  do i CANCEL a task")
+        );
         assert_ne!(text_hash("a b"), text_hash("a c"));
     }
 
@@ -145,7 +153,10 @@ mod tests {
     fn slugs_make_valid_km_ids() {
         assert_eq!(slug("code/rust/async"), "code.rust.async");
         assert_eq!(slug("Async Rust, with tokio!"), "async-rust-with-tokio");
-        assert!(crate::km::manifest::valid_id(&format!("data.{}", slug("C++/Templates & more"))));
+        assert!(crate::km::manifest::valid_id(&format!(
+            "data.{}",
+            slug("C++/Templates & more")
+        )));
         assert_eq!(slug("///"), "");
     }
 

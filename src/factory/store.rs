@@ -298,7 +298,10 @@ impl Db {
     pub fn set_summary(&self, id: &str, summary: &Value) -> Res<()> {
         self.conn
             .lock()
-            .execute("UPDATE tasks SET summary = ?2 WHERE id = ?1", params![id, jstr(summary)])
+            .execute(
+                "UPDATE tasks SET summary = ?2 WHERE id = ?1",
+                params![id, jstr(summary)],
+            )
             .map_err(db)?;
         Ok(())
     }
@@ -883,7 +886,10 @@ impl Db {
     pub fn clear_artifacts_stage(&self, task: &str, stage: &str) -> Res<()> {
         self.conn
             .lock()
-            .execute("DELETE FROM artifacts WHERE task = ?1 AND stage = ?2", params![task, stage])
+            .execute(
+                "DELETE FROM artifacts WHERE task = ?1 AND stage = ?2",
+                params![task, stage],
+            )
             .map_err(db)?;
         Ok(())
     }

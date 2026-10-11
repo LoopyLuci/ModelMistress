@@ -49,9 +49,37 @@ fn on(args: &[String], name: &str) -> bool {
 }
 
 const VALUE_FLAGS: &[&str] = &[
-    "author", "reviewer", "base", "domain", "name", "source", "glob", "kind", "records", "max-tokens", "wall-s",
-    "approval", "review", "device-author", "device-reviewer", "device-base", "device-embedder", "eval-set", "spec",
-    "state", "logs", "status", "file", "changes", "from", "task", "limit", "by", "note", "license", "per-call",
+    "author",
+    "reviewer",
+    "base",
+    "domain",
+    "name",
+    "source",
+    "glob",
+    "kind",
+    "records",
+    "max-tokens",
+    "wall-s",
+    "approval",
+    "review",
+    "device-author",
+    "device-reviewer",
+    "device-base",
+    "device-embedder",
+    "eval-set",
+    "spec",
+    "state",
+    "logs",
+    "status",
+    "file",
+    "changes",
+    "from",
+    "task",
+    "limit",
+    "by",
+    "note",
+    "license",
+    "per-call",
 ];
 
 /// The positional words: everything that is neither a flag nor a flag's value.
@@ -77,7 +105,9 @@ fn abs(p: &str) -> String {
 }
 
 fn source(s: &str, globs: &[&str]) -> Result<Value, String> {
-    let (kind, v) = s.split_once(':').ok_or_else(|| format!("--source {s:?} must look like kind:value"))?;
+    let (kind, v) = s
+        .split_once(':')
+        .ok_or_else(|| format!("--source {s:?} must look like kind:value"))?;
     Ok(match kind {
         "dir" => {
             let mut j = json!({"kind": "dir", "path": abs(v)});
@@ -92,7 +122,11 @@ fn source(s: &str, globs: &[&str]) -> Result<Value, String> {
         "km" => json!({"kind": "km", "id": v}),
         "tool" => json!({"kind": "tool", "name": v}),
         "traces" => json!({"kind": "traces", "query": v}),
-        _ => return Err(format!("--source kind {kind:?} must be dir, file, url, km, skill, tool or traces")),
+        _ => {
+            return Err(format!(
+                "--source kind {kind:?} must be dir, file, url, km, skill, tool or traces"
+            ))
+        }
     })
 }
 
@@ -126,13 +160,25 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
             if !pos.is_empty() {
                 a["goal"] = json!(pos.join(" "));
             }
-            for (f, k) in [("author", "author"), ("reviewer", "reviewer"), ("base", "base"), ("domain", "domain"), ("name", "name"), ("approval", "approval"), ("license", "license")] {
+            for (f, k) in [
+                ("author", "author"),
+                ("reviewer", "reviewer"),
+                ("base", "base"),
+                ("domain", "domain"),
+                ("name", "name"),
+                ("approval", "approval"),
+                ("license", "license"),
+            ] {
                 if let Some(v) = flag(rest, f) {
                     a[k] = json!(v);
                 }
             }
             if let Some(v) = flag(rest, "kind") {
-                a["kinds"] = json!(v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>());
+                a["kinds"] = json!(v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>());
             }
             // globs apply to the dir sources
             let globs = flags(rest, "glob");
@@ -155,7 +201,12 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
             if let Some(v) = flag(rest, "review") {
                 a["tagging"]["review"] = json!(v);
             }
-            for (f, k) in [("device-author", "author"), ("device-reviewer", "reviewer"), ("device-base", "base"), ("device-embedder", "embedder")] {
+            for (f, k) in [
+                ("device-author", "author"),
+                ("device-reviewer", "reviewer"),
+                ("device-base", "base"),
+                ("device-embedder", "embedder"),
+            ] {
                 if let Some(v) = flag(rest, f) {
                     a["device"][k] = json!(v);
                 }
@@ -175,7 +226,10 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
             }
             ("factory.task.create".into(), a)
         }
-        "list" => ("factory.task.list".into(), flag(rest, "state").map_or(json!({}), |s| json!({"state": s}))),
+        "list" => (
+            "factory.task.list".into(),
+            flag(rest, "state").map_or(json!({}), |s| json!({"state": s})),
+        ),
         "get" => {
             let mut a = json!({"id": need(0, "a task id")?});
             if let Some(n) = num(rest, "logs")? {
@@ -192,7 +246,10 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
             }
             ("factory.task.get".into(), a)
         }
-        "plan" => ("factory.task.get".into(), json!({"id": need(0, "a task id")?, "logs": 0})),
+        "plan" => (
+            "factory.task.get".into(),
+            json!({"id": need(0, "a task id")?, "logs": 0}),
+        ),
         "plan-edit" => {
             let mut a = json!({"id": need(0, "a task id")?});
             if let Some(f) = flag(rest, "file") {
@@ -219,7 +276,9 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
         }
         "cancel" => ("factory.task.cancel".into(), json!({"id": need(0, "a task id")?})),
         "review" if pos.first().map(String::as_str) == Some("decide") => {
-            let item: i64 = need(1, "a review item number")?.parse().map_err(|_| "the item must be a number".to_string())?;
+            let item: i64 = need(1, "a review item number")?
+                .parse()
+                .map_err(|_| "the item must be a number".to_string())?;
             let mut a = json!({"item": item, "decision": need(2, "approve, reject or edit")?});
             for (f, k) in [("by", "by"), ("note", "note")] {
                 if let Some(v) = flag(rest, f) {
@@ -264,7 +323,14 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
                 let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv:?}: give key=value"))?;
                 patch.insert(k.into(), serde_json::from_str(v).unwrap_or_else(|_| json!(v)));
             }
-            ("factory.settings".into(), if patch.is_empty() { json!({}) } else { json!({"settings": patch}) })
+            (
+                "factory.settings".into(),
+                if patch.is_empty() {
+                    json!({})
+                } else {
+                    json!({"settings": patch})
+                },
+            )
         }
         "embedder" if pos.first().map(String::as_str) == Some("setup") => {
             let mut a = json!({"model": need(1, "a hub model id")?});
@@ -341,14 +407,23 @@ mod tests {
         let (op, a) = p("create Async Rust with tokio --author dusty --reviewer q4 --source file:docs/a.md --source tool:km.list --kind data,memory,tool --records 30 --max-tokens 9000 --wall-s 60 --device-author cpu --plan-approval --no-start").unwrap();
         assert_eq!(op, "factory.task.create");
         assert_eq!(a["goal"], "Async Rust with tokio");
-        assert_eq!((a["author"].as_str(), a["reviewer"].as_str()), (Some("dusty"), Some("q4")));
+        assert_eq!(
+            (a["author"].as_str(), a["reviewer"].as_str()),
+            (Some("dusty"), Some("q4"))
+        );
         assert_eq!(a["sources"].as_array().unwrap().len(), 2);
         assert_eq!(a["sources"][1], json!({"kind": "tool", "name": "km.list"}));
         assert_eq!(a["kinds"], json!(["data", "memory", "tool"]));
-        assert_eq!((a["size"]["records"].as_u64(), a["size"]["max_tokens"].as_u64()), (Some(30), Some(9000)));
+        assert_eq!(
+            (a["size"]["records"].as_u64(), a["size"]["max_tokens"].as_u64()),
+            (Some(30), Some(9000))
+        );
         assert_eq!(a["budget"]["wall_s"], 60);
         assert_eq!(a["device"]["author"], "cpu");
-        assert_eq!((a["plan_approval"].as_bool(), a["start"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(
+            (a["plan_approval"].as_bool(), a["start"].as_bool()),
+            (Some(true), Some(false))
+        );
     }
 
     #[test]
@@ -363,16 +438,34 @@ mod tests {
 
     #[test]
     fn the_other_commands_map_to_operations() {
-        assert_eq!(p("resume ft-1 --from verify").unwrap().1, json!({"id": "ft-1", "from": "verify"}));
+        assert_eq!(
+            p("resume ft-1 --from verify").unwrap().1,
+            json!({"id": "ft-1", "from": "verify"})
+        );
         assert_eq!(p("cancel ft-1").unwrap().0, "factory.task.cancel");
         let (op, a) = p("review decide 7 approve --by me").unwrap();
-        assert_eq!((op.as_str(), a["item"].as_i64(), a["by"].as_str()), ("factory.review.decide", Some(7), Some("me")));
-        assert_eq!(p("review --task ft-1 --kind tag").unwrap().1, json!({"task": "ft-1", "kind": "tag"}));
-        assert_eq!(p("vocabulary add lib tokio rayon").unwrap().1, json!({"namespace": "lib", "add": ["tokio", "rayon"]}));
+        assert_eq!(
+            (op.as_str(), a["item"].as_i64(), a["by"].as_str()),
+            ("factory.review.decide", Some(7), Some("me"))
+        );
+        assert_eq!(
+            p("review --task ft-1 --kind tag").unwrap().1,
+            json!({"task": "ft-1", "kind": "tag"})
+        );
+        assert_eq!(
+            p("vocabulary add lib tokio rayon").unwrap().1,
+            json!({"namespace": "lib", "add": ["tokio", "rayon"]})
+        );
         let (_, a) = p("settings promotion=auto min_uplift=0.1").unwrap();
         assert_eq!(a["settings"]["promotion"], "auto");
         assert_eq!(a["settings"]["min_uplift"], 0.1);
-        assert_eq!(p("plan-edit ft-1 --approve").unwrap().1, json!({"id": "ft-1", "approve": true}));
-        assert_eq!(p("embedder setup hf.co/x/y:Q8_0 --name mm-embed-1").unwrap().1["name"], "mm-embed-1");
+        assert_eq!(
+            p("plan-edit ft-1 --approve").unwrap().1,
+            json!({"id": "ft-1", "approve": true})
+        );
+        assert_eq!(
+            p("embedder setup hf.co/x/y:Q8_0 --name mm-embed-1").unwrap().1["name"],
+            "mm-embed-1"
+        );
     }
 }
