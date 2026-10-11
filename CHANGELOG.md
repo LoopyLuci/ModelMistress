@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.1 — 2026-10-11
+
+The desktop app, ready for daily use.
+
+### Desktop app
+- **An installable Windows app** (NSIS per-user installer, and an MSI). It ships the hub beside it, starts it when
+  the app opens (or uses a hub that already runs) and stops it on quit only if the app started it
+  (`desktop.json` `{"stop_hub_on_quit": false}` or `MM_STOP_HUB_ON_QUIT=0` keeps it running). Tray: Open, Stop hub,
+  Quit. A starting screen, and an error screen with Try again.
+- **Chat**, the landing page: streaming replies with markdown, collapsible reasoning, Stop (or Esc), conversations,
+  and a link from a reply to its trace.
+- **Models**: load and unload with options, including experts on the CPU (`--cpu-moe`, `--n-cpu-moe`); pull by name;
+  ModelMistress's own native models are listed (a GGUF with its `dusty.json` beside it), with experts on the CPU by
+  default.
+- **Status** (RAM, the loaded model's memory and buffers), **Settings**, **Speech**, **Images** and **Vision** pages.
+  The old Swarm page is gone.
+- Moved to Tauri 2. The window reaches the hub through a loopback relay that adds CORS headers for the app's own
+  origins only (it adds no credentials). The content security policy allows only `http://127.0.0.1`.
+
+### Hub
+- `service.status` reports system RAM; a loaded model reports its resident memory and buffers.
+
+### Also in this release
+- **The Forge** (`docs/native/forge.md`): an optional Python/PyTorch environment the hub runs; Dusty-1.0 (Qwen3.5-4B
+  as `qwen35moe`) converts and answers token for token like its base.
+- **The Knowledge Module factory** (`docs/native/km-factory.md`): tasks from plan to publish, with review.
+
 ## 0.2.0 — 2026-10-10
 
 The first release of ModelMistress as a standalone model hub.
