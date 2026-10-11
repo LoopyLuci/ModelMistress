@@ -95,11 +95,12 @@ pub fn operations() -> Vec<Value> {
         ),
         op(
             "trace.settings",
-            "Show or change tracing: enabled, top_k (alternatives per token), max_age_days, max_total_mb",
+            "Show or change tracing: enabled, top_k (alternatives per token), routing (record the experts a MoE model picks), max_age_days, max_total_mb",
             true,
             false,
             json!({
                 "enabled": {"type": "boolean"}, "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+                "routing": {"type": "boolean"},
                 "max_age_days": {"type": "integer", "minimum": 0}, "max_total_mb": {"type": "integer", "minimum": 0}
             }),
             &[],

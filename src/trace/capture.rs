@@ -4,8 +4,12 @@
 //! lets the answer through unchanged (the log probabilities the client did not ask for are taken out again), and
 //! records the prompt, the model's reasoning apart from its answer, every token with its alternatives and entropy,
 //! the timings, the adapters attached, and RAM at the start and the end. Streaming and not streaming both work.
+//! For a mixture-of-experts model it can also ask for the experts each layer picked per token (`mm_routing`, answered
+//! by the patched llama-server, see `engines/patches`): they go into the token records, and a summary per layer
+//! into `routing` events.
 //! With tracing off none of this runs: [`wants`] is the only cost.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +20,7 @@ use axum::response::Response;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use super::store::{entropy, now_ms, NO_ID};
+use super::store::{encode_routing, entropy, now_ms, RouteLayer, NO_ID};
 use super::{tracer, Alt, Scope, Stage, TokenRec, Tracer};
 use crate::engine::{Engine, Fail, Target};
 use crate::hub::Hub;
@@ -91,11 +95,37 @@ fn lp_of(t: &Value) -> f32 {
     t["logprob"].as_f64().unwrap_or(0.0).max(-1.0e4) as f32
 }
 
-/// The tokens of one `logprobs.content` array.
-fn tokens_of(content: &Value, k: usize, ph: &mut Phase) -> Vec<TokenRec> {
+/// The layers of one token's `mm_routing` (`[{layer, experts, weights}]`).
+fn route_of(v: &Value) -> Vec<RouteLayer> {
+    let Some(arr) = v.as_array() else { return vec![] };
+    arr.iter()
+        .filter_map(|l| {
+            let layer = u32::try_from(l["layer"].as_u64()?).ok()?;
+            let experts: Vec<u32> = l["experts"]
+                .as_array()?
+                .iter()
+                .filter_map(|e| e.as_u64().and_then(|e| u32::try_from(e).ok()))
+                .collect();
+            let weights: Vec<f32> = l["weights"]
+                .as_array()?
+                .iter()
+                .map(|w| w.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            (!experts.is_empty() && experts.len() == weights.len()).then_some(RouteLayer {
+                layer,
+                experts,
+                weights,
+            })
+        })
+        .collect()
+}
+
+/// The tokens of one `logprobs.content` array; `routing` holds the experts per token (the same order), or is null.
+fn tokens_of(content: &Value, k: usize, ph: &mut Phase, routing: &Value) -> Vec<TokenRec> {
     let Some(arr) = content.as_array() else { return vec![] };
     arr.iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let text = token_text(t);
             let alts: Vec<Alt> = t["top_logprobs"]
                 .as_array()
@@ -117,7 +147,7 @@ fn tokens_of(content: &Value, k: usize, ph: &mut Phase) -> Vec<TokenRec> {
                 entropy: entropy(alts.iter().map(|a| a.logprob)),
                 phase,
                 alts,
-                routing: vec![],
+                routing: encode_routing(&route_of(&routing[i])),
                 text,
             }
         })
@@ -141,14 +171,17 @@ pub fn split_think(content: &str) -> (String, String) {
 }
 
 /// Make a response what the client asked for: no `logprobs` unless they asked, and no more alternatives than they
-/// asked for. Returns whether anything changed.
-fn shape(v: &mut Value, client_top: Option<usize>) -> bool {
+/// asked for, and no `mm_routing` unless they asked. Returns whether anything changed.
+fn shape(v: &mut Value, client_top: Option<usize>, strip_routing: bool) -> bool {
     let mut changed = false;
     let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) else {
         return false;
     };
     for c in choices {
         let Some(o) = c.as_object_mut() else { continue };
+        if strip_routing {
+            changed |= o.remove("mm_routing").is_some();
+        }
         match client_top {
             None => changed |= o.remove("logprobs").is_some(),
             Some(n) => {
@@ -247,6 +280,9 @@ struct Rec {
     first_token: Option<Instant>,
     sent: Option<Instant>,
     res_start: Value,
+    /// Gate weight summed per layer and expert over the answer, and how many tokens had routing.
+    route_sum: BTreeMap<u32, BTreeMap<u32, f64>>,
+    route_tokens: u64,
     done: bool,
 }
 
@@ -267,6 +303,17 @@ impl Rec {
     }
 
     fn push(&mut self, toks: Vec<TokenRec>) {
+        for t in &toks {
+            if let Some(layers) = super::store::decode_routing(&t.routing) {
+                self.route_tokens += 1;
+                for l in layers {
+                    let row = self.route_sum.entry(l.layer).or_default();
+                    for (e, w) in l.experts.iter().zip(&l.weights) {
+                        *row.entry(*e).or_default() += *w as f64;
+                    }
+                }
+            }
+        }
         self.pending.extend(toks);
         if self.pending.len() >= 16 || self.flushed.elapsed() > Duration::from_millis(100) {
             self.flush();
@@ -299,7 +346,12 @@ impl Rec {
             self.phase.reasoning = false;
         }
         self.content.push_str(t);
-        let toks = tokens_of(&c["logprobs"]["content"], self.k, &mut self.phase);
+        // one token per chunk: its routing is one list of layers
+        let routing = match c.get("mm_routing") {
+            Some(r) if r.as_array().is_some_and(|a| !a.is_empty()) => json!([r]),
+            _ => Value::Null,
+        };
+        let toks = tokens_of(&c["logprobs"]["content"], self.k, &mut self.phase, &routing);
         self.push(toks);
     }
 
@@ -314,8 +366,22 @@ impl Rec {
         self.reasoning_hint = m["reasoning_content"].as_str().unwrap_or("").to_string();
         let first = c["logprobs"]["content"].get(0).map(token_text).unwrap_or_default();
         self.phase.reasoning = !self.reasoning_hint.is_empty() && !first.contains("<think>");
-        let toks = tokens_of(&c["logprobs"]["content"], self.k, &mut self.phase);
+        let toks = tokens_of(&c["logprobs"]["content"], self.k, &mut self.phase, &c["mm_routing"]);
         self.push(toks);
+    }
+
+    /// One `routing` event per layer: the experts that fired over the answer and their summed gate weights (the
+    /// heat map adds them up). The per-token detail is in the token records.
+    fn emit_routing(&mut self) {
+        for (layer, row) in std::mem::take(&mut self.route_sum) {
+            let experts: Vec<u32> = row.keys().copied().collect();
+            let weights: Vec<f64> = row.values().map(|w| (w * 1e4).round() / 1e4).collect();
+            self.tr.event(
+                &self.id,
+                "routing",
+                json!({"token": null, "tokens": self.route_tokens, "layer": layer, "experts": experts, "weights": weights}),
+            );
+        }
     }
 
     fn finish(&mut self, status: &str, error: Option<&str>, res_end: Option<Value>) {
@@ -324,6 +390,7 @@ impl Rec {
         }
         self.done = true;
         self.flush();
+        self.emit_routing();
         let (reasoning, answer) = if self.reasoning_hint.trim().is_empty() {
             split_think(&self.content)
         } else {
@@ -379,6 +446,8 @@ struct Run {
     body: Value,
     /// What the client sees: None = no log probabilities, Some(n) = n alternatives.
     client_top: Option<usize>,
+    /// The hub asked for `mm_routing` on its own, so the client does not get it back.
+    strip_routing: bool,
     stream: bool,
 }
 
@@ -439,6 +508,12 @@ async fn begin(hub: &Hub, orig: &Value, parent: Option<&str>, meta: Value, scope
     body["logprobs"] = json!(true);
     body["top_logprobs"] = json!(k.max(client_top.unwrap_or(0)));
     body["model"] = json!(entry.id);
+    // expert routing: when the client asks for it, or the tracing settings do (the client then does not see it)
+    let client_routing = orig["mm_routing"].as_bool() == Some(true);
+    let strip_routing = !client_routing && tr.settings().routing;
+    if strip_routing {
+        body["mm_routing"] = json!(true);
+    }
 
     let mut params = serde_json::Map::new();
     for key in PARAM_KEYS {
@@ -479,6 +554,8 @@ async fn begin(hub: &Hub, orig: &Value, parent: Option<&str>, meta: Value, scope
         first_token: None,
         sent: None,
         res_start,
+        route_sum: BTreeMap::new(),
+        route_tokens: 0,
         done: false,
     };
     tr.update(&id, json!({"params": params, "prompt": last_user_text(orig)}));
@@ -504,6 +581,7 @@ async fn begin(hub: &Hub, orig: &Value, parent: Option<&str>, meta: Value, scope
         rec,
         body,
         client_top,
+        strip_routing,
         stream,
     })
 }
@@ -585,7 +663,7 @@ async fn read_whole(hub: &Hub, mut run: Run) -> Result<(Reply, String), Fail> {
                 }
             }
             run.rec.finish("ok", None, res);
-            if shape(&mut v, run.client_top) {
+            if shape(&mut v, run.client_top, run.strip_routing) {
                 Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
             } else {
                 bytes
@@ -655,6 +733,7 @@ async fn read_stream(hub: &Hub, mut run: Run) -> Result<Response, Fail> {
         .record(&run.rec.model, true, t0.elapsed().as_millis() as u64, None);
     let engine = hub.engine.clone();
     let client_top = run.client_top;
+    let strip_routing = run.strip_routing;
     let k = run.rec.k;
     let mut up = resp.bytes_stream();
     let body = async_stream::stream! {
@@ -667,13 +746,13 @@ async fn read_stream(hub: &Hub, mut run: Run) -> Result<Response, Fail> {
                 Ok(c) => c,
                 Err(x) => { failed = Some(x.to_string()); break; }
             };
-            let untouched = client_top.is_some_and(|n| n >= k);
+            let untouched = client_top.is_some_and(|n| n >= k) && !strip_routing;
             for ev in sse.push(&chunk) {
                 let mut out = ev.clone();
                 if let Some(d) = data_of(&ev) {
                     if let Ok(mut v) = serde_json::from_str::<Value>(d) {
                         rec.feed_chunk(&v);
-                        if !untouched && shape(&mut v, client_top) {
+                        if !untouched && shape(&mut v, client_top, strip_routing) {
                             out = format!("data: {v}\n\n");
                         }
                     }
@@ -767,10 +846,10 @@ mod tests {
     fn the_client_sees_what_it_asked_for() {
         let lp = json!({"content": [{"token": "a", "logprob": -0.1, "top_logprobs": [{"token": "a"}, {"token": "b"}, {"token": "c"}]}]});
         let mut v = json!({"choices": [{"index": 0, "logprobs": lp}]});
-        assert!(shape(&mut v, None));
+        assert!(shape(&mut v, None, false));
         assert!(v["choices"][0].get("logprobs").is_none());
         let mut v = json!({"choices": [{"index": 0, "logprobs": lp}]});
-        assert!(shape(&mut v, Some(1)));
+        assert!(shape(&mut v, Some(1), false));
         assert_eq!(
             v["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
                 .as_array()
@@ -779,7 +858,41 @@ mod tests {
             1
         );
         let mut v = json!({"choices": [{"index": 0, "logprobs": lp}]});
-        assert!(!shape(&mut v, Some(5)));
+        assert!(!shape(&mut v, Some(5), false));
+    }
+
+    #[test]
+    fn routing_is_read_per_token_and_malformed_layers_are_skipped() {
+        let c = json!([{"token": "a", "logprob": -0.1, "top_logprobs": []}, {"token": "b", "logprob": -0.1, "top_logprobs": []}]);
+        let r = json!([
+            [{"layer": 0, "experts": [1, 5], "weights": [0.6, 0.4]},
+             {"layer": 1, "experts": [1], "weights": [0.6, 0.4]},
+             {"layer": 2, "experts": "x", "weights": []}],
+            []
+        ]);
+        let t = tokens_of(&c, 4, &mut Phase::default(), &r);
+        let first = super::super::store::decode_routing(&t[0].routing).unwrap();
+        assert_eq!(first.len(), 1, "only the well-formed layer");
+        assert_eq!(
+            (first[0].layer, first[0].experts.clone(), first[0].weights.clone()),
+            (0, vec![1, 5], vec![0.6, 0.4])
+        );
+        assert!(t[1].routing.is_empty());
+        assert!(tokens_of(&c, 4, &mut Phase::default(), &Value::Null)[0]
+            .routing
+            .is_empty());
+    }
+
+    #[test]
+    fn routing_the_client_did_not_ask_for_is_taken_out() {
+        let mk =
+            || json!({"choices": [{"index": 0, "mm_routing": [[{"layer": 0, "experts": [1], "weights": [1.0]}]]}]});
+        let mut v = mk();
+        assert!(shape(&mut v, Some(1), true));
+        assert!(v["choices"][0].get("mm_routing").is_none());
+        let mut v = mk();
+        assert!(!shape(&mut v, Some(1), false));
+        assert!(v["choices"][0].get("mm_routing").is_some());
     }
 
     #[test]
@@ -796,10 +909,10 @@ mod tests {
     fn tokens_carry_alternatives_and_entropy() {
         let c = json!([{"token": "Hi", "logprob": -0.1, "bytes": [72, 105],
                         "top_logprobs": [{"token": "Hi", "logprob": -0.69}, {"token": "Yo", "logprob": -0.69}]}]);
-        let t = tokens_of(&c, 8, &mut Phase::default());
+        let t = tokens_of(&c, 8, &mut Phase::default(), &Value::Null);
         assert_eq!(t[0].text, "Hi");
         assert_eq!(t[0].alts.len(), 2);
         assert!((t[0].entropy - 0.693).abs() < 0.01, "{}", t[0].entropy);
-        assert_eq!(tokens_of(&c, 1, &mut Phase::default())[0].alts.len(), 1);
+        assert_eq!(tokens_of(&c, 1, &mut Phase::default(), &Value::Null)[0].alts.len(), 1);
     }
 }

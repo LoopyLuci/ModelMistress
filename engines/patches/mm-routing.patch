@@ -1,0 +1,321 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fbfcbe5..8db7a22 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -18,6 +18,9 @@
+ #include "mtmd-helper.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstring>
++#include <map>
+ #include <cstddef>
+ #include <cinttypes>
+ #include <exception>
+@@ -38,6 +41,104 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++// ModelMistress: expert routing capture.
++// The graph evaluation callback is always installed, but it only asks for the MoE router outputs
++// (`ffn_moe_topk-<layer>`, `ffn_moe_weights-<layer>`) while a decode contains a token of a request with
++// "mm_routing": true. Everything else costs one atomic load per graph node. All of it runs on the decode thread.
++struct mm_routing_capture {
++    struct layer {
++        int32_t k = 0;
++        std::vector<int32_t> ids;     // row-major [n_tokens][k]
++        std::vector<float>   weights; // row-major [n_tokens][k]
++    };
++
++    std::atomic<bool> active{false};
++    std::map<int32_t, layer> layers;
++
++    static bool match(const ggml_tensor * t, const char * prefix, int32_t & il) {
++        const size_t n = strlen(prefix);
++        if (strncmp(t->name, prefix, n) != 0) {
++            return false;
++        }
++        char * end = nullptr;
++        il = (int32_t) strtol(t->name + n, &end, 10);
++        return end != t->name + n && *end == '\0'; // not the "(reshaped)" views
++    }
++
++    static bool cb(ggml_tensor * t, bool ask, void * user_data) {
++        auto * self = static_cast<mm_routing_capture *>(user_data);
++        if (!self->active.load(std::memory_order_relaxed)) {
++            return false;
++        }
++        int32_t il = -1;
++        const bool is_ids = match(t, "ffn_moe_topk-", il);
++        const bool is_w   = !is_ids && match(t, "ffn_moe_weights-", il);
++        if (!is_ids && !is_w) {
++            return false;
++        }
++        if (ask) {
++            return true;
++        }
++
++        // the tensors are views or strided: read the whole extent and walk it with the strides
++        std::vector<uint8_t> raw(ggml_nbytes(t));
++        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
++        auto & l = self->layers[il];
++        if (is_ids) {
++            if (t->type != GGML_TYPE_I32) {
++                return true;
++            }
++            l.k = (int32_t) t->ne[0];
++            for (int64_t r = 0; r < t->ne[1]; ++r) {
++                for (int64_t j = 0; j < t->ne[0]; ++j) {
++                    int32_t v;
++                    memcpy(&v, raw.data() + r*t->nb[1] + j*t->nb[0], sizeof(v));
++                    l.ids.push_back(v);
++                }
++            }
++        } else {
++            if (t->type != GGML_TYPE_F32) {
++                return true;
++            }
++            for (int64_t r = 0; r < t->ne[2]; ++r) {
++                for (int64_t j = 0; j < t->ne[1]; ++j) {
++                    float v;
++                    memcpy(&v, raw.data() + r*t->nb[2] + j*t->nb[1], sizeof(v));
++                    l.weights.push_back(v);
++                }
++            }
++        }
++        return true;
++    }
++
++    // The routing of one token of the decode that just ran. `row` is the token's index in the sub-batch;
++    // the last layer only computes the rows that are outputs, so it is found by `row_out` instead.
++    std::vector<completion_token_output::mm_route_layer> take(int32_t n_tokens, int32_t n_out, int32_t row, int32_t row_out) const {
++        std::vector<completion_token_output::mm_route_layer> out;
++        for (const auto & [il, l] : layers) {
++            if (l.k <= 0 || l.ids.size() != l.weights.size() || l.ids.size() % l.k != 0) {
++                continue;
++            }
++            const int32_t rows = (int32_t) (l.ids.size() / l.k);
++            int32_t r = -1;
++            if (rows == n_tokens) {
++                r = row;
++            } else if (rows == n_out) {
++                r = row_out;
++            }
++            if (r < 0 || r >= rows) {
++                continue;
++            }
++            completion_token_output::mm_route_layer e;
++            e.layer = il;
++            e.experts.assign(l.ids.begin() + (size_t) r*l.k, l.ids.begin() + (size_t) (r + 1)*l.k);
++            e.weights.assign(l.weights.begin() + (size_t) r*l.k, l.weights.begin() + (size_t) (r + 1)*l.k);
++            out.push_back(std::move(e));
++        }
++        return out;
++    }
++};
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+@@ -866,6 +967,8 @@ private:
+ 
+     server_batch batch;
+ 
++    mm_routing_capture mm_routing; // ModelMistress
++
+     llama_model   * model_dft = nullptr;
+     llama_context * ctx_dft   = nullptr;
+ 
+@@ -1077,6 +1180,9 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        params_base.cb_eval           = mm_routing_capture::cb; // ModelMistress: idle unless a request asks
++        params_base.cb_eval_user_data = &mm_routing;
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();
+@@ -2055,8 +2161,8 @@ private:
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
+-            res->prob_output = tkn; // copy the token probs
++        if (slot.task->params.sampling.n_probs > 0 || slot.task->params.mm_routing) {
++            res->prob_output = tkn; // copy the token probs (and the expert routing)
+         }
+ 
+         // populate timings if this is final response or timings_per_token is enabled
+@@ -2125,6 +2231,17 @@ private:
+             }
+         }
+ 
++        // ModelMistress: the expert routing of each generated token (same tokens as logprobs.content)
++        if (slot.task->params.mm_routing && !slot.task->params.stream) {
++            size_t n = slot.generated_token_probs.size();
++            if (slot.stop == STOP_TYPE_WORD) {
++                n -= std::min(n, common_tokenize(ctx_tgt, slot.stopping_word, false).size());
++            }
++            for (size_t i = 0; i < n; ++i) {
++                res->mm_routing.push_back(slot.generated_token_probs[i].mm_routing);
++            }
++        }
++
+         res->generation_params = slot.task->params; // copy the parameters
+ 
+         queue_results.send(std::move(res));
+@@ -3659,12 +3776,24 @@ private:
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
++
++        // ModelMistress: capture expert routing only if a token of a request that asks for it is sampled from this decode
++        mm_routing.layers.clear();
++        for (auto & slot : slots) {
++            if (slot.is_processing() && slot.task && slot.task->params.mm_routing &&
++                    slot.i_batch >= off && slot.i_batch < off + (int32_t) batch.view.size()) {
++                mm_routing.active = true;
++                break;
++            }
++        }
++
+         queue_tasks.yield_to_queue([&]() {
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
+         });
++        mm_routing.active = false;
+ 
+         if (ret != 0) {
+             {
+@@ -3863,6 +3992,20 @@ private:
+                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+             }
+ 
++            if (slot.task->params.mm_routing) {
++                // ModelMistress: this token's rank among the outputs of the sub-batch (the last layer only has those rows)
++                int32_t n_out = 0, row_out = -1;
++                for (int32_t i = 0; i < n_batch_tokens; ++i) {
++                    if (batch.tokens[off + i].output) {
++                        if (i == tok_idx) {
++                            row_out = n_out;
++                        }
++                        n_out++;
++                    }
++                }
++                result.mm_routing = mm_routing.take(n_batch_tokens, n_out, tok_idx, row_out);
++            }
++
+             if (!process_token(result, slot)) {
+                 // release slot because of stop condition
+                 slot.print_timings();
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 27ecafb..75f099a 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -37,6 +37,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("return_progress", params.return_progress))
+         ->set_desc("Include prompt processing progress events in stream mode"));
+ 
++    add((new field_bool("mm_routing", params.mm_routing))
++        ->set_desc("ModelMistress: report the experts chosen at each MoE layer for every generated token in `mm_routing`"));
++
+     add((new field_num("sse_ping_interval", params.sse_ping_interval))
+         ->set_hard_limits(-1, INT32_MAX)
+         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 0d3beb3..0d44311 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -261,6 +261,18 @@ static inline std::string stop_type_to_str(stop_type type) {
+ // completion_token_output
+ //
+ 
++json completion_token_output::mm_routing_to_json(const std::vector<mm_route_layer> & r) {
++    json out = json::array();
++    for (const auto & l : r) {
++        out.push_back(json{
++            {"layer",   l.layer},
++            {"experts", l.experts},
++            {"weights", l.weights},
++        });
++    }
++    return out;
++}
++
+ json completion_token_output::to_json(bool post_sampling_probs) const {
+     json probs_for_token = json::array();
+     for (const auto & p : probs) {
+@@ -436,6 +448,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+         };
+     }
+ 
++    if (!stream && generation_params.mm_routing) {
++        json per_token = json::array();
++        for (const auto & r : mm_routing) {
++            per_token.push_back(completion_token_output::mm_routing_to_json(r));
++        }
++        choice["mm_routing"] = per_token;
++    }
++
+     std::time_t t = std::time(0);
+ 
+     json res = json {
+@@ -1142,10 +1162,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
+         add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
+     }
+ 
++    if (deltas.empty() && !prob_output.mm_routing.empty()) {
++        add_delta(json::object()); // ModelMistress: a token that adds no text still carries its routing
++    }
++
+     if (!deltas.empty()) {
+         auto & last_json = deltas[deltas.size() - 1];
+         GGML_ASSERT(last_json.at("choices").size() >= 1);
+ 
++        if (!prob_output.mm_routing.empty()) {
++            last_json.at("choices").at(0)["mm_routing"] = completion_token_output::mm_routing_to_json(prob_output.mm_routing);
++        }
++
+         if (prob_output.probs.size() > 0) {
+             last_json.at("choices").at(0)["logprobs"] = json {
+                 {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143..b28dafe 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -53,6 +53,7 @@ struct task_params {
+     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+     bool return_tokens   = false;
+     bool return_progress = false;
++    bool mm_routing      = false; // ModelMistress: report the experts chosen for each generated token (MoE models)
+ 
+     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+ 
+@@ -307,6 +308,16 @@ struct completion_token_output {
+     };
+     std::vector<prob_info> probs;
+ 
++    // ModelMistress: the experts chosen at each MoE layer for this token (only when the request asks for mm_routing)
++    struct mm_route_layer {
++        int32_t layer;
++        std::vector<int32_t> experts;
++        std::vector<float>   weights;
++    };
++    std::vector<mm_route_layer> mm_routing;
++
++    static json mm_routing_to_json(const std::vector<mm_route_layer> & r);
++
+     json to_json(bool post_sampling_probs) const;
+ 
+     static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
+@@ -337,6 +348,7 @@ struct server_task_result_cmpl_final : server_task_result {
+ 
+     bool post_sampling_probs;
+     std::vector<completion_token_output> probs_output;
++    std::vector<std::vector<completion_token_output::mm_route_layer>> mm_routing; // per generated token (ModelMistress)
+     std::vector<std::string>  response_fields;
+ 
+     task_params generation_params;

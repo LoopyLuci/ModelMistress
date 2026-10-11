@@ -28,6 +28,12 @@ fn main() {
                 dir.display()
             );
         }
+        if name == "llama.cpp" {
+            // Our patch to llama.cpp (the submodule stays pinned; the patch is applied to its working tree).
+            let patches = engines.join("patches");
+            println!("cargo:rerun-if-changed={}", patches.display());
+            apply_patch(&src, &patches.join("mm-routing.patch"));
+        }
     }
     for f in [
         "CMakeLists.txt",
@@ -128,6 +134,39 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=MM_BUNDLED_SD_VERSION={sd_version}");
+}
+
+/// Applies `patch` to the working tree of the git checkout `dir`. Skips it when it is already applied (the reverse
+/// patch applies cleanly); stops the build when it applies neither way (the pinned llama.cpp moved on).
+fn apply_patch(dir: &Path, patch: &Path) {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .arg(patch)
+            .output()
+            .unwrap_or_else(|e| panic!("bundled-engine: could not run git to apply {}: {e}", patch.display()))
+    };
+    if git(&["apply", "--check", "--reverse"]).status.success() {
+        return; // already applied
+    }
+    let check = git(&["apply", "--check"]);
+    if !check.status.success() {
+        panic!(
+            "bundled-engine: {} does not apply to engines/llama.cpp: {}",
+            patch.display(),
+            String::from_utf8_lossy(&check.stderr).trim()
+        );
+    }
+    let done = git(&["apply"]);
+    if !done.status.success() {
+        panic!(
+            "bundled-engine: applying {} failed: {}",
+            patch.display(),
+            String::from_utf8_lossy(&done.stderr).trim()
+        );
+    }
 }
 
 /// Configures and builds `targets` of the CMake project in `src` into `build`. The flags in `flags` are the

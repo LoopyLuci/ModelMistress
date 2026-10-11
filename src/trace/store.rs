@@ -6,7 +6,7 @@
 //! ```text
 //! token id u32 (u32::MAX = unknown) | logprob f32 | entropy f32 | phase u8 (0 answer, 1 reasoning)
 //! | alternative count u8 | text length u16 | text bytes
-//! | routing length u16 | routing bytes            (reserved: per-layer expert routing; empty today)
+//! | routing length u16 | routing bytes            (per-layer expert routing, see `encode_routing`; empty if none)
 //! | per alternative: id u32 | logprob f32 | text length u16 | text bytes
 //! ```
 //!
@@ -46,18 +46,83 @@ pub struct TokenRec {
     /// 0 answer, 1 reasoning.
     pub phase: u8,
     pub alts: Vec<Alt>,
-    /// Reserved: per-layer expert routing (an opaque blob until a producer defines it).
+    /// Per-layer expert routing of a mixture-of-experts model, as [`encode_routing`] writes it (empty: none).
     pub routing: Vec<u8>,
+}
+
+/// The experts one MoE layer picked for one token, with their gate weights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteLayer {
+    pub layer: u32,
+    pub experts: Vec<u32>,
+    pub weights: Vec<f32>,
+}
+
+/// Routing blob: layer count u16, then per layer `layer u16 | k u8 | k x expert u16 | k x weight f32`. Layers that
+/// would not fit the record's u16 length are left out.
+pub fn encode_routing(layers: &[RouteLayer]) -> Vec<u8> {
+    let mut body = vec![];
+    let mut n = 0u16;
+    for l in layers {
+        let k = l.experts.len().min(l.weights.len()).min(255);
+        if body.len() + 3 + k * 6 + 2 > u16::MAX as usize {
+            break;
+        }
+        body.extend_from_slice(&(l.layer.min(u16::MAX as u32) as u16).to_le_bytes());
+        body.push(k as u8);
+        for e in &l.experts[..k] {
+            body.extend_from_slice(&(*e).min(u16::MAX as u32).to_le_bytes()[..2]);
+        }
+        for w in &l.weights[..k] {
+            body.extend_from_slice(&w.to_le_bytes());
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return vec![];
+    }
+    let mut out = n.to_le_bytes().to_vec();
+    out.extend(body);
+    out
+}
+
+/// The layers in a routing blob; None if it is not one.
+pub fn decode_routing(b: &[u8]) -> Option<Vec<RouteLayer>> {
+    let mut c = Cur(b);
+    let n = c.u16()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let layer = c.u16()? as u32;
+        let k = c.u8()? as usize;
+        let experts = (0..k).map(|_| c.u16().map(u32::from)).collect::<Option<Vec<_>>>()?;
+        let weights = (0..k).map(|_| c.f32()).collect::<Option<Vec<_>>>()?;
+        out.push(RouteLayer {
+            layer,
+            experts,
+            weights,
+        });
+    }
+    c.0.is_empty().then_some(out)
 }
 
 impl TokenRec {
     pub fn to_json(&self, i: usize) -> Value {
+        let routing = if self.routing.is_empty() {
+            Value::Null
+        } else if let Some(ls) = decode_routing(&self.routing) {
+            json!(ls
+                .iter()
+                .map(|l| json!({"layer": l.layer, "experts": l.experts, "weights": l.weights}))
+                .collect::<Vec<_>>())
+        } else {
+            json!(self.routing.len())
+        };
         json!({"i": i, "id": if self.id == NO_ID { Value::Null } else { json!(self.id) }, "text": self.text,
                "logprob": self.logprob, "p": self.logprob.exp(), "entropy": self.entropy,
                "phase": if self.phase == 1 { "reasoning" } else { "answer" },
                "alts": self.alts.iter().map(|a| json!({"id": if a.id == NO_ID { Value::Null } else { json!(a.id) },
                       "text": a.text, "logprob": a.logprob, "p": a.logprob.exp()})).collect::<Vec<_>>(),
-               "routing": if self.routing.is_empty() { Value::Null } else { json!(self.routing.len()) }})
+               "routing": routing})
     }
 }
 
