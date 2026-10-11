@@ -3,7 +3,7 @@
 //!
 //! The working core is `catalog` (what models are on this machine), `engine` (llama.cpp processes, Ollama
 //! pass-through), `hub` (the HTTP server), `audio` and `speech` (speech to text), `tts` (text to speech), `tools`
-//! (quantize, LoRA, draft models, embeddings, rerank), `km` (Knowledge Modules), `factory` (makes them), `vision` (image recognition), `hosting` (keys, quotas and
+//! (quantize, LoRA, draft models, embeddings, rerank), `km` (Knowledge Modules), `factory` (makes them), `forge` (the training system: a managed Python worker), `vision` (image recognition), `hosting` (keys, quotas and
 //! usage for peers) and `client` (the CLI's, MCP's and the desktop app's way to a running hub).
 
 pub mod audio;
@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod client;
 pub mod engine;
 pub mod factory;
+pub mod forge;
 pub mod hosting;
 pub mod hub;
 pub mod image;

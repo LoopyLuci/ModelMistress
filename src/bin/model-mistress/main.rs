@@ -219,8 +219,102 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// The Forge, ModelMistress's training system: `forge status`, `forge install`, `forge preflight`,
+    /// `forge run <step> <json>`, `forge runs`, `forge show <run>`, `forge cancel <run>`.
+    Forge {
+        #[command(subcommand)]
+        cmd: ForgeCmd,
+    },
     /// Serve the operations as MCP tools over stdio (the hub must be running).
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum ForgeCmd {
+    /// Where the Forge lives, whether it is installed, the last preflight.
+    Status,
+    /// Create the Forge's Python environment, install the pinned requirements (PyTorch for ROCm), run the preflight.
+    Install {
+        /// The Python that creates the environment (default: forge_python, MM_FORGE_PYTHON, else `python`).
+        #[arg(long)]
+        python: Option<String>,
+        /// A requirements file (default: forge/requirements-rocm-windows.txt).
+        #[arg(long)]
+        requirements: Option<PathBuf>,
+        #[arg(long)]
+        skip_preflight: bool,
+    },
+    /// Prove that an optimizer step really runs on the GPU.
+    Preflight,
+    /// Run a pipeline step with JSON arguments and follow it.
+    Run {
+        step: String,
+        args: Option<String>,
+        /// Start it and return at once.
+        #[arg(long)]
+        detach: bool,
+        /// Stop after this many seconds.
+        #[arg(long)]
+        timeout_s: Option<u64>,
+    },
+    /// The runs, newest first.
+    Runs {
+        #[arg(long)]
+        step: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u64,
+    },
+    /// One run: result, metrics, artifacts, the end of its log.
+    Show {
+        run: String,
+        /// Only this metric.
+        #[arg(long)]
+        metric: Option<String>,
+    },
+    /// Stop a run and its process tree.
+    Cancel { run: String },
+    /// Load a model on the engine its format needs: `load <id or path> [--device auto|gpu|cpu] [--plan-only]`.
+    Load {
+        model: String,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        plan_only: bool,
+    },
+    /// Generate with a model the Forge worker serves (tokens with logprobs as JSON).
+    Generate {
+        model: String,
+        prompt: String,
+        #[arg(long, default_value_t = 64)]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f64,
+        #[arg(long, default_value_t = 0)]
+        top_logprobs: u32,
+    },
+    /// Stop the Forge worker serving a model.
+    Unload { model: String },
+}
+
+/// Follows a job until it ends, showing its progress on stderr; returns its final description.
+async fn follow(c: &Client, job: &Value) -> anyhow::Result<Value> {
+    let id = job["job"].as_str().unwrap_or("").to_string();
+    loop {
+        let j = c.call("job.get", json!({"job": id})).await?;
+        let status = j["status"].as_str().unwrap_or("").to_string();
+        eprint!(
+            "\r{:>5.1}%  {:<70}",
+            j["percent"].as_f64().unwrap_or(0.0),
+            j["message"].as_str().unwrap_or("").chars().take(70).collect::<String>()
+        );
+        if status != "running" {
+            eprintln!();
+            return Ok(j);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 #[derive(Subcommand)]
@@ -693,6 +787,120 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         }
         Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
         Cmd::Factory { args } => model_mistress::factory::cli::run(&home, args).await?,
+        Cmd::Forge { cmd } => {
+            let c = client().await?;
+            match cmd {
+                ForgeCmd::Status => show(&c.call("forge.status", json!({})).await?),
+                ForgeCmd::Install {
+                    python,
+                    requirements,
+                    skip_preflight,
+                } => {
+                    let mut a = json!({"skip_preflight": skip_preflight});
+                    if let Some(p) = python {
+                        a["python"] = json!(p);
+                    }
+                    if let Some(r) = requirements {
+                        a["requirements"] = json!(std::path::absolute(&r)?);
+                    }
+                    let job = c.call("forge.install", a).await?;
+                    eprintln!("run {}", job["run"].as_str().unwrap_or(""));
+                    let j = follow(&c, &job).await?;
+                    if j["status"] != "done" {
+                        anyhow::bail!(
+                            "{}: {}",
+                            j["status"].as_str().unwrap_or(""),
+                            j["message"].as_str().unwrap_or("")
+                        );
+                    }
+                    show(&j["result"]);
+                }
+                ForgeCmd::Preflight => show(&c.call("forge.preflight", json!({})).await?),
+                ForgeCmd::Run {
+                    step,
+                    args,
+                    detach,
+                    timeout_s,
+                } => {
+                    let a: Value = match args {
+                        Some(s) => serde_json::from_str(&s)?,
+                        None => json!({}),
+                    };
+                    let mut req = json!({"step": step, "args": a});
+                    if let Some(t) = timeout_s {
+                        req["timeout_s"] = json!(t);
+                    }
+                    let job = c.call("forge.run", req).await?;
+                    eprintln!("run {}", job["run"].as_str().unwrap_or(""));
+                    if detach {
+                        show(&job);
+                    } else {
+                        let j = follow(&c, &job).await?;
+                        if j["status"] != "done" {
+                            anyhow::bail!(
+                                "{}: {}",
+                                j["status"].as_str().unwrap_or(""),
+                                j["message"].as_str().unwrap_or("")
+                            );
+                        }
+                        show(&j["result"]["result"]);
+                    }
+                }
+                ForgeCmd::Runs { step, status, limit } => {
+                    let mut a = json!({"limit": limit});
+                    if let Some(s) = step {
+                        a["step"] = json!(s);
+                    }
+                    if let Some(s) = status {
+                        a["status"] = json!(s);
+                    }
+                    for r in c.call("forge.runs", a).await?.as_array().cloned().unwrap_or_default() {
+                        println!(
+                            "{:<26} {:<14} {:<11} {:>8}  {}",
+                            r["run"].as_str().unwrap_or(""),
+                            r["step"].as_str().unwrap_or(""),
+                            r["status"].as_str().unwrap_or(""),
+                            r["seconds"].as_f64().map_or("-".to_string(), |x| format!("{x:.1}s")),
+                            r["error"].as_str().unwrap_or("").lines().next().unwrap_or("")
+                        );
+                    }
+                }
+                ForgeCmd::Show { run, metric } => {
+                    let mut a = json!({"run": run});
+                    if let Some(m) = metric {
+                        a["metric"] = json!(m);
+                    }
+                    show(&c.call("forge.run.get", a).await?);
+                }
+                ForgeCmd::Cancel { run } => show(&c.call("forge.run.cancel", json!({"run": run})).await?),
+                ForgeCmd::Load {
+                    model,
+                    device,
+                    plan_only,
+                } => {
+                    let mut a = json!({"model": model, "plan_only": plan_only});
+                    if let Some(d) = device {
+                        a["device"] = json!(d);
+                    }
+                    show(&c.call("forge.load", a).await?);
+                }
+                ForgeCmd::Generate {
+                    model,
+                    prompt,
+                    max_tokens,
+                    temperature,
+                    top_logprobs,
+                } => show(
+                    &c.call(
+                        "forge.generate",
+                        json!({"model": model, "prompt": prompt, "max_tokens": max_tokens,
+                               "temperature": temperature, "top_logprobs": top_logprobs}),
+                    )
+                    .await?,
+                ),
+                ForgeCmd::Unload { model } => show(&c.call("forge.unload", json!({"model": model})).await?),
+            }
+        }
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())

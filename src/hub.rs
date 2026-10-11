@@ -212,6 +212,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::trace::api::operations());
     all.extend(crate::km::ops::operations());
     all.extend(crate::factory::ops::operations());
+    all.extend(crate::forge::operations());
     all
 }
 
@@ -858,6 +859,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let body = tools::check_rerank(a).map_err(Fail::invalid)?;
             forward_json(hub, "/v1/rerank", body).await?
         }
+        id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
         "key.create" | "key.list" | "key.revoke" | "usage.get" => key_call(&hub.keys, id, a).map_err(ApiError::from)?,
         "config.get" => shown_settings(&e.settings()),
