@@ -78,6 +78,11 @@ PATH. Downloads go to `download_dir` (default `<home>`); gated Hugging Face repo
 Build llama.cpp from source with the GPU backend you have (for example `-DGGML_VULKAN=ON` for AMD or Intel
 GPUs, `-DGGML_CUDA=ON` for NVIDIA).
 
+## Desktop app
+
+On Windows, `ModelMistress_<version>_x64-setup.exe` installs the app and the hub together. The app uses a hub that
+already runs, else starts the one it ships with (and stops it again on quit). See [docs/desktop.md](docs/desktop.md).
+
 ## API
 
 Everything but `/v1/health` needs `Authorization: Bearer <token>`.
