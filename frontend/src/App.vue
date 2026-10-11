@@ -28,13 +28,15 @@ import { auth, inTauri, signOut } from '@/transport'
 
 // Pages grouped by what they are for; the group row is always shown, the pages of the current group under it.
 const groups = [
+  { label: 'Chat', to: '/', pages: [{ label: 'Chat', to: '/' }] },
+  { label: 'Models', to: '/models', pages: [{ label: 'Models', to: '/models' }] },
   { label: 'Thoughts', to: '/thoughts', pages: [{ label: 'Thoughts', to: '/thoughts' }] },
   { label: 'Traces', to: '/traces', pages: [{ label: 'Traces', to: '/traces' }] },
   { label: 'Knowledge', to: '/knowledge', pages: [{ label: 'Library', to: '/knowledge' }, { label: 'Residency', to: '/residency' }, { label: 'Vocabulary', to: '/vocabulary' }] },
   { label: 'Data', to: '/data', pages: [{ label: 'Data studio', to: '/data' }] },
   { label: 'Factory', to: '/factory', pages: [{ label: 'Tasks', to: '/factory' }, { label: 'Review queue', to: '/factory/review' }] },
-  { label: 'Models', to: '/models', pages: [{ label: 'Models', to: '/models' }, { label: 'Overview', to: '/overview' }, { label: 'Swarm', to: '/swarm' }] },
-  { label: 'Settings', to: '/settings', pages: [{ label: 'Settings', to: '/settings' }] },
+  { label: 'Media', to: '/speech', pages: [{ label: 'Speech', to: '/speech' }, { label: 'Images', to: '/images' }, { label: 'Vision', to: '/vision' }] },
+  { label: 'Settings', to: '/settings', pages: [{ label: 'Settings', to: '/settings' }, { label: 'Status', to: '/overview' }] },
 ]
 const route = useRoute()
 const within = (path: string, base: string) => path === base || path.startsWith(base + '/')

@@ -28,9 +28,30 @@ pub struct ModelEntry {
     pub mmproj: Option<PathBuf>,
     /// Scalar metadata from the GGUF header: `general.*` and `<architecture>.*`.
     pub meta: Map<String, Value>,
+    /// Set for a model the Forge made (under `<forge data dir>/**/gguf/`): MM's own models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<Native>,
+}
+
+/// What `dusty.json`, next to a Forge output's `gguf` folder, says about it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Native {
+    /// `dusty`, `misty` (the `family` field of dusty.json, else the name's first word, else the folder above).
+    pub family: String,
+    /// The name in dusty.json (`Dusty-1.0`).
+    pub name: String,
 }
 
 impl ModelEntry {
+    /// Mixture-of-experts: the GGUF says how many experts it has.
+    pub fn experts(&self) -> Option<u64> {
+        let arch = self.architecture()?;
+        self.meta
+            .get(&format!("{arch}.expert_count"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    }
+
     pub fn architecture(&self) -> Option<&str> {
         self.meta.get("general.architecture").and_then(Value::as_str)
     }
@@ -52,6 +73,14 @@ impl ModelEntry {
             "file_type": self.meta.get("general.file_type").and_then(Value::as_u64).map(file_type_name),
             "context_length": self.context_length(),
             "vision": self.mmproj.is_some(),
+            "native": self.native.is_some(),
+            "family": self.native.as_ref().map(|n| n.family.as_str()),
+            "experts": self.experts(),
+            "experts_used": self
+                .architecture()
+                .and_then(|a| self.meta.get(&format!("{a}.expert_used_count")))
+                .and_then(Value::as_u64),
+            "path": self.path,
             "loaded": loaded,
         })
     }
@@ -63,6 +92,8 @@ pub struct Roots {
     pub ollama: Vec<PathBuf>,
     pub huggingface: Vec<PathBuf>,
     pub folders: Vec<PathBuf>,
+    /// The Forge's data folder: `**/gguf/*.gguf` under it are MM's own (native) models.
+    pub native: Vec<PathBuf>,
 }
 
 impl Roots {
@@ -99,6 +130,21 @@ pub fn scan(roots: &Roots) -> Vec<ModelEntry> {
     let mut add = |e: ModelEntry| {
         found.entry(e.id.clone()).or_insert(e);
     };
+    for dir in dedup(&roots.native) {
+        let mut files = Vec::new();
+        walk(&dir, 6, &mut files);
+        for f in files {
+            let in_gguf = f.parent().and_then(Path::file_name).is_some_and(|n| n == "gguf");
+            if in_gguf && is_model_file(&f) {
+                let Some(native) = native_info(&f) else { continue };
+                let mmproj = sibling_mmproj(&f);
+                if let Some(mut e) = entry(model_stem(&f), "native", f, mmproj) {
+                    e.native = Some(native);
+                    add(e);
+                }
+            }
+        }
+    }
     for dir in dedup(&roots.ollama) {
         scan_ollama(&dir, &mut add);
     }
@@ -154,7 +200,36 @@ fn entry(id: String, source: &'static str, path: PathBuf, mmproj: Option<PathBuf
         size_bytes,
         mmproj,
         meta,
+        native: None,
     })
+}
+
+/// The family and name of a Forge output at `<...>/<name>/gguf/<file>.gguf`, from the `dusty.json` beside `gguf/`
+/// (a `gguf` folder without one is not a model of ours).
+fn native_info(gguf: &Path) -> Option<Native> {
+    let model_dir = gguf.parent().and_then(Path::parent);
+    let json: Value = model_dir
+        .and_then(|d| std::fs::read(d.join("dusty.json")).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let name = json["name"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            model_dir
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| model_stem(gguf));
+    let family = json["family"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            let first = name.split(['-', '_', ' ', '.']).next().unwrap_or("");
+            (!first.is_empty()).then(|| first.to_string())
+        })
+        .unwrap_or_else(|| "native".into())
+        .to_lowercase();
+    Some(Native { family, name })
 }
 
 fn scan_ollama(dir: &Path, add: &mut impl FnMut(ModelEntry)) {
@@ -543,6 +618,7 @@ mod tests {
             ollama: vec![ol],
             huggingface: vec![d.join("hf")],
             folders: vec![d.join("dir")],
+            ..Default::default()
         };
         let ids: Vec<String> = scan(&roots).into_iter().map(|e| e.id).collect();
         assert_eq!(
@@ -559,6 +635,42 @@ mod tests {
         assert!(q.mmproj.is_some());
         assert_eq!(q.context_length(), Some(4096));
         assert_eq!(q.summary(false)["vision"], true);
+    }
+
+    #[test]
+    fn forge_outputs_are_native_models() {
+        let d = tmp("native");
+        let out = d.join("data/dusty/Dusty-1.0");
+        std::fs::create_dir_all(out.join("gguf")).unwrap();
+        std::fs::write(out.join("dusty.json"), r#"{"name": "Dusty-1.0"}"#).unwrap();
+        gguf(&out.join("gguf/Dusty-1.0-Q8_0.gguf"), "qwen35moe", "Dusty");
+        // a family named in the file wins; a GGUF outside a gguf folder is not native
+        let m = d.join("data/misty/Mist-2");
+        std::fs::create_dir_all(m.join("gguf")).unwrap();
+        std::fs::write(m.join("dusty.json"), r#"{"name": "Mist-2", "family": "Misty"}"#).unwrap();
+        gguf(&m.join("gguf/Mist-2-Q4_K_M.gguf"), "qwen35moe", "Mist");
+        gguf(&d.join("data/misty/Mist-2/stray.gguf"), "llama", "Stray");
+        // a gguf folder with no dusty.json (a conversion's intermediate) is not native
+        std::fs::create_dir_all(d.join("data/gguf")).unwrap();
+        gguf(&d.join("data/gguf/Base-Q8_0.gguf"), "qwen35", "Base");
+        let roots = Roots {
+            native: vec![d.join("data")],
+            folders: vec![d.join("data")], // also a model folder: the native entry keeps the id
+            ..Default::default()
+        };
+        let all = scan(&roots);
+        let by = |id: &str| all.iter().find(|e| e.id == id).unwrap();
+        let dusty = by("Dusty-1.0-Q8_0");
+        assert_eq!(dusty.native.as_ref().unwrap().family, "dusty");
+        assert_eq!(dusty.source, "native");
+        assert_eq!(by("Mist-2-Q4_K_M").native.as_ref().unwrap().family, "misty");
+        assert!(by("stray").native.is_none());
+        assert!(by("Base-Q8_0").native.is_none());
+        let s = dusty.summary(false);
+        assert_eq!(
+            (s["native"].clone(), s["family"].clone()),
+            (true.into(), "dusty".into())
+        );
     }
 
     #[test]

@@ -26,6 +26,33 @@ Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in lla
   `config.set` saving to `config.toml`.
 - MCP over stdio (`model-mistress mcp`).
 
+## The dashboard as an app (tested in headless Edge against a running hub)
+
+- **Chat** is the landing page: model picker with MM's own (Forge) models in a group at the top, streamed answers
+  (`/v1/chat/completions`, `stream: true`), conversations kept in the browser (new, rename, delete), system prompt,
+  temperature, top-p, max tokens, Stop (button or Esc), Enter sends and Shift+Enter breaks a line, markdown with
+  copyable code blocks (own renderer, everything escaped), reasoning (`reasoning_content` or `<think>`) collapsed
+  apart from the answer, time to first token and tokens per second per reply, "trace replies" (sets `mm_trace` and
+  links each reply to its trace), and a picture button for vision models. Stop cancels the task in llama-server.
+- **Models**: installed models (size, quantisation, architecture, context, where it runs), load with options
+  (context, GPU layers, experts on the CPU for MoE models), unload, loaded state with RAM and the buffers
+  llama.cpp reports, details, delete with confirmation, Hugging Face search with per-file download and download by
+  name (Ollama too), downloads with progress and stop.
+- **Native models**: a GGUF under `<forge data dir>/**/gguf/` with a `dusty.json` beside `gguf/` is listed by
+  `model.list` as source `native`, with `native: true`, its `family` (`dusty`, `misty`) and the expert counts.
+  Loading a native MoE model passes `--cpu-moe` unless the load says `cpu_moe: false` (`n_cpu_moe: N` for the
+  first N layers only), so Dusty Q8_0 (23.8 GB) runs on a 24 GB card: experts in RAM, the rest on the GPU.
+- Measured with Dusty-1.0 Q8_0 (qwen35moe, 64 experts, top 4) in the Chat page, 80-token reply, a first request
+  that also loaded it (file cached): 6.0 s to the first token, 4.9 tokens/s; a warm 40-token reply about 3.5
+  tokens/s on a busy machine (free RAM was 7 GB of 64, the model server held 19 to 23 GB).
+- **Settings** is a form made from `config.get` (a changed value is sent with `config.set`; tested by changing
+  `max_loaded` and changing it back). **Status** (`/overview`) shows version, uptime, engine, RAM, loaded models
+  and their memory (`service.status` gained `system`, and `model.loaded` gained `rss_mb` and `buffers`).
+- **Speech, Images, Vision** pages: microphone to `/v1/audio/transcriptions`, text to `/v1/audio/speech`; prompt to
+  an `image.generate` job with progress and a gallery; a dropped picture to `/v1/vision/*` with boxes drawn. Each
+  shows "not available in this build" when the hub answers 501 or 404; with no speech, image or vision model on
+  this machine they showed exactly that, the happy paths of these three were not run against real models.
+
 ## Hosting for peers
 
 Per-peer keys (stored hashed in the home folder), quotas (requests per minute, tokens per day, concurrent requests,

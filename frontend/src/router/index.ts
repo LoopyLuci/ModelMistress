@@ -1,7 +1,10 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import Dashboard from '../views/Dashboard.vue'
 import ModelsView from '../views/ModelsView.vue'
-import SwarmView from '../views/SwarmView.vue'
+import ChatView from '../views/ChatView.vue'
+import SpeechView from '../views/SpeechView.vue'
+import ImagesView from '../views/ImagesView.vue'
+import VisionView from '../views/VisionView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import ThoughtsView from '../views/ThoughtsView.vue'
 import TracesView from '../views/TracesView.vue'
@@ -17,7 +20,7 @@ import FactoryTaskView from '../views/FactoryTaskView.vue'
 import FactoryReviewView from '../views/FactoryReviewView.vue'
 
 const routes = [
-  { path: '/', redirect: '/thoughts' },
+  { path: '/', name: 'Chat', component: ChatView },
   { path: '/thoughts', name: 'Thoughts', component: ThoughtsView },
   { path: '/traces', name: 'Traces', component: TracesView },
   { path: '/traces/:id', name: 'Trace', component: TraceDetailView, props: true },
@@ -32,7 +35,9 @@ const routes = [
   { path: '/factory/:id', name: 'FactoryTask', component: FactoryTaskView, props: true },
   { path: '/overview', name: 'Dashboard', component: Dashboard },
   { path: '/models', name: 'Models', component: ModelsView },
-  { path: '/swarm', name: 'Swarm', component: SwarmView },
+  { path: '/speech', name: 'Speech', component: SpeechView },
+  { path: '/images', name: 'Images', component: ImagesView },
+  { path: '/vision', name: 'Vision', component: VisionView },
   { path: '/settings', name: 'Settings', component: SettingsView },
 ]
 

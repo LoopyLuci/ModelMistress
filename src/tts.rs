@@ -388,6 +388,7 @@ mod tests {
             size_bytes: 1,
             mmproj: mmproj.then(|| PathBuf::from("/m/mmproj-x.gguf")),
             meta: Default::default(),
+            native: None,
         }
     }
 

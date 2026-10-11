@@ -44,7 +44,9 @@ runs on its own.
   ([docs/native/km-factory.md](docs/native/km-factory.md), [docs/native/km-factory-runtime.md](docs/native/km-factory-runtime.md)).
 - **The model's thoughts, visible.** Any chat can be traced: every token with its probability, the alternatives the
   model weighed and its entropy, the reasoning kept apart from the answer, stage timings and resources. Traces can be
-  rerun with changes (ablation) and compared. A dashboard at `/ui` (any browser, and the desktop app) shows traces,
+  rerun with changes (ablation) and compared. A dashboard at `/ui` (any browser, and the desktop app) is also where you chat with the models (the Chat page
+  streams, keeps conversations locally and shows reasoning apart), manage them (load options such as experts on the
+  CPU, downloads) and change settings; it shows traces,
   Knowledge Modules, residency, training data and factory tasks ([docs/native/observability.md](docs/native/observability.md)).
 - **Its own models, in progress.** Dusty (Qwen3.5-4B turned into a mixture of experts whose experts come from Knowledge
   Modules) and Misty (trained from scratch), with a training system ("the Forge"), consolidation of what a KM does

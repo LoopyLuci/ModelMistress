@@ -684,6 +684,7 @@ mod tests {
             size_bytes: 1,
             mmproj: None,
             meta: Default::default(),
+            native: None,
         };
         assert_eq!(
             find_model(&dirs, &[e], "org/flux:q4", None).unwrap().path,
