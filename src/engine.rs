@@ -213,6 +213,9 @@ pub struct Extras {
     pub lora: Vec<Lora>,
     #[serde(default)]
     pub draft: Option<Draft>,
+    /// Load this GGUF instead of the catalog entry's file: the core assembled with experts KMs (km/assemble.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
 }
 
 /// llama-server arguments for LoRA adapters. They are loaded without being applied (`--lora-init-without-apply`);
@@ -944,9 +947,10 @@ impl Engine {
         let s = self.settings();
         let port = free_port().map_err(|e| Fail::new(500, "io", format!("no free port: {e}")))?;
         let key = crate::hub::new_token();
+        let extras = self.extras(&entry.id);
         let mut args: Vec<String> = vec![
             "-m".into(),
-            entry.path.display().to_string(),
+            extras.model_path.as_ref().unwrap_or(&entry.path).display().to_string(),
             "--host".into(),
             "127.0.0.1".into(),
             "--port".into(),
@@ -965,7 +969,6 @@ impl Engine {
             args.extend(["-t".into(), t.to_string()]);
         }
         args.extend(moe_args(entry, opts));
-        let extras = self.extras(&entry.id);
         if opts.reranking {
             args.push("--reranking".into());
         } else if opts.embeddings {
@@ -1641,6 +1644,7 @@ mod tests {
                 n_min: None,
                 gpu_layers: Some(-1),
             }),
+            model_path: Some(PathBuf::from("assembled.gguf")),
         };
         e.set_extras("m", x.clone()).unwrap();
         drop(e);

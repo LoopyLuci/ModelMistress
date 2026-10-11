@@ -111,7 +111,10 @@ sha256 = "..."
 Kind-specific tables:
 
 - `experts`: `[experts] layers = [4, 5, ...]`, `slots_per_layer`, `hidden`, `ffn`, `gate = "swiglu"`; each payload file
-  names its layer and slot range.
+  names its layer and slot range. A payload is a GGUF fragment with the base's tensor names for that layer
+  (`blk.N.ffn_gate_exps.weight`, `ffn_up_exps.weight`, `ffn_down_exps.weight`, optionally `ffn_gate_inp.weight` for the
+  router rows), the slot dimension (the last) equal to the number of slots in the range, and the base's quant type and
+  other dimensions. Assembly copies bytes (see `km-runtime.md`).
 - `memory`: `[memory] chunks = "payload/chunks.jsonl"`, `embeddings = "payload/emb.f16"`, `dim`, `index = "hnsw" | "flat"`.
 - `specialist`: `[specialist] engine = "tts" | "image" | "stt" | "vision"`, `model = "<hub model id>"`,
   `input_schema`, `output_schema` (JSON Schema), `tool_description`. A specialist KM can only name engines the hub

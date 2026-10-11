@@ -432,7 +432,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
         "km.residency" => {
             let st = km.settings();
             let mut v = km.manager.snapshot(km.store.disk_bytes(), st.budget_disk_bytes);
-            v["note"] = json!("adapters attach to a running core; experts, projector, router and tool KMs are held and verified here, and their assembly into a core is pending; a loaded specialist KM is callable (km.specialist.call)");
+            v["note"] = json!("adapters attach to a running core; experts KMs given a core are assembled into it and hot-swapped; projector, router and tool KMs are held and verified here, and their assembly into a core is pending; a loaded specialist KM is callable (km.specialist.call)");
             v
         }
         "km.events" => {

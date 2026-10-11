@@ -11,9 +11,11 @@
 //!
 //! [`Km`] ties them together for one home folder. Nothing in a KM is ever executed or opened as an address.
 
+pub mod assemble;
 pub mod cli;
 pub mod data;
 pub mod embed;
+pub mod experts;
 pub mod manifest;
 pub mod memory;
 pub mod ops;
@@ -43,7 +45,7 @@ use crate::engine::{Engine, Fail};
 use embed::{Embedder, HashEmbedder, HubEmbedder};
 use manifest::{Kind, Manifest};
 use pack::{SigState, Source};
-use residency::{AttachSpec, Attacher, Budgets, Candidate, EngineAttacher, Guard, Manager, SystemClock, Tier};
+use residency::{AttachSpec, Attacher, Budgets, Candidate, Guard, Manager, SystemClock, Tier};
 use select::{Budget, Query, QueryVec, Weights};
 use store::{Record, Store, Trust};
 
@@ -259,10 +261,11 @@ impl Km {
     }
 
     pub fn attacher(&self) -> Arc<dyn Attacher> {
+        // the default is made once: the experts attacher remembers which experts KMs each core holds
         self.attacher
             .lock()
+            .get_or_insert_with(|| Arc::new(experts::ComposedAttacher::for_engine(&self.engine)))
             .clone()
-            .unwrap_or_else(|| Arc::new(EngineAttacher(self.engine.clone())))
     }
 
     pub fn set_attacher(&self, a: Option<Arc<dyn Attacher>>) {
@@ -481,7 +484,7 @@ impl Km {
         let core = req.core.clone().or_else(|| st.default_core.clone());
         let want = if root { req.tier } else { None };
         let tier = match (kind, want) {
-            (Kind::Adapter, None) => {
+            (Kind::Adapter | Kind::Experts, None) => {
                 if core.is_some() {
                     Tier::Vram
                 } else {
@@ -499,11 +502,16 @@ impl Km {
                     scale: req.scale,
                 })
             }
+            (Kind::Experts, Tier::Vram) => Some(AttachSpec {
+                path: std::path::absolute(&dir).unwrap_or_else(|_| dir.clone()),
+                scale: 1.0,
+            }),
             _ => None,
         };
         let attach_state = match (kind, tier) {
             (Kind::Adapter, Tier::Vram) => "attached",
             (Kind::Adapter, _) => "staged",
+            (Kind::Experts, Tier::Vram) => "attached",
             (Kind::Specialist, _) => "attached",
             (Kind::Experts | Kind::Projector | Kind::Router | Kind::Tool, _) => "pending",
             (Kind::Memory, _) => "on-demand",

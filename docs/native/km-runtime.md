@@ -103,8 +103,20 @@ over the bytes of `km.toml`. Trust is checked again on every load against today'
 - **Adapter KMs** attach to a hub model named by `core` (or `default_core`) in the VRAM tier; without a core they are
   staged in RAM. Attachments are recorded in `<home>/km/attached.json` so an adapter left attached by a crashed hub is
   detached on the next load or residency call.
-- **Experts, projector, router and tool KMs** are verified, accounted and held; their output says
-  `attach: "pending"`. Memory KMs report `on-demand`.
+- **Experts KMs** named for a `core` (or `default_core`) are assembled into it: the core's base GGUF is copied and the
+  KM's tensors are written over the declared `(layer, slot)` byte runs of `blk.N.ffn_{gate,up,down}_exps.weight` (and
+  the router rows of `ffn_gate_inp.weight`, if the payload carries them). No requantization: a different quant type,
+  shape or slot count, an unknown tensor, a missing gate/up/down, or two KMs on one slot is refused with the tensor
+  named. The result is `<home>/km/assembled/<core>-<hash>.gguf` (the hash covers the base file's name, size and mtime
+  and the resident experts KMs with their payload hashes, in key order); the same inputs reuse the file, it is written
+  to a temp name and renamed, and free disk space is checked first. The engine then reloads the core from that file
+  through its hot swap (`model_path` in the core's saved options): the old instance serves until the new one is ready,
+  and stays if it does not start, in which case the load is refused with the engine's reason and nothing changes.
+  Loading or evicting another experts KM re-assembles with the whole resident set; evicting the last one puts the base
+  file back and deletes the core's assembled files (best effort). Without a core, an experts KM is held in RAM with
+  `attach: "pending"`; with one it reports `attached`. LoRA adapters keep their own mechanism on the same core.
+- **Projector, router and tool KMs** are verified, accounted and held; their output says `attach: "pending"`. Memory
+  KMs report `on-demand`.
 - **Specialist KMs** are callable once loaded (`attach: "attached"`). `km.specialist.call {id, input}` checks `input`
   against the manifest's `specialist.input_schema` (an inline table or a JSON string; absent: the engine's own checks
   apply), adds `model = specialist.model`, and runs the hub operation of the engine: `stt` is `speech.transcribe`, `tts`
@@ -136,7 +148,7 @@ over the bytes of `km.toml`. Trust is checked again on every load against today'
 
 ## Deferred
 
-- Assembling experts, projectors and routers into a running core, and the learned router term (`attach: pending`).
+- Assembling projectors and routers into a running core, and the learned router term (`attach: pending`).
 - Wiring selection and `open_request` into `/v1/chat/completions`, and persisting the event ring (observability branch).
 - Restoring the resident set after a restart; the consolidation state is read from the manifest only (no operation
   changes it yet); automatic re-loading of an absorbed KM when its uplift returns.

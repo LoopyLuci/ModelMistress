@@ -753,7 +753,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Free bytes on the disk that holds `path` (or the nearest folder above it that exists).
-fn free_space(path: &Path) -> Option<u64> {
+pub(crate) fn free_space(path: &Path) -> Option<u64> {
     let mut p = path.to_path_buf();
     while !p.exists() {
         p = p.parent()?.to_path_buf();

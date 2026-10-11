@@ -289,6 +289,40 @@ pub fn experts(root: &Path, id: &str, version: &str, descriptor: &str) -> PathBu
         .build_experts()
 }
 
+/// An experts KM whose payloads are the given GGUF fragments `(layer, [first slot, last slot], file bytes)`, for
+/// assembly into a real (or synthetic) core. Dimensions are the core's `hidden` and `ffn`.
+pub fn experts_with(
+    root: &Path,
+    id: &str,
+    version: &str,
+    (hidden, ffn, slots_per_layer): (u32, u32, u32),
+    parts: &[(u32, [u32; 2], Vec<u8>)],
+) -> PathBuf {
+    let mut layers: Vec<u32> = parts.iter().map(|p| p.0).collect();
+    layers.sort_unstable();
+    layers.dedup();
+    let mut b = Builder::new(root, "experts", id, version).descriptor(id).tables(&format!(
+        "[experts]\nlayers = {layers:?}\nslots_per_layer = {slots_per_layer}\nhidden = {hidden}\nffn = {ffn}\ngate = \"swiglu\""
+    ));
+    for (layer, [a, z], bytes) in parts {
+        b = b.file(
+            &format!("payload/l{layer}-{a}-{z}.gguf"),
+            "experts",
+            "gguf",
+            bytes.clone(),
+        );
+    }
+    let dir = b.build();
+    let p = dir.join("km.toml");
+    let mut t = std::fs::read_to_string(&p).expect("km.toml");
+    for (layer, [a, z], _) in parts {
+        let path = format!("path = \"payload/l{layer}-{a}-{z}.gguf\"");
+        t = t.replace(&path, &format!("{path}\nlayer = {layer}\nslots = [{a}, {z}]"));
+    }
+    std::fs::write(p, t).expect("km.toml");
+    dir
+}
+
 impl Builder {
     /// Experts payload files name their layer and slots; patch them into the generated manifest.
     fn build_experts(self) -> PathBuf {
