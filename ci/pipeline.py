@@ -89,7 +89,10 @@ def preflight() -> tuple[bool, str]:
     ver = tuple(int(x) for x in re.findall(r"(\d+)\.(\d+)", out)[0])
     if ver < (1, 85):
         return False, f"cargo {out.split()[1]} is older than 1.85 (rustup update)"
-    free = shutil.disk_usage(target_dir().parent if target_dir().exists() else ROOT).free / 1e9
+    where = target_dir()
+    while not where.exists() and where.parent != where:  # the drive the build will go to, even before it exists
+        where = where.parent
+    free = shutil.disk_usage(where).free / 1e9
     if free < 5:
         return False, f"only {free:.1f} GB free where the build goes"
     say(f"  ->     {out.strip()}; {free:.0f} GB free for the build")
