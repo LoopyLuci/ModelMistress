@@ -89,6 +89,12 @@ impl From<Fail> for ApiError {
     }
 }
 
+impl From<ApiError> for Fail {
+    fn from(e: ApiError) -> Self {
+        e.0
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

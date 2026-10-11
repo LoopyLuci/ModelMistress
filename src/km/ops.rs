@@ -122,6 +122,11 @@ pub fn operations() -> Vec<Value> {
            json!({"id": id, "version": version, "channel": channel, "text": {"type": "string"},
                   "vector": {"type": "array", "items": {"type": "number"}, "description": "a query embedding, instead of text"},
                   "top_k": {"type": "integer", "minimum": 1, "maximum": 100}, "min_score": {"type": "number"}}), &["id"]),
+        op("km.specialist.call", "Call a loaded specialist KM: the input is checked against its input_schema and run on the engine (stt, tts, image or vision) with the KM's model; the call is recorded in the trace store",
+           true, false,
+           json!({"id": id, "version": version, "channel": channel,
+                  "input": {"type": "object", "description": "the engine's arguments, as the matching hub operation takes them (speech.transcribe, speech.synthesize, image.generate, vision.analyze), without model"},
+                  "trace": {"type": "string", "description": "file the call under this existing trace instead of a new one"}}), &["id", "input"]),
     ]
 }
 
@@ -427,7 +432,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
         "km.residency" => {
             let st = km.settings();
             let mut v = km.manager.snapshot(km.store.disk_bytes(), st.budget_disk_bytes);
-            v["note"] = json!("adapters attach to a running core; experts, projector, router, specialist and tool KMs are held and verified here, and their assembly into a core is pending");
+            v["note"] = json!("adapters attach to a running core; experts, projector, router and tool KMs are held and verified here, and their assembly into a core is pending; a loaded specialist KM is callable (km.specialist.call)");
             v
         }
         "km.events" => {
@@ -555,6 +560,12 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                 a["min_score"].as_f64().unwrap_or(-1.0) as f32,
             )
             .await?
+        }
+        "km.specialist.call" => {
+            let (id, v, c) = target(a)?;
+            let input = a.get("input").ok_or_else(|| Fail::invalid("input is required"))?;
+            km.specialist_call(hub, &id, v.as_deref(), c.as_deref(), input, os(a, "trace"))
+                .await?
         }
         _ => return Err(Fail::not_found(format!("no operation {id}"))),
     })

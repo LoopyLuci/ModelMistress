@@ -856,6 +856,19 @@ impl Engine {
     /// swapping) the one in service. For stand-ins in tests; `on_stop` runs when it is stopped.
     #[doc(hidden)]
     pub fn adopt(&self, model: &str, port: u16, key: &str, on_stop: Option<Box<dyn FnOnce() + Send>>) -> Arc<Instance> {
+        self.adopt_as(model, port, key, false, on_stop)
+    }
+
+    /// [`adopt`](Self::adopt) for a stand-in that serves `/v1/embeddings` (`embeddings`) instead of chat.
+    #[doc(hidden)]
+    pub fn adopt_as(
+        &self,
+        model: &str,
+        port: u16,
+        key: &str,
+        embeddings: bool,
+        on_stop: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Arc<Instance> {
         let inst = Arc::new(Instance {
             model: model.to_string(),
             port,
@@ -865,7 +878,7 @@ impl Engine {
             started: Instant::now(),
             args: vec![],
             log: PathBuf::new(),
-            embeddings: false,
+            embeddings,
             reranking: false,
             opts: LoadOpts::default(),
             extras: Extras::default(),

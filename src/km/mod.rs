@@ -22,6 +22,7 @@ pub mod residency;
 pub mod resolve;
 pub mod sample;
 pub mod select;
+pub mod specialist;
 pub mod store;
 pub mod vocab;
 
@@ -171,6 +172,7 @@ pub struct Km {
     pub manager: Arc<Manager>,
     embedder: Mutex<Option<Arc<dyn Embedder>>>,
     attacher: Mutex<Option<Arc<dyn Attacher>>>,
+    backend: Mutex<Option<Arc<dyn specialist::Backend>>>,
     /// Content ids whose files were verified in this process (km-spec.md section 9).
     verified: Mutex<HashSet<String>>,
     ready: tokio::sync::OnceCell<()>,
@@ -201,6 +203,7 @@ impl Km {
             manager: Manager::new(Arc::new(SystemClock)),
             embedder: Mutex::new(None),
             attacher: Mutex::new(None),
+            backend: Mutex::new(None),
             verified: Mutex::new(HashSet::new()),
             ready: tokio::sync::OnceCell::new(),
         });
@@ -501,7 +504,8 @@ impl Km {
         let attach_state = match (kind, tier) {
             (Kind::Adapter, Tier::Vram) => "attached",
             (Kind::Adapter, _) => "staged",
-            (Kind::Experts | Kind::Projector | Kind::Router | Kind::Specialist | Kind::Tool, _) => "pending",
+            (Kind::Specialist, _) => "attached",
+            (Kind::Experts | Kind::Projector | Kind::Router | Kind::Tool, _) => "pending",
             (Kind::Memory, _) => "on-demand",
             _ => "n/a",
         };

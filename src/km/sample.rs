@@ -25,6 +25,7 @@ pub struct Builder {
     keywords: Vec<String>,
     embed_model: Option<String>,
     centroid_of: Option<String>,
+    centroid_vec: Option<Vec<f32>>,
     base: String,
     requires: Vec<String>,
     conflicts: Vec<String>,
@@ -54,6 +55,7 @@ impl Builder {
             keywords: vec![],
             embed_model: None,
             centroid_of: None,
+            centroid_vec: None,
             base: if matches!(kind, "adapter" | "experts" | "projector" | "router") {
                 "dusty".into()
             } else {
@@ -100,6 +102,12 @@ impl Builder {
     }
     pub fn embed_model(mut self, v: &str) -> Self {
         self.embed_model = Some(v.into());
+        self
+    }
+    /// A centroid of the given values (made by the embedder `embed_model` names) instead of the hash embedding.
+    pub fn centroid_vec(mut self, v: &[f32]) -> Self {
+        self.centroid_vec = Some(v.to_vec());
+        self.centroid_of = Some(String::new());
         self
     }
     pub fn no_centroid(mut self) -> Self {
@@ -157,7 +165,7 @@ impl Builder {
         std::fs::create_dir_all(dir.join("payload")).expect("a folder");
         let embedder = HashEmbedder::default();
         if let Some(text) = self.centroid_of.clone() {
-            let c = f32_to_f16(&embedder.embed_one(&text));
+            let c = f32_to_f16(&self.centroid_vec.clone().unwrap_or_else(|| embedder.embed_one(&text)));
             self.files
                 .push(("payload/centroid.f16".into(), "centroid".into(), "f16".into(), c));
         }

@@ -58,11 +58,13 @@ also `POST /v1/call/km.a.b` and MCP tools. The owner's token only: none of them 
 | `km.vocabulary.get` / `.edit` | edit: yes | |
 | `km.data.list/get`, `.edit/approve/reject/commit` | edit, approve, reject, commit: yes | |
 | `km.memory.query` | no (it may load the KM into RAM) | hits carry chunk id, score and a `km@version#chunk` citation |
+| `km.specialist.call` | yes (it runs an engine) | `{id, input, trace?}`: a loaded specialist KM; see below |
 
 In Rust: `km::runtime(&engine)` gives the `Km`; `Km::open_request(&[LoadReq])` loads a request's whole KM set and returns
 a `Guard`: nothing in it is evicted until the guard is dropped. `Km::manager.events().subscribe()` is the broadcast
 stream (the observability branch can persist it); `events().recent(..)` is the in-memory ring (1000 events).
-`Km::set_embedder` and `Km::set_attacher` replace the embedder and the adapter attacher (tests do).
+`Km::set_embedder`, `Km::set_attacher` and `Km::set_specialist_backend` replace the embedder, the adapter attacher and the
+specialist engine runner (tests do).
 
 ## Settings (`[km]` in `<home>/config.toml`, also `config.set`)
 
@@ -101,8 +103,16 @@ over the bytes of `km.toml`. Trust is checked again on every load against today'
 - **Adapter KMs** attach to a hub model named by `core` (or `default_core`) in the VRAM tier; without a core they are
   staged in RAM. Attachments are recorded in `<home>/km/attached.json` so an adapter left attached by a crashed hub is
   detached on the next load or residency call.
-- **Experts, projector, router, specialist and tool KMs** are verified, accounted and held; their output says
+- **Experts, projector, router and tool KMs** are verified, accounted and held; their output says
   `attach: "pending"`. Memory KMs report `on-demand`.
+- **Specialist KMs** are callable once loaded (`attach: "attached"`). `km.specialist.call {id, input}` checks `input`
+  against the manifest's `specialist.input_schema` (an inline table or a JSON string; absent: the engine's own checks
+  apply), adds `model = specialist.model`, and runs the hub operation of the engine: `stt` is `speech.transcribe`, `tts`
+  is `speech.synthesize`, `image` is `image.generate` (with `wait`), `vision` is `vision.analyze`. The answer is
+  `{km, engine, model, ms, trace, result}`. Every call is recorded with `specialist_call` in the trace store: under the
+  trace named by `trace`, else under a new one of kind `km.specialist`. Errors: an unknown or unloaded KM is 404,
+  a KM that is not a specialist or input that breaks the schema is 400, an engine that is not built in, has no model
+  or is down is 503. The route is `POST /v1/km/specialist/call`, and it is an MCP tool like every `km.*` operation.
 - **Data KMs**: the working copy of each KM id lives in `<home>/km/data.db` with an append-only history of every
   revision of every record; `km.data.commit` writes a new version whose `parent` is the version it started from.
   Editing a record does not change its status; approving or rejecting is itself a new `rev`.
@@ -130,5 +140,6 @@ over the bytes of `km.toml`. Trust is checked again on every load against today'
 - Wiring selection and `open_request` into `/v1/chat/completions`, and persisting the event ring (observability branch).
 - Restoring the resident set after a restart; the consolidation state is read from the manifest only (no operation
   changes it yet); automatic re-loading of an absorbed KM when its uplift returns.
-- Using a `skill` KM's instructions in the context, and calling a `tool` KM's tool; the factory itself.
+- Using a `skill` KM's instructions in the context, and calling a `tool` KM's tool; letting a core call a specialist on
+  its own (only `km.specialist.call` exists); the factory itself.
 - A fixed-ANN index (HNSW), and signature creation from the API (the CLI has `keygen` and `sign`).

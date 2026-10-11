@@ -350,7 +350,7 @@ async fn a_bundle_loads_and_unloads_its_members() {
 }
 
 #[tokio::test]
-async fn experts_projector_router_and_specialist_are_held_with_attach_pending() {
+async fn experts_projector_and_router_are_held_with_attach_pending_and_a_specialist_is_attached() {
     let (home, _hub, km, _) = setup();
     let src = home.join("src");
     import(&km, &sample::experts(&src, "ex.rust", "1.0.0", "experts"));
@@ -359,7 +359,9 @@ async fn experts_projector_router_and_specialist_are_held_with_attach_pending() 
     import(&km, &sample::projector(&src, "proj.vis", "1.0.0", "spec.tts"));
     for id in ["ex.rust", "router.main", "spec.tts", "proj.vis"] {
         let out = km.load(LoadReq::new(id)).await.unwrap();
-        assert_eq!(out["loaded"][0]["attach"], "pending", "{id}");
+        // a specialist is callable (km.specialist.call); the others wait for their assembly into a core
+        let want = if id == "spec.tts" { "attached" } else { "pending" };
+        assert_eq!(out["loaded"][0]["attach"], want, "{id}");
         assert_eq!(out["loaded"][0]["tier"], "ram");
     }
     assert_eq!(km.manager.resident_keys().len(), 4);
@@ -918,6 +920,7 @@ fn operations_are_unique_marked_and_have_routes() {
         "data.commit",
         "vocabulary.edit",
         "prefetch",
+        "specialist.call",
     ];
     for o in &kms {
         let id = o["id"].as_str().unwrap();
@@ -1104,4 +1107,298 @@ fn recorder_flags_work() {
     let r = Recorder::default();
     r.fail_attach.store(true, Ordering::SeqCst);
     assert!(r.fail_attach.load(Ordering::SeqCst));
+}
+
+// ---- specialist KMs are callable -----------------------------------------------------------------------------
+
+/// A stand-in for the engines: remembers what it was asked and answers by engine kind.
+#[derive(Default)]
+struct StubEngines {
+    seen: parking_lot::Mutex<Vec<(String, Value)>>,
+    fail: bool,
+}
+
+impl specialist::Backend for StubEngines {
+    fn run<'a>(&'a self, _: &'a Hub, engine: &'a str, args: Value) -> futures::future::BoxFuture<'a, Res<Value>> {
+        Box::pin(async move {
+            self.seen.lock().push((engine.to_string(), args.clone()));
+            if self.fail {
+                return Err(Fail::unavailable("the stand-in engine is down"));
+            }
+            Ok(match engine {
+                "stt" => json!({"text": "hello there", "language": "en"}),
+                "tts" => json!({"output": args["output"], "bytes": 3}),
+                "image" => json!({"files": ["a.png"], "seed": 7}),
+                _ => json!({"predictions": [{"label": "cat", "score": 0.9}]}),
+            })
+        })
+    }
+}
+
+fn spec_kms(km: &Km, src: &Path) {
+    let schema = |required: &str, props: &str| {
+        format!("input_schema = {{ type = \"object\", required = [{required}], properties = {{ {props} }} }}")
+    };
+    for (id, engine, model, extra) in [
+        (
+            "spec.stt",
+            "stt",
+            "whisper-x",
+            schema("\"file\"", "file = { type = \"string\" }"),
+        ),
+        (
+            "spec.tts",
+            "tts",
+            "voice-x",
+            schema(
+                "\"input\", \"output\"",
+                "input = { type = \"string\", maxLength = 20 }, output = { type = \"string\" }",
+            ),
+        ),
+        (
+            "spec.img",
+            "image",
+            "draw-x",
+            schema(
+                "\"prompt\"",
+                "prompt = { type = \"string\" }, n = { type = \"integer\", maximum = 4 }",
+            ),
+        ),
+        ("spec.vis", "vision", "see-x", String::new()),
+    ] {
+        let dir = Builder::new(src, "specialist", id, "1.0.0")
+            .descriptor(&format!("{engine} specialist"))
+            .tables(&format!(
+                "[specialist]\nengine = \"{engine}\"\nmodel = \"{model}\"\ntool_description = \"calls {model}\"\n{extra}"
+            ))
+            .build();
+        import(km, &dir);
+    }
+}
+
+fn call_trace(hub: &Hub, id: &str) -> Value {
+    let tr = crate::trace::tracer(&hub.engine.home);
+    tr.store().unwrap().get(id, 0).unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_loaded_specialist_kms_calls_run_on_its_engine_and_are_traced() {
+    let (home, hub, km, _) = setup();
+    spec_kms(&km, &home.join("src"));
+    let stub = Arc::new(StubEngines::default());
+    km.set_specialist_backend(Some(stub.clone()));
+    let inputs = [
+        ("spec.stt", "stt", json!({"file": "a.wav"}), "text"),
+        ("spec.tts", "tts", json!({"input": "hi", "output": "o.wav"}), "bytes"),
+        ("spec.img", "image", json!({"prompt": "a cat", "n": 2}), "files"),
+        ("spec.vis", "vision", json!({"file": "c.png"}), "predictions"),
+    ];
+    for (id, engine, input, field) in inputs {
+        let out = km.load(LoadReq::new(id)).await.unwrap();
+        assert_eq!(out["loaded"][0]["attach"], "attached", "{id}");
+        let r = call(&hub, "km.specialist.call", json!({"id": id, "input": input}))
+            .await
+            .unwrap();
+        assert_eq!(r["km"], format!("{id}@1.0.0"));
+        assert_eq!(r["engine"], engine);
+        assert!(!r["result"][field].is_null(), "{id}: {r}");
+        // the KM's own model is what the engine is asked for
+        let (seen_engine, args) = stub.seen.lock().last().cloned().unwrap();
+        assert_eq!(seen_engine, engine);
+        assert_eq!(args["model"], r["model"]);
+        let tr = call_trace(&hub, r["trace"].as_str().unwrap());
+        assert_eq!(tr["kind"], "km.specialist", "{tr}");
+        assert_eq!(tr["status"], "ok");
+        let c = &tr["specialist_calls"][0];
+        assert_eq!(c["specialist"], format!("{id}@1.0.0"));
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["input"], input);
+        assert_eq!(c["output"], r["result"]);
+    }
+    assert_eq!(stub.seen.lock().len(), 4);
+    assert_eq!(km.manager.refs_of("spec.stt@1.0.0"), 0, "the call's hold is released");
+    // a call can be filed under a trace that exists
+    let tr = crate::trace::tracer(&hub.engine.home);
+    let own = tr.start("chat", "m", &json!({}), None, &json!({})).expect("a trace");
+    let r = call(
+        &hub,
+        "km.specialist.call",
+        json!({"id": "spec.stt", "input": {"file": "b.wav"}, "trace": own}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["trace"], own.as_str());
+    assert_eq!(call_trace(&hub, &own)["specialist_calls"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn specialist_calls_refuse_bad_input_unloaded_and_wrong_kms() {
+    let (home, hub, km, _) = setup();
+    spec_kms(&km, &home.join("src"));
+    import(&km, &adapter(&home, "code.rust", "1.0.0", "rust"));
+    let stub = Arc::new(StubEngines::default());
+    km.set_specialist_backend(Some(stub.clone()));
+    let ask = |id: &str, input: Value| call(&hub, "km.specialist.call", json!({"id": id, "input": input}));
+    // not loaded yet, or not there at all: 404
+    assert_eq!(
+        ask("spec.tts", json!({"input": "hi", "output": "o"}))
+            .await
+            .unwrap_err()
+            .status,
+        404
+    );
+    assert_eq!(ask("spec.nope", json!({})).await.unwrap_err().status, 404);
+    km.load(LoadReq::new("spec.tts")).await.unwrap();
+    km.load(LoadReq::new("code.rust")).await.unwrap();
+    // not a specialist, or input that breaks the schema: 400
+    assert_eq!(ask("code.rust", json!({})).await.unwrap_err().status, 400);
+    for bad in [
+        json!({"input": "hi"}),
+        json!({"input": 5, "output": "o"}),
+        json!({"input": "x".repeat(21), "output": "o"}),
+    ] {
+        let e = ask("spec.tts", bad).await.unwrap_err();
+        assert_eq!((e.status, e.code), (400, "invalid"), "{}", e.message);
+        assert!(e.message.starts_with("input:"), "{}", e.message);
+    }
+    assert_eq!(ask("spec.tts", json!("text")).await.unwrap_err().status, 400);
+    let e = call(&hub, "km.specialist.call", json!({"id": "spec.tts"}))
+        .await
+        .unwrap_err();
+    assert_eq!(e.status, 400);
+    assert!(stub.seen.lock().is_empty(), "nothing reached the engine");
+    // an engine that fails: 503, and the call is recorded as failed
+    let down = Arc::new(StubEngines {
+        fail: true,
+        ..Default::default()
+    });
+    km.set_specialist_backend(Some(down));
+    let tr = crate::trace::tracer(&hub.engine.home);
+    let own = tr.start("chat", "m", &json!({}), None, &json!({})).unwrap();
+    let e = call(
+        &hub,
+        "km.specialist.call",
+        json!({"id": "spec.tts", "input": {"input": "hi", "output": "o"}, "trace": own}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!((e.status, e.code), (503, "unavailable"));
+    let c = call_trace(&hub, &own)["specialist_calls"][0].clone();
+    assert_eq!(c["ok"], false);
+    assert_eq!(c["output"]["code"], "unavailable");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[tokio::test]
+async fn the_hub_backend_reports_an_engine_that_is_not_built_in_as_unavailable() {
+    let (home, hub, km, _) = setup();
+    // reachable as a hub operation, so also as a REST route and an MCP tool
+    assert!(hub::operations().iter().any(|o| o["id"] == "km.specialist.call"));
+    assert_eq!(ops::route_of("km.specialist.call"), "/v1/km/specialist/call");
+    if !crate::vision::AVAILABLE {
+        spec_kms(&km, &home.join("src"));
+        km.load(LoadReq::new("spec.vis")).await.unwrap();
+        let e = call(
+            &hub,
+            "km.specialist.call",
+            json!({"id": "spec.vis", "input": {"image": "aGVsbG8="}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!((e.status, e.code), (503, "unavailable"), "{}", e.message);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- the hub embedder drives KM search ------------------------------------------------------------------------
+
+/// A stand-in `/v1/embeddings`: the texts that mention rust get one direction, sql another, the rest a third.
+async fn embeddings_stub(seen: Arc<parking_lot::Mutex<Vec<Value>>>) -> (u16, tokio::task::JoinHandle<()>) {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/embeddings",
+        post(move |axum::Json(req): axum::Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().push(req.clone());
+                let texts: Vec<String> = match &req["input"] {
+                    Value::Array(a) => a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect(),
+                    Value::String(s) => vec![s.clone()],
+                    _ => vec![],
+                };
+                let data: Vec<Value> = texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let v = if t.contains("rust") {
+                            [1.0, 0.0, 0.0]
+                        } else if t.contains("sql") {
+                            [0.0, 1.0, 0.0]
+                        } else {
+                            [0.0, 0.0, 1.0]
+                        };
+                        json!({"object": "embedding", "index": i, "embedding": v})
+                    })
+                    .collect();
+                axum::Json(json!({"object": "list", "model": req["model"], "data": data}))
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    (
+        port,
+        tokio::spawn(async move {
+            let _ = axum::serve(l, app).await;
+        }),
+    )
+}
+
+#[tokio::test]
+async fn the_hub_embedder_ranks_km_search_with_the_vectors_the_hub_returns() {
+    let home = crate::testing::temp_home();
+    let hub = crate::testing::hub(&home, &["stub-embed"]);
+    let km = runtime(&hub.engine).unwrap();
+    let seen = Arc::new(parking_lot::Mutex::new(vec![]));
+    let (port, server) = embeddings_stub(seen.clone()).await;
+    let abort = server.abort_handle();
+    hub.engine
+        .adopt_as("stub-embed", port, "k", true, Some(Box::new(move || abort.abort())));
+    settings(&hub, |s| {
+        s.embedder = "hub".into();
+        s.embed_model = Some("stub-embed".into());
+    });
+    let src = home.join("src");
+    // the same words in both descriptors: only the centroids tell them apart
+    for (id, centroid) in [("code.rust", [1.0f32, 0.0, 0.0]), ("code.sql", [0.0, 1.0, 0.0])] {
+        let dir = Builder::new(&src, "adapter", id, "1.0.0")
+            .descriptor("shared words")
+            .embed_model("stub-embed")
+            .centroid_vec(&centroid)
+            .file("payload/a.gguf", "lora", "gguf", vec![3; 64])
+            .build();
+        import(&km, &dir);
+    }
+    for (query, first, second) in [
+        ("shared rust", "code.rust", "code.sql"),
+        ("shared sql", "code.sql", "code.rust"),
+    ] {
+        let r = call(&hub, "km.search", json!({"query": query})).await.unwrap();
+        assert_eq!(r["embedder"], "stub-embed", "{r}");
+        assert_eq!(r["results"][0]["id"], first, "{query}: {r}");
+        assert_eq!(r["results"][1]["id"], second);
+        assert_eq!(r["results"][0]["terms"]["vec"]["used"], true);
+        let (a, b) = (
+            r["results"][0]["terms"]["vec"]["value"].as_f64().unwrap(),
+            r["results"][1]["terms"]["vec"]["value"].as_f64().unwrap(),
+        );
+        assert!((a - 1.0).abs() < 1e-3 && b.abs() < 1e-3, "{a} {b}");
+    }
+    let asked = seen.lock().clone();
+    assert_eq!(asked.len(), 2);
+    assert_eq!(asked[0]["model"], "stub-embed");
+    assert_eq!(asked[0]["input"][0], "shared rust");
+    hub.engine.unload_all();
+    let _ = std::fs::remove_dir_all(&home);
 }
