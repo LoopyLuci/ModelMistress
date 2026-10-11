@@ -101,6 +101,8 @@ pub fn operations() -> Vec<Value> {
         op("km.data.list", "Records of a data KM's working copy, with filters", false, false,
            with(json!({"status": {"type": "string", "enum": ["pending", "approved", "rejected"]}, "split": {"type": "string"},
                        "tag": {"type": "string"}, "task": {"type": "string"}, "text": {"type": "string"},
+                       "min_quality": {"type": "number", "description": "only records whose labels.quality is at least this"},
+                       "source_kind": {"type": "string", "description": "only records whose source.kind is this (teacher, owner...)"},
                        "limit": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 0}})), &["id"]),
         op("km.data.get", "One record, optionally with every revision", false, false,
            with(json!({"record": {"type": "string"}, "history": {"type": "boolean"}})), &["id", "record"]),
@@ -113,6 +115,9 @@ pub fn operations() -> Vec<Value> {
            with(json!({"records": strings, "from_status": {"type": "string"}, "by": {"type": "string"}, "note": {"type": "string"}})), &["id"]),
         op("km.data.commit", "Turn the working copy's edits into a new version of the data KM (the old one is untouched)", true, false,
            json!({"id": id, "version": {"type": "string", "description": "default: the newest version with the patch number up by one"}}), &["id"]),
+        op("km.file.get", "Read one text file of an installed KM (a payload file, the eval set, README or km.toml; the path is checked against the manifest). Owner only", false, false,
+           json!({"id": id, "version": version, "channel": channel, "path": {"type": "string", "description": "as listed in km.show payload, e.g. payload/records.jsonl"},
+                  "max_bytes": {"type": "integer", "minimum": 1, "description": "default and ceiling 1048576"}}), &["id", "path"]),
         op("km.memory.query", "Retrieve chunks from a memory KM by similarity; returns chunk ids and scores for citation", false, false,
            json!({"id": id, "version": version, "channel": channel, "text": {"type": "string"},
                   "vector": {"type": "array", "items": {"type": "number"}, "description": "a query embedding, instead of text"},
@@ -232,6 +237,9 @@ fn list_items(km: &Km, a: &Value) -> Res<Value> {
         v["pinned"] = json!(o.pinned);
         v["banned"] = json!(o.banned);
         v["consolidation"] = r.consolidation.clone();
+        v["base"] = json!(r.base);
+        v["base_version"] = json!(r.base_version);
+        v["arch"] = json!(r.arch);
         out.push(v);
         if out.len() >= limit {
             break;
@@ -449,6 +457,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                 split: os(a, "split").map(str::to_string),
                 tag: os(a, "tag").map(str::to_string),
                 task: os(a, "task").map(str::to_string),
+                min_quality: a["min_quality"].as_f64(),
+                source_kind: os(a, "source_kind").map(str::to_string),
                 text: os(a, "text").map(str::to_string),
                 limit: a["limit"].as_u64().unwrap_or(0) as usize,
                 offset: a["offset"].as_u64().unwrap_or(0) as usize,
@@ -501,6 +511,36 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let k = km.clone();
             let rec = blocking(move || k.data.commit(&k.store, &id, ver.as_deref(), &Km::data_trust())).await?;
             json!({"committed": rec.key, "parent": rec.parent})
+        }
+        "km.file.get" => {
+            let (id, ver, ch) = target(a)?;
+            let rec = km.store.resolve(&id, ver.as_deref(), ch.as_deref())?;
+            let rel = s(a, "path")?;
+            let dir = km.store.dir_of(&rec.key);
+            let m = Manifest::from_file(&dir.join("km.toml"))?;
+            // only what the manifest names (or km.toml and README.md), never a path of the caller's making
+            if !(m.allowed_files().contains(rel) && rel != "SIGNATURE") || super::pack::safe_rel(rel).is_err() {
+                return Err(Fail::not_found(format!("{} has no file {rel:?}", rec.key)));
+            }
+            let cap = a["max_bytes"].as_u64().unwrap_or(1 << 20).min(1 << 20) as usize;
+            let path = dir.join(rel);
+            let rel_s = rel.to_string();
+            let key = rec.key.clone();
+            blocking(move || {
+                let bytes = std::fs::read(&path).map_err(|e| Fail::not_found(format!("{key}/{rel_s}: {e}")))?;
+                let total = bytes.len();
+                let cut = &bytes[..total.min(cap)];
+                let text = std::str::from_utf8(cut).map(str::to_string).or_else(|e| {
+                    // a multi-byte character cut at the end is not binary
+                    if e.error_len().is_none() && e.valid_up_to() > 0 {
+                        Ok(String::from_utf8_lossy(&cut[..e.valid_up_to()]).into_owned())
+                    } else {
+                        Err(Fail::invalid(format!("{key}/{rel_s} is not text ({total} bytes)")))
+                    }
+                })?;
+                Ok(json!({"key": key, "path": rel_s, "bytes": total, "truncated": total > cap, "text": text}))
+            })
+            .await?
         }
         "km.memory.query" => {
             let vector = a

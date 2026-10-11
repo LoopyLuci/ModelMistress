@@ -45,6 +45,10 @@ pub struct Filter {
     pub split: Option<String>,
     pub tag: Option<String>,
     pub task: Option<String>,
+    /// At least this `labels.quality`.
+    pub min_quality: Option<f64>,
+    /// `source.kind` (teacher, owner, ...).
+    pub source_kind: Option<String>,
     /// Substring of the record's JSON (case-insensitive).
     pub text: Option<String>,
     pub limit: usize,
@@ -179,6 +183,12 @@ impl DataStore {
                 continue;
             }
             if f.task.as_ref().is_some_and(|x| v["task"].as_str() != Some(x)) {
+                continue;
+            }
+            if f.min_quality.is_some_and(|q| v["labels"]["quality"].as_f64().is_none_or(|x| x < q)) {
+                continue;
+            }
+            if f.source_kind.as_ref().is_some_and(|k| v["source"]["kind"].as_str() != Some(k)) {
                 continue;
             }
             if let Some(t) = &f.tag {
