@@ -16,10 +16,10 @@ pub mod hub;
 pub mod image;
 pub mod km;
 pub mod pull;
-pub mod trace;
 pub mod speech;
 pub mod testing;
 pub mod tools;
+pub mod trace;
 pub mod tts;
 pub mod vision;
 
