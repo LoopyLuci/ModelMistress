@@ -111,8 +111,11 @@ requests.
 
 ## Native models
 
-Designed (`docs/native/architecture.md`); the training system and Dusty-1.0's conversion are being built. Nothing of
-Misty exists yet.
+Designed (`docs/native/architecture.md`). The Forge (`docs/native/forge.md`), an optional self-installed
+Python/PyTorch environment run by the hub over a JSON-lines protocol, works on Windows with ROCm on an RX 7900 XTX.
+Dusty-1.0 is built: Qwen3.5-4B converted to `qwen35moe` (the dense FFN is the shared expert, 64 empty routed slots
+per layer for Knowledge Modules), and its Q8_0 GGUF answers token for token like the base (10 of 10 prompts, log
+probabilities identical). Not yet: training Dusty's experts, consolidation, the base bake-off, anything of Misty.
 
 ## Not done yet
 
@@ -120,8 +123,9 @@ Misty exists yet.
 - Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
   multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
-- Training: being built as the Forge (an optional, self-installed Python/PyTorch environment).
-- The desktop app builds (Tauri, release) but its older pages (Overview, Models, Swarm, Settings) are placeholders.
+- Training beyond the Forge's conversion and checks: expert training, distillation, adapters.
+- The desktop app: a usable Chat, Models (including native models), Settings, Speech, Images and Vision, a shell
+  that starts its own hub and an installer are being built for 0.2.1; today's older pages are placeholders.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
 
 ## Legacy code
