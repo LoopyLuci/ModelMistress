@@ -128,6 +128,11 @@ Which experts each MoE layer picked for each generated token is recorded when th
 setting `routing` (`trace.settings`), or `"mm_routing": true` in a traced request. It costs a copy off the device per
 layer and token, so it is off by default; a request without it is served exactly as before.
 
+Measured on an RX 7900 XTX (Vulkan) with Qwen3-Coder-30B-A3B (48 layers, 8 of 128 experts), 256 tokens at
+temperature 0: the released hub 152.4 tokens/s, the patched hub without the flag 152.4 tokens/s (no cost), with the
+flag 33.5 tokens/s (about 4.5x slower: each layer's router output is read back from the GPU as the token is made).
+The text was identical in all three.
+
 - **Producer**: the bundled llama.cpp carries a small patch, `engines/patches/mm-routing.patch` (the submodule stays
   pinned; `src/build.rs` applies the patch before building, skips it if it is already applied, and stops the build if
   it does not apply to a newer llama.cpp). It installs the graph evaluation callback (`cb_eval`) in llama-server. The
