@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-pub use store::{Alt, TokenRec};
+pub use store::{Alt, RouteLayer, TokenRec};
 
 /// What the owner can set (`trace.settings`, kept in `<home>/trace/settings.json`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +35,9 @@ pub struct TraceSettings {
     pub enabled: bool,
     /// Alternatives recorded per token (llama-server's `top_logprobs`), 1 to 20.
     pub top_k: u32,
+    /// Record which experts a mixture-of-experts model picks for each token of a traced request (a request can ask
+    /// for it alone with `"mm_routing": true`). It costs a copy off the device per layer and token.
+    pub routing: bool,
     /// Delete traces older than this many days (0 = keep).
     pub max_age_days: u32,
     /// Delete the oldest traces when the stored size passes this many MB (0 = no limit).
@@ -46,6 +49,7 @@ impl Default for TraceSettings {
         Self {
             enabled: false,
             top_k: 8,
+            routing: false,
             max_age_days: 30,
             max_total_mb: 2048,
         }

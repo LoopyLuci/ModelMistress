@@ -34,7 +34,7 @@ for the `mm_trace` field, the header and one atomic flag.
   unless `mm_trace` is false: this is how the KM factory's model calls (`km-factory.md` §2) are recorded.
   These fields are removed before the request reaches the model.
 
-Settings (`<home>/trace/settings.json`): `enabled`, `top_k` (alternatives per token, 1 to 20, default 8),
+Settings (`<home>/trace/settings.json`): `enabled`, `top_k` (alternatives per token, 1 to 20, default 8), `routing` (record MoE expert routing, default off),
 `max_age_days` (default 30, 0 = keep), `max_total_mb` (default 2048, 0 = no limit). Retention deletes traces older
 than the age, then the oldest until the stored size fits; a running trace is never deleted.
 
@@ -42,7 +42,7 @@ than the age, then the oldest until the stored size fits; a running trace is nev
 
 `<home>/trace/traces.db` (SQLite, WAL): tables `traces`, `stages`, `events`, `specialist_calls`. Per-token data is in
 `<home>/trace/segments/<trace id>.tok`, a compact binary file (format in `src/trace/store.rs`): per token the id,
-logprob, entropy, phase, the alternatives, and a **reserved routing blob** for per-layer expert routing. Records are
+logprob, entropy, phase, the alternatives, and a **routing blob** for per-layer expert routing (MoE models, see below). Records are
 appended while the request runs, so a crash loses at most the last record. Export is JSON lines: one trace per line,
 with its stages, events and tokens (`trace.export`, `GET /v1/native/export`).
 
@@ -66,7 +66,7 @@ The KM runtime and the Forge only need to call these: a new kind of trace needs 
 are rows of (kind, JSON). Events the dashboard already understands:
 
 - `selection`: `{selected: [{id, score, why}], candidates: [...]}` fills "Selected knowledge modules";
-- `routing`: `{token, layer, experts: [ids], weights: [gate weights], n_experts}` fills the expert heat map.
+- `routing`: `{token, layer, experts: [ids], weights: [gate weights], n_experts}` fills the expert heat map (the hub's own events have `token: null` and summed weights, see "Expert routing capture").
 
 ### Jobs and tasks (the KM factory)
 
@@ -115,27 +115,33 @@ desktop app (Tauri) the same pages use the app's `hub_call` command; the live vi
 
 - **Thoughts**: follows requests live. Tokens are tinted by how unsure the model was; hover (or tap) a token for its
   probability, entropy and alternatives. Reasoning is a collapsible panel; stage timeline; resources; panels for the
-  selected KMs and the expert-routing heat map (filled from events when a producer exists). A box sends a traced
+  selected KMs and the expert-routing heat map (filled by the `routing` events of a traced MoE request). A box sends a traced
   request (browser only).
 - **Traces**: list with search, model, status, task and job filters; tracing settings; export. A trace opens with the
   same renderer; rerun with overrides or adapters removed; tick two traces and compare.
 
 Light and dark themes (system default, switch in the header); the layout works at phone width.
 
-## Not done yet: expert routing capture
+## Expert routing capture (mixture-of-experts models)
 
-The heat map and the `routing` event are in place; nothing produces them, because llama-server does not report which
-experts a layer chose. To add it:
+Which experts each MoE layer picked for each generated token is recorded when the request asks for it: tracing
+setting `routing` (`trace.settings`), or `"mm_routing": true` in a traced request. It costs a copy off the device per
+layer and token, so it is off by default; a request without it is served exactly as before.
 
-1. In the vendored llama.cpp, set `cparams.cb_eval` (the ggml scheduler's evaluation callback) from a small patch to
-   llama-server. The callback is called for each graph tensor with `ask == true` first (return true for the tensors we
-   want) and then with the data.
-2. Select the MoE router outputs by name: with `llama_set_graph_callback`/`cb(cur, "ffn_moe_topk", il)` the top-k
-   expert ids per token are the tensor `ffn_moe_topk-<layer>` and the gate weights `ffn_moe_weights-<layer>`.
-   Copy them off the device (`ggml_backend_tensor_get`) only when tracing asks, since it stalls the GPU.
-3. Expose the result per generated token in the response (an extension field such as `mm_routing:
-   [{layer, experts, weights}]`, enabled by a request field like `"mm_routing": true`), and have `capture.rs` write
-   it to the token's reserved `routing` blob and emit `routing` events.
-
-The same hook gives the logit-lens data for small cores. The patch must be small and kept in the engine's patch set
-so a llama.cpp update re-applies it.
+- **Producer**: the bundled llama.cpp carries a small patch, `engines/patches/mm-routing.patch` (the submodule stays
+  pinned; `src/build.rs` applies the patch before building, skips it if it is already applied, and stops the build if
+  it does not apply to a newer llama.cpp). It installs the graph evaluation callback (`cb_eval`) in llama-server. The
+  callback is idle (one atomic load per graph node) unless a decode contains a token of a request with
+  `"mm_routing": true`; then it asks for only the router tensors `ffn_moe_topk-<layer>` (expert ids) and
+  `ffn_moe_weights-<layer>` (their gate probabilities) and reads them with `ggml_backend_tensor_get`. The answer
+  carries `mm_routing`: non-streamed, `choices[0].mm_routing` is one entry per generated token (the same tokens as
+  `logprobs.content`); streamed, each chunk's `choices[0].mm_routing` is that token's entry. An entry is
+  `[{layer, experts: [ids], weights: [gate weights]}]`, the routing of the step that produced the token (its input
+  token). Not reported: speculative decoding, and tokens the server holds back (an incomplete UTF-8 character).
+- **Hub** (`src/trace/capture.rs`): sets `mm_routing` on the request sent to llama-server, parses the answer, writes
+  each token's layers into the token's routing blob (`store::encode_routing`: layer count u16, then per layer
+  `layer u16 | k u8 | k x expert u16 | k x weight f32`; the token API shows it decoded), and at the end of the request
+  emits one `routing` event per layer: `{token: null, tokens: N, layer, experts, weights}` with the gate weights summed
+  over the N tokens, which is what the heat map draws. If only the settings asked, the client does not get
+  `mm_routing` back; if the client asked, it does.
+- A model that is not a mixture of experts simply reports nothing.

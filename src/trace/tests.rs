@@ -272,6 +272,38 @@ fn settings_persist_and_are_clamped() {
     let _ = std::fs::remove_dir_all(home);
 }
 
+#[test]
+fn routing_blobs_round_trip_and_stay_inside_the_record() {
+    let l = |layer: u32| store::RouteLayer {
+        layer,
+        experts: vec![3, 70_000 % 65_536, 9],
+        weights: vec![0.5, 0.25, 0.125],
+    };
+    assert!(store::encode_routing(&[]).is_empty());
+    let blob = store::encode_routing(&[l(0), l(7)]);
+    let back = store::decode_routing(&blob).unwrap();
+    assert_eq!(
+        (back.len(), back[1].layer, back[1].experts[2], back[1].weights[0]),
+        (2, 7, 9, 0.5)
+    );
+    assert!(
+        store::decode_routing(&blob[..blob.len() - 1]).is_none(),
+        "a torn blob is not routing"
+    );
+    assert!(store::decode_routing(&[1, 2, 3]).is_none());
+    // far more layers than a record can hold: the blob still decodes, with fewer layers
+    let many: Vec<_> = (0..5000).map(l).collect();
+    let blob = store::encode_routing(&many);
+    assert!(blob.len() <= u16::MAX as usize);
+    assert!(store::decode_routing(&blob).unwrap().len() < 5000);
+    // and it survives the segment file
+    let mut t = tok("a", -0.1, 0, &[]);
+    t.routing = store::encode_routing(&[l(1)]);
+    let mut buf = header();
+    encode(&t, &mut buf);
+    assert_eq!(decode(&buf)[0].routing, t.routing);
+}
+
 // ---- a stand-in llama-server with log probabilities -------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -313,20 +345,28 @@ fn lp_entry(text: &str, k: usize) -> Value {
     json!({"token": text, "logprob": -0.2, "bytes": text.bytes().collect::<Vec<_>>(), "top_logprobs": alts})
 }
 
+/// What the patched llama-server reports for token `i` when the request has `mm_routing`: two MoE layers.
+fn route_entry(i: usize) -> Value {
+    json!([{"layer": 0, "experts": [i % 4, 4 + i % 2], "weights": [0.75, 0.25]},
+           {"layer": 1, "experts": [1, 2], "weights": [0.5, 0.5]}])
+}
+
 async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
     f.seen.lock().push(req.clone());
     let want_lp = req["logprobs"].as_bool().unwrap_or(false);
+    let want_route = req["mm_routing"].as_bool().unwrap_or(false);
     let k = req["top_logprobs"].as_u64().unwrap_or(0) as usize;
     let toks = script(&req);
     let timings = json!({"prompt_n": 6, "prompt_ms": 12.5, "predicted_n": toks.len(), "predicted_ms": 40.0,
                          "predicted_per_second": 200.0});
     if req["stream"].as_bool().unwrap_or(false) {
         let events = async_stream::stream! {
-            for (t, r) in toks {
+            for (i, (t, r)) in toks.into_iter().enumerate() {
                 let delta = if t.contains("think>") { json!({}) }
                     else if r { json!({"reasoning_content": t}) } else { json!({"content": t}) };
                 let mut c = json!({"index": 0, "delta": delta, "finish_reason": null});
                 if want_lp { c["logprobs"] = json!({"content": [lp_entry(&t, k)]}); }
+                if want_route { c["mm_routing"] = route_entry(i); }
                 yield Ok::<_, std::io::Error>(format!("data: {}\n\n", json!({"choices": [c]})));
             }
             let last = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "timings": timings});
@@ -345,6 +385,9 @@ async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
                             "message": {"role": "assistant", "content": content, "reasoning_content": reasoning}});
     if want_lp {
         choice["logprobs"] = json!({"content": toks.iter().map(|t| lp_entry(&t.0, k)).collect::<Vec<_>>()});
+    }
+    if want_route {
+        choice["mm_routing"] = json!((0..toks.len()).map(route_entry).collect::<Vec<_>>());
     }
     Json(json!({"model": req["model"], "choices": [choice], "timings": timings,
                 "usage": {"prompt_tokens": 6, "completion_tokens": toks.len(), "total_tokens": 6 + toks.len()}}))
@@ -976,4 +1019,107 @@ async fn the_dashboard_is_served_and_the_page_needs_no_token() {
             .status(),
         401
     );
+}
+
+// ---- expert routing ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn expert_routing_is_asked_for_recorded_and_summed_per_layer() {
+    let r = rig().await;
+    // not asked: the model's server is not asked either, and nothing is recorded
+    r.chat(json!({"mm_trace": true})).send().await.unwrap();
+    assert!(r.fake.seen.lock()[0].get("mm_routing").is_none());
+    let id = r.traces().await[0]["id"].as_str().unwrap().to_string();
+    let (_, t) = r.get(&format!("/v1/native/traces/{id}")).await;
+    assert!(t["events"].as_array().unwrap().iter().all(|e| e["kind"] != "routing"));
+
+    // the client asks: it gets the routing back, and the trace has it
+    let v: Value = r
+        .chat(json!({"mm_trace": true, "mm_routing": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r.fake.seen.lock().last().unwrap()["mm_routing"], true);
+    assert_eq!(v["choices"][0]["mm_routing"].as_array().unwrap().len(), 8);
+    let items = r.traces().await;
+    let id = items.iter().find(|t| t["id"] != id.as_str()).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, toks) = r.get(&format!("/v1/native/traces/{id}/tokens")).await;
+    let routing = &toks["tokens"][2]["routing"];
+    assert_eq!(routing[0]["layer"], 0);
+    assert_eq!(routing[0]["experts"], json!([2, 4]));
+    assert_eq!(routing[0]["weights"], json!([0.75, 0.25]));
+    assert_eq!(routing[1]["experts"], json!([1, 2]));
+    let (_, t) = r.get(&format!("/v1/native/traces/{id}")).await;
+    let ev: Vec<&Value> = t["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "routing")
+        .collect();
+    assert_eq!(ev.len(), 2, "one event per layer");
+    let l1 = ev.iter().find(|e| e["data"]["layer"] == 1).unwrap();
+    assert_eq!(l1["data"]["experts"], json!([1, 2]));
+    assert_eq!(l1["data"]["weights"], json!([4.0, 4.0]), "8 tokens at 0.5 each");
+    assert_eq!(l1["data"]["tokens"], 8);
+    let l0 = ev.iter().find(|e| e["data"]["layer"] == 0).unwrap();
+    assert_eq!(l0["data"]["experts"], json!([0, 1, 2, 3, 4, 5]));
+}
+
+#[tokio::test]
+async fn the_tracing_setting_asks_for_routing_without_the_client_seeing_it() {
+    let r = rig().await;
+    tracer(&r.home)
+        .set_settings(TraceSettings {
+            routing: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let v: Value = r
+        .chat(json!({"mm_trace": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r.fake.seen.lock()[0]["mm_routing"], true);
+    assert!(v["choices"][0].get("mm_routing").is_none(), "the client did not ask");
+
+    let plain = r
+        .chat(json!({"stream": true}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let traced = r
+        .chat(json!({"stream": true, "mm_trace": true}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(traced, plain, "the stream is unchanged");
+    assert!(!traced.contains("mm_routing"));
+    let items = r.traces().await;
+    assert_eq!(items.len(), 2);
+    let id = items[0]["id"].as_str().unwrap();
+    let (_, t) = r.get(&format!("/v1/native/traces/{id}")).await;
+    let n = t["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "routing")
+        .count();
+    assert_eq!(n, 2, "the streamed trace has its routing too");
+    let (_, toks) = r.get(&format!("/v1/native/traces/{id}/tokens")).await;
+    assert_eq!(toks["tokens"][7]["routing"][0]["experts"], json!([3, 5]));
 }
