@@ -68,7 +68,7 @@ fn fragment(dir: &Path, layer: u32, fill: u8) -> Vec<u8> {
 }
 
 struct Rig {
-    home: PathBuf,
+    home: crate::testing::TestDir,
     km: Arc<Km>,
     stub: Arc<Stub>,
     lora: Arc<Recorder>,
@@ -166,7 +166,7 @@ async fn experts_kms_are_assembled_into_the_core_and_hot_swapped_then_the_base_c
     let all = r.stub.instances.lock().clone();
     assert!(all[..all.len() - 1].iter().all(|i| i.is_stopped()));
     assert!(!all[all.len() - 1].is_stopped());
-    let _ = std::fs::remove_dir_all(&r.home);
+    let _ = std::fs::remove_dir_all(r.home.as_path());
 }
 
 #[tokio::test]
@@ -188,7 +188,7 @@ async fn a_swap_that_fails_refuses_the_load_with_the_reason_and_keeps_what_ran_b
     r.km.load(req("ex.b")).await.unwrap();
     let h = assemble::read_header(&r.stub.current.lock().clone().unwrap()).unwrap();
     assert!(h.tensors.contains_key("blk.1.ffn_up_exps.weight"));
-    let _ = std::fs::remove_dir_all(&r.home);
+    let _ = std::fs::remove_dir_all(r.home.as_path());
 }
 
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn an_experts_km_that_does_not_fit_the_core_is_refused_before_anything_swa
     );
     assert!(r.stub.swaps.lock().is_empty());
     assert!(r.km.manager.resident_keys().is_empty());
-    let _ = std::fs::remove_dir_all(&r.home);
+    let _ = std::fs::remove_dir_all(r.home.as_path());
 }
 
 #[tokio::test]
@@ -234,7 +234,7 @@ async fn the_composed_attacher_sends_adapters_to_lora_and_experts_to_assembly() 
     assert_eq!(r.stub.swaps.lock().len(), 1, "removing an adapter does not reassemble");
     assert!(r.stub.current.lock().is_some(), "the experts stay in");
     let _ = json!({});
-    let _ = std::fs::remove_dir_all(&r.home);
+    let _ = std::fs::remove_dir_all(r.home.as_path());
 }
 
 #[tokio::test]
