@@ -20,6 +20,8 @@ pub struct HubLink {
     /// None: a fixed hub that is never started or searched for (tests, or a hub the user named).
     home: Option<PathBuf>,
     client: Arc<Mutex<Option<Arc<Client>>>>,
+    /// Start a hub inside the app when none answers (off once the app manages the hub process itself).
+    embed: bool,
 }
 
 impl HubLink {
@@ -31,7 +33,19 @@ impl HubLink {
         Self {
             home: Some(home),
             client: Arc::new(Mutex::new(None)),
+            embed: true,
         }
+    }
+
+    /// The home this link looks in.
+    pub fn home(&self) -> Option<PathBuf> {
+        self.home.clone()
+    }
+
+    /// Never start a hub inside the app: the app's own lifecycle (`hub_proc`) decides that.
+    pub fn without_embedded(mut self) -> Self {
+        self.embed = false;
+        self
     }
 
     /// A hub at a known address with its token.
@@ -39,6 +53,7 @@ impl HubLink {
         Self {
             home: None,
             client: Arc::new(Mutex::new(Some(Arc::new(Client::new(url, token))))),
+            embed: false,
         }
     }
 
@@ -56,6 +71,7 @@ impl HubLink {
         };
         let c = match Client::find(Some(home.clone())).await {
             Ok(c) => c,
+            Err(e) if !self.embed => return Err(e),
             Err(_) => {
                 start_embedded(home).await?;
                 Client::find(Some(home.clone()))
@@ -70,7 +86,7 @@ impl HubLink {
 }
 
 /// Run a hub in this process (as `model-mistress serve` does) and wait until it has written its control file.
-async fn start_embedded(home: &std::path::Path) -> Result<()> {
+pub async fn start_embedded(home: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(home)?;
     let _ = std::fs::remove_file(home.join("control.json")); // a dead hub's
     let settings = Settings::load(home).map_err(anyhow::Error::msg)?;

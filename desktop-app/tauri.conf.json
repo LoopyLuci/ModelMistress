@@ -1,29 +1,34 @@
 {
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ModelMistress",
+  "version": "0.2.1",
+  "identifier": "dev.modelmistress.app",
   "build": {
-    "withGlobalTauri": true
+    "frontendDist": "../frontend/dist"
   },
-  "tauri": {
+  "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Model Mistress",
+        "label": "main",
+        "title": "ModelMistress",
         "width": 1200,
         "height": 800
       }
     ],
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.model.mistress",
-      "icon": [
-        "icons/32x32.png"
-      ]
-    },
-    "allowlist": {
-      "all": true
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' data: blob: http://127.0.0.1:*; media-src 'self' blob: http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
+      "capabilities": ["default"]
     }
   },
-  "package": {
-    "productName": "Model Mistress",
-    "version": "0.2.0"
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "externalBin": ["binaries/model-mistress"],
+    "shortDescription": "Local models behind one OpenAI-compatible API",
+    "windows": {
+      "nsis": { "installMode": "currentUser" }
+    }
   }
 }

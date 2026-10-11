@@ -1,6 +1,8 @@
-// How the dashboard talks to the hub. Inside the desktop app (Tauri) it goes through the app's commands; in a plain
-// browser (the hub serves this page at /ui) it uses fetch with the owner's token, which the page asks for once and
-// keeps in sessionStorage (this tab only), never in the URL.
+// How the dashboard talks to the hub. In a plain browser (the hub serves this page at /ui) it uses fetch with the
+// owner's token, which the page asks for once and keeps in sessionStorage (this tab only), never in the URL. Inside
+// the desktop app (Tauri) the app tells the page where its hub is and the hub's token (`hub_info`), and the page
+// calls the hub with fetch too (so streaming works: chat, /v1/native/stream, job progress); operations still go
+// through the app's `hub_call` command.
 import { reactive } from 'vue'
 
 const KEY = 'mm_token'
@@ -8,6 +10,25 @@ const KEY = 'mm_token'
 export const auth = reactive({ token: sessionStorage.getItem(KEY) || '', error: '' })
 
 export const inTauri = (): boolean => !!(window as any).__TAURI__
+
+/** Call one of the desktop app's commands (Tauri 2: core.invoke; Tauri 1: tauri.invoke). */
+export function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<any> {
+  const t = (window as any).__TAURI__
+  return (t.core?.invoke ?? t.tauri.invoke)(cmd, args)
+}
+
+let hubInfoCache: Promise<{ url: string; token: string }> | null = null
+
+/** Where the app's hub is and its token (desktop app only). Waits while the app starts the hub. */
+export function hubInfo(): Promise<{ url: string; token: string }> {
+  if (!hubInfoCache) {
+    hubInfoCache = invoke('hub_info').catch((e) => {
+      hubInfoCache = null
+      throw typeof e === 'string' ? new Error(e) : e
+    })
+  }
+  return hubInfoCache
+}
 
 export const needsToken = (): boolean => !inTauri() && !auth.token
 
@@ -29,13 +50,25 @@ const base = (): string => ((import.meta as any).env?.VITE_HUB_URL as string) ||
 
 async function http(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers || {})
-  headers.set('Authorization', `Bearer ${auth.token}`)
+  let root = base()
+  if (inTauri()) {
+    const info = await hubInfo()
+    root = info.url
+    headers.set('Authorization', `Bearer ${info.token}`)
+  } else {
+    headers.set('Authorization', `Bearer ${auth.token}`)
+  }
   let r: Response
   try {
-    r = await fetch(base() + path, { ...init, headers })
+    r = await fetch(root + path, { ...init, headers })
   } catch (e) {
     if ((e as any)?.name === 'AbortError') throw e
+    if (inTauri()) hubInfoCache = null // the hub may have been restarted on another port
     throw new Error('the hub is not reachable')
+  }
+  if (inTauri() && (r.status === 401 || r.status === 403)) {
+    hubInfoCache = null // a restarted hub has a new token; the next call asks the app again
+    return r
   }
   if (r.status === 401 || r.status === 403) {
     signOut(r.status === 401 ? 'That token was not accepted.' : 'The hub refused this token.')
@@ -57,9 +90,78 @@ async function failure(r: Response): Promise<Error> {
   return e
 }
 
+/** Fetch from the hub with the right base URL and bearer token (browser: same origin and the signed-in token;
+ *  desktop app: the app's hub). Returns the Response; check `ok` yourself. */
+export function hubFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  return http(path, init)
+}
+
+/** Call the hub and read a server-sent event stream (for example POST /v1/chat/completions with stream:true, or
+ *  GET /v1/native/stream with no body). `body` null = GET, else POST as JSON. Each `data:` payload is parsed as JSON
+ *  and passed to `onEvent` (with the event name as the second argument when the stream gives one); `data: [DONE]`
+ *  ends the stream. Resolves when the stream ends; rejects when the hub refuses or is unreachable; aborting `signal`
+ *  stops it early and resolves quietly. */
+export async function sse(
+  path: string,
+  body: unknown,
+  onEvent: (data: any, event?: string) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  try {
+    const r = await http(path, {
+      method: body == null ? 'GET' : 'POST',
+      signal,
+      headers: { Accept: 'text/event-stream', ...(body == null ? {} : { 'Content-Type': 'application/json' }) },
+      body: body == null ? undefined : JSON.stringify(body),
+    })
+    if (!r.ok || !r.body) throw await failure(r)
+    await readSse(r.body.getReader(), onEvent)
+  } catch (e) {
+    if ((e as any)?.name === 'AbortError' || signal?.aborted) return
+    throw e
+  }
+}
+
+async function readSse(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onEvent: (data: any, event?: string) => void,
+): Promise<void> {
+  const dec = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    let i: number
+    while ((i = buf.search(/\r?\n\r?\n/)) >= 0) {
+      const block = buf.slice(0, i)
+      buf = buf.slice(i).replace(/^\r?\n\r?\n/, '')
+      const lines = block.split(/\r?\n/)
+      const data = lines
+        .filter((l) => l.startsWith('data:'))
+        .map((l) => l.slice(5).replace(/^ /, ''))
+        .join('\n')
+      const ev = lines.find((l) => l.startsWith('event:'))?.slice(6).trim()
+      if (!data) continue
+      if (data.trim() === '[DONE]') return
+      try {
+        onEvent(JSON.parse(data), ev)
+      } catch (_) {
+        /* a broken line */
+      }
+    }
+  }
+}
+
 /** Run one hub operation (the same names MCP and POST /v1/call/{op} use). */
 export async function call(op: string, args: Record<string, unknown> = {}): Promise<any> {
-  if (inTauri()) return (window as any).__TAURI__.tauri.invoke('hub_call', { op, args })
+  if (inTauri()) {
+    try {
+      return await invoke('hub_call', { op, args })
+    } catch (e) {
+      throw typeof e === 'string' ? new Error(e) : e
+    }
+  }
   const r = await http(`/v1/call/${op}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -71,18 +173,14 @@ export async function call(op: string, args: Record<string, unknown> = {}): Prom
 
 export type LiveState = 'connecting' | 'live' | 'down'
 
-/** Live trace events: server-sent events in a browser (read with fetch so the token stays in a header), polling in
- *  the desktop app. Returns a function that stops it. */
+/** Live trace events: server-sent events (read with fetch so the token stays in a header), in the browser and in the
+ *  desktop app. Returns a function that stops it. */
 export function subscribe(onEvent: (e: any) => void, onState: (s: LiveState) => void): () => void {
-  return inTauri() ? poll(onEvent, onState) : sse(onEvent, onState)
-}
-
-function sse(onEvent: (e: any) => void, onState: (s: LiveState) => void): () => void {
   const stop = new AbortController()
   const run = async () => {
     let wait = 1000
     while (!stop.signal.aborted) {
-      if (!auth.token) {
+      if (!inTauri() && !auth.token) {
         onState('down')
         await new Promise((ok) => setTimeout(ok, 500))
         continue
@@ -93,31 +191,7 @@ function sse(onEvent: (e: any) => void, onState: (s: LiveState) => void): () => 
         if (!r.ok || !r.body) throw await failure(r)
         onState('live')
         wait = 1000
-        const reader = r.body.getReader()
-        const dec = new TextDecoder()
-        let buf = ''
-        for (;;) {
-          const { value, done } = await reader.read()
-          if (done) break
-          buf += dec.decode(value, { stream: true })
-          let i: number
-          while ((i = buf.search(/\r?\n\r?\n/)) >= 0) {
-            const block = buf.slice(0, i)
-            buf = buf.slice(i).replace(/^\r?\n\r?\n/, '')
-            const data = block
-              .split(/\r?\n/)
-              .filter((l) => l.startsWith('data:'))
-              .map((l) => l.slice(5).trim())
-              .join('\n')
-            if (data) {
-              try {
-                onEvent(JSON.parse(data))
-              } catch (_) {
-                /* a broken line */
-              }
-            }
-          }
-        }
+        await readSse(r.body.getReader(), (e) => onEvent(e))
       } catch (_) {
         if (stop.signal.aborted) return
       }
@@ -130,48 +204,8 @@ function sse(onEvent: (e: any) => void, onState: (s: LiveState) => void): () => 
   return () => stop.abort()
 }
 
-function poll(onEvent: (e: any) => void, onState: (s: LiveState) => void): () => void {
-  let alive = true
-  const seen = new Map<string, number>() // running trace id -> tokens already sent on
-  const tick = async () => {
-    try {
-      const l = await call('trace.list', { status: 'running', limit: 20 })
-      onState('live')
-      const running = new Set<string>()
-      for (const t of l.items as any[]) {
-        running.add(t.id)
-        if (!seen.has(t.id)) {
-          seen.set(t.id, 0)
-          onEvent({ type: 'trace.start', trace: t.id, model: t.model, kind: t.kind, ts: t.started_ms })
-        }
-        const have = seen.get(t.id)!
-        const r = await call('trace.tokens', { id: t.id, offset: have, limit: 2000 })
-        if (r.tokens.length) {
-          seen.set(t.id, have + r.tokens.length)
-          onEvent({ type: 'tokens', trace: t.id, offset: have, tokens: r.tokens })
-        }
-      }
-      for (const id of [...seen.keys()]) {
-        if (!running.has(id)) {
-          seen.delete(id)
-          onEvent({ type: 'trace.finish', trace: id })
-        }
-      }
-    } catch (_) {
-      onState('down')
-    }
-    if (alive) setTimeout(tick, 800)
-  }
-  tick()
-  return () => {
-    alive = false
-  }
-}
-
-/** Send a chat request that is traced; the answer itself is not used here (the Thoughts page shows it live).
- *  Browser only. */
+/** Send a chat request that is traced; the answer itself is not used here (the Thoughts page shows it live). */
 export async function chatTraced(model: string, prompt: string, signal: AbortSignal): Promise<void> {
-  if (inTauri()) throw new Error('sending a request from here needs a browser; any client can send one with mm_trace')
   const r = await http('/v1/chat/completions', {
     method: 'POST',
     signal,
