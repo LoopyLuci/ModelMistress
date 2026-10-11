@@ -204,6 +204,12 @@ fn op(id: &str, summary: &str, mutating: bool, destructive: bool, props: Value, 
 }
 
 pub fn operations() -> Vec<Value> {
+    let mut ops = base_operations();
+    ops.extend(crate::forge::operations());
+    ops
+}
+
+fn base_operations() -> Vec<Value> {
     let model = json!({"type": "string", "description": "a model id from model.list, or ollama/<name>"});
     let load_props = json!({
         "model": model,
@@ -846,6 +852,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let body = tools::check_rerank(a).map_err(Fail::invalid)?;
             forward_json(hub, "/v1/rerank", body).await?
         }
+        id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
         "key.create" | "key.list" | "key.revoke" | "usage.get" => key_call(&hub.keys, id, a).map_err(ApiError::from)?,
         "config.get" => shown_settings(&e.settings()),

@@ -97,6 +97,15 @@ pub struct Settings {
     pub image_model: Option<String>,
     /// Allow `serve --host` to listen beyond this machine (it also needs at least one peer key). Off by default.
     pub allow_network: bool,
+    /// The Forge (training): where its Python environment lives (`<forge_dir>/env`). Unset: MM_FORGE_DIR, else
+    /// `<home>/forge`.
+    pub forge_dir: Option<PathBuf>,
+    /// The Forge's weights, checkpoints and outputs. Unset: MM_FORGE_DATA_DIR, else `<forge_dir>/data`.
+    pub forge_data_dir: Option<PathBuf>,
+    /// The `forge` folder holding `mm_forge/` and the requirements. Unset: MM_FORGE_SRC, else looked for near the program.
+    pub forge_src: Option<PathBuf>,
+    /// The Python that creates the Forge environment. Unset: MM_FORGE_PYTHON, else `python` on PATH.
+    pub forge_python: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -123,6 +132,10 @@ impl Default for Settings {
             tts_voice: None,
             image_model: None,
             allow_network: false,
+            forge_dir: None,
+            forge_data_dir: None,
+            forge_src: None,
+            forge_python: None,
         }
     }
 }

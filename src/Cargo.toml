@@ -48,6 +48,7 @@ nix = { version = "0.29", features = ["signal"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 async-stream = "0.3"
 num_enum = "0.7"
+rusqlite = { version = "0.32", features = ["bundled"] }   # the Forge's run store
 clap = { version = "4", features = ["derive", "env"] }
 opentelemetry = { version = "0.22", optional = true }
 opentelemetry-otlp = { version = "0.13", optional = true, features = ["reqwest-client"] }

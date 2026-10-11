@@ -1,0 +1,19 @@
+# ModelMistress Forge: the worker's Python environment on Windows with an AMD GPU (ROCm 7.2.1).
+# Needs Python 3.12 (the wheels are cp312) and an AMD graphics driver that supports ROCm on Windows (26.2.2 or newer).
+# Tested on a Radeon RX 7900 XTX (gfx1100). The wheels are AMD's own (repo.radeon.com); each URL carries its SHA-256,
+# which pip checks. forge.install runs `pip install -r` on this file.
+rocm-sdk-core @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl#sha256=f68989d48df71cbfc3cb68bf705dc37c0f56e9666feddb59a1a0f5ff7539fe1c
+rocm-sdk-libraries-custom @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl#sha256=c7fe0b0731af8896093ff69e11496830d3cb6a4aed73e895c60b7cbdc200be92
+rocm @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz#sha256=9084902eaa69213a00a90784ad89e6e5fe73c702df0cc6cc3a70d777c7a6142b
+torch @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl#sha256=e88bf270163b48f7f27f7ea3db5ffb3be4ba107301933022bcb3c6ddedfeeabb
+
+# the rest comes from PyPI
+numpy==2.2.6
+safetensors==0.8.0
+huggingface_hub==0.36.2
+transformers==4.57.6
+sentencepiece==0.2.2
+protobuf==4.25.9
+tqdm==4.70.1
+PyYAML==6.0.3
+pytest==9.1.1
