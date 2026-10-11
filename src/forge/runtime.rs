@@ -162,10 +162,8 @@ pub fn llama_cpp_src(forge_src: Option<&Path>) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("mm-forge-rt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn dir() -> crate::testing::TestDir {
+        crate::testing::TestDir::new("mm-forge-rt")
     }
 
     #[test]

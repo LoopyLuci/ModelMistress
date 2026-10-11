@@ -968,10 +968,8 @@ mod tests {
 
     #[test]
     fn deleting_refuses_models_it_did_not_download() {
-        let home = std::env::temp_dir().join(format!("mm-pull-del-{}", std::process::id()));
-        let elsewhere = std::env::temp_dir().join(format!("mm-pull-other-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&elsewhere);
+        let home = crate::testing::TestDir::lazy("mm-pull-del");
+        let elsewhere = crate::testing::TestDir::new("mm-pull-other");
         std::fs::create_dir_all(&elsewhere).unwrap();
         crate::catalog::tests_support::gguf(&elsewhere.join("theirs.gguf"), "llama", "T");
         let snap = home.join("hub/models--org--M-GGUF/snapshots/abc");

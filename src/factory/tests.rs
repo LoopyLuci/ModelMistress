@@ -238,7 +238,7 @@ async fn fake_chat(State(f): State<Fake>, Json(req): Json<Value>) -> Response {
 }
 
 struct Rig {
-    home: PathBuf,
+    home: crate::testing::TestDir,
     hub: Hub,
     f: Arc<Factory>,
     fake: Fake,

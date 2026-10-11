@@ -110,6 +110,13 @@ pub fn tracer(home: &Path) -> Arc<Tracer> {
     t
 }
 
+/// Let go of the tracer of a home folder (tests, before they remove it).
+pub(crate) fn forget_tracer(home: &Path) {
+    if let Some(m) = REGISTRY.get() {
+        m.lock().remove(home);
+    }
+}
+
 impl Tracer {
     fn new(home: &Path) -> Self {
         let settings = std::fs::read(home.join("trace").join("settings.json"))

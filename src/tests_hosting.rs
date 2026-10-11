@@ -13,7 +13,7 @@ struct Rig {
     hub: Hub,
     url: String,
     http: reqwest::Client,
-    home: std::path::PathBuf,
+    home: crate::testing::TestDir,
     _server: tokio::task::JoinHandle<()>,
 }
 

@@ -123,7 +123,7 @@ pub(crate) mod tests {
     pub struct Rig {
         pub link: HubLink,
         pub hub: Hub,
-        pub home: PathBuf,
+        pub home: testing::TestDir,
         _task: tokio::task::JoinHandle<()>,
     }
 

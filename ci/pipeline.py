@@ -274,7 +274,11 @@ def smoke() -> tuple[bool, str]:
             kill_tree(proc.pid)
         for pid in pids_alive(children):
             kill_tree(pid)
-        shutil.rmtree(home, ignore_errors=True)
+        for _ in range(10):   # a just-killed process can still hold a file for a moment
+            shutil.rmtree(home, ignore_errors=True)
+            if not home.exists():
+                break
+            time.sleep(0.5)
 
 
 FUNCS = {"preflight": preflight, "static": static, "tests": tests, "build": build, "smoke": smoke}

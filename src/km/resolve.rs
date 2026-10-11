@@ -212,7 +212,7 @@ mod tests {
         s.install(&stage, &m, &t, 0).unwrap().0
     }
 
-    fn setup() -> (std::path::PathBuf, Store) {
+    fn setup() -> (crate::testing::TestDir, Store) {
         let home = crate::testing::temp_home();
         let s = Store::open(&home).unwrap();
         (home, s)

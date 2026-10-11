@@ -124,9 +124,74 @@ pub async fn serve(hub: Hub) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, task)
 }
 
-/// A new empty folder under the system temp folder.
-pub fn temp_home() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("mm-test-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&p).expect("a temp folder");
-    p
+/// A new empty folder under the system temp folder, removed again when this is dropped (also when the test panics).
+/// Derefs to the folder's path.
+pub struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    /// A fresh folder named `<prefix>-<random>`.
+    pub fn new(prefix: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).expect("a temp folder");
+        TestDir(p)
+    }
+
+    /// A path of the form `<prefix>-<random>` that is not created now, but removed on drop if it exists by then.
+    pub fn lazy(prefix: &str) -> Self {
+        TestDir(std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4())))
+    }
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &std::path::PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        // The runtimes kept per home folder hold databases open in it.
+        crate::km::forget_runtime(&self.0);
+        crate::factory::forget_runtime(&self.0);
+        crate::trace::forget_tracer(&self.0);
+        crate::forge::forget_forge(&self.0);
+        if std::fs::remove_dir_all(&self.0).is_err() && self.0.exists() {
+            // A database or a server task of the test can still hold a file (Windows will not delete it then): try
+            // again when the test's thread ends, by which time its runtime and everything in it are gone.
+            let p = self.0.clone();
+            let _ = LEFT.try_with(|l| l.0.borrow_mut().push(p));
+        }
+    }
+}
+
+thread_local! {
+    /// Folders of [`TestDir`]s that could not be removed when they were dropped.
+    static LEFT: Left = const { Left(std::cell::RefCell::new(Vec::new())) };
+}
+
+struct Left(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+impl Drop for Left {
+    fn drop(&mut self) {
+        for p in self.0.get_mut().drain(..) {
+            for _ in 0..40 {
+                if std::fs::remove_dir_all(&p).is_ok() || !p.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// A new empty folder under the system temp folder (see [`TestDir`]).
+pub fn temp_home() -> TestDir {
+    TestDir::new("mm-test")
 }

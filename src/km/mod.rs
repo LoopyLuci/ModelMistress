@@ -194,6 +194,13 @@ pub fn runtime(engine: &Arc<Engine>) -> Res<Arc<Km>> {
     Ok(k)
 }
 
+/// Let go of the runtime of a home folder (tests, before they remove it).
+pub(crate) fn forget_runtime(home: &Path) {
+    if let Some(m) = RUNTIMES.get() {
+        m.lock().remove(home);
+    }
+}
+
 impl Km {
     pub fn open(engine: Arc<Engine>) -> Res<Arc<Km>> {
         let store = Store::open(&engine.home)?;

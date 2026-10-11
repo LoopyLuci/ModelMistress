@@ -65,6 +65,13 @@ pub fn forge_for(hub: &Hub) -> Arc<Forge> {
         .clone()
 }
 
+/// Let go of the forge of a home folder (tests, before they remove it).
+pub(crate) fn forget_forge(home: &Path) {
+    if let Some(m) = FORGES.get() {
+        m.lock().remove(home);
+    }
+}
+
 // ---- where things are --------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]

@@ -534,7 +534,6 @@ mod tests {
     use super::*;
     use crate::km::pack::{SigState, Source};
     use crate::km::sample;
-    use std::path::PathBuf;
 
     fn own() -> Trust {
         Trust {
@@ -544,7 +543,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (PathBuf, Store, DataStore) {
+    fn setup() -> (crate::testing::TestDir, Store, DataStore) {
         let home = crate::testing::temp_home();
         let s = Store::open(&home).unwrap();
         let d = DataStore::open(&home).unwrap();
