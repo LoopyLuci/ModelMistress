@@ -138,3 +138,5 @@ a.btn.primary { color: var(--accent-text); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .skip { position: absolute; left: -999px; top: 0; background: var(--accent); color: var(--accent-text); padding: 6px 10px; z-index: 10; }
 .skip:focus { left: 8px; top: 8px; }
+.pill.awaiting_approval, .pill.budget { color: var(--warn); }
+.pill.created, .pill.skipped { color: var(--muted); }
