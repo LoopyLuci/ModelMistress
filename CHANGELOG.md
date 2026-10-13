@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Serving for agents
+- **Serving profiles**: `[profiles."<model id>"]` and `[serving]` in `config.toml`, and the same fields in `model.load`:
+  `ctx_per_slot`, `cache_type_k`, `cache_type_v`, `flash_attn`, `cache_prompt`, `cache_reuse`, `cache_ram_mib`,
+  `kv_unified`, `batch_size`, `ubatch_size`, `jinja`, `chat_template_file` (plus the existing `ctx_size`, `gpu_layers`,
+  `parallel`). Checked before a server starts. Unset options add no flag, so existing configs start models as before.
+- `GET /v1/models` and `model.loaded` report `serving`: the real context window per slot, slots, KV types and the VRAM
+  of each loaded model.
+- **VRAM planner**: a load whose estimate does not fit the GPU unloads the least recently used idle models or is
+  refused with `503 insufficient_vram` instead of spilling (`vram_guard`, `vram_margin_mib`, `skip_vram_check`).
+  New operation `model.plan`. See `docs/serving.md`.
+
 ## 0.2.1 — 2026-10-11
 
 The desktop app, ready for daily use.

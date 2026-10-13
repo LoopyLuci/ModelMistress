@@ -108,11 +108,18 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `GET /ui` | the dashboard |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
-`model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
+`model.plan`, `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
 `chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `vision.analyze`, `quantize`, `lora`, `speculative`, `embeddings.create`,
 `rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
 `config.set`, and the families `km.*`, `factory.*` and `trace.*` (`GET /v1/operations` lists every one with its
 schema). Every operation is also an MCP tool.
+
+## Serving agents
+
+Per-model serving profiles (`[profiles."<model id>"]` in `config.toml`: context per slot, parallel slots, KV-cache
+types, flash attention, prompt caching, batch sizes, chat template), the real context window and VRAM of each loaded
+model in `GET /v1/models` (`serving`) and `model.loaded`, and a VRAM planner that refuses or unloads the least recently
+used model instead of letting a load spill: [docs/serving.md](docs/serving.md).
 
 ## Development
 

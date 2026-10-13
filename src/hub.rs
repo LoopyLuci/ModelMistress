@@ -235,7 +235,20 @@ fn core_operations() -> Vec<Value> {
         "extra_args": {"type": "array", "items": {"type": "string"}, "description": "more llama-server arguments"},
         "cpu_moe": {"type": "boolean", "description": "mixture-of-experts: all expert tensors in system memory, the rest on the GPU (default: on for MM's own models)"},
         "n_cpu_moe": {"type": "integer", "minimum": 0, "description": "mixture-of-experts: the experts of the first N layers in system memory"},
-        "reload": {"type": "boolean", "description": "hot swap: load a fresh copy beside the running one and switch over when it is ready; requests in progress finish on the old copy"}
+        "reload": {"type": "boolean", "description": "hot swap: load a fresh copy beside the running one and switch over when it is ready; requests in progress finish on the old copy"},
+        "ctx_per_slot": {"type": "integer", "minimum": 1, "description": "context tokens per slot (the server gets ctx_per_slot x parallel); wins over ctx_size"},
+        "cache_type_k": {"type": "string", "enum": crate::serving::KV_TYPES, "description": "KV-cache type for keys (-ctk)"},
+        "cache_type_v": {"type": "string", "enum": crate::serving::KV_TYPES, "description": "KV-cache type for values (-ctv); a quantised one needs flash attention"},
+        "flash_attn": {"type": "string", "enum": ["on", "off", "auto"], "description": "flash attention (-fa)"},
+        "cache_prompt": {"type": "boolean", "description": "keep each slot's prompt between requests (--cache-prompt)"},
+        "cache_reuse": {"type": "integer", "minimum": 0, "description": "smallest chunk to reuse from the cache by KV shifting (--cache-reuse)"},
+        "cache_ram_mib": {"type": "integer", "minimum": -1, "description": "RAM for prompt caches outside the slots (--cache-ram; 0 = off, -1 = no limit)"},
+        "kv_unified": {"type": "boolean", "description": "one KV buffer shared by all slots (--kv-unified)"},
+        "batch_size": {"type": "integer", "minimum": 1, "description": "logical batch size (-b)"},
+        "ubatch_size": {"type": "integer", "minimum": 1, "description": "physical batch size (-ub)"},
+        "jinja": {"type": "boolean", "description": "Jinja chat template engine (--jinja), needed for tool calls"},
+        "chat_template_file": {"type": "string", "description": "a Jinja chat template file used instead of the model's own"},
+        "skip_vram_check": {"type": "boolean", "description": "load even if the VRAM planner says it does not fit"}
     });
     vec![
         op(
@@ -281,6 +294,14 @@ fn core_operations() -> Vec<Value> {
             false,
             json!({}),
             &[],
+        ),
+        op(
+            "model.plan",
+            "Would a load fit? The VRAM it is estimated to take, the GPU's free memory, and what the planner would do",
+            false,
+            false,
+            load_props.clone(),
+            &["model"],
         ),
         op(
             "model.load",
@@ -768,6 +789,30 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let t0 = Instant::now();
             let inst = e.ensure_loaded(&m, &opts, true).await?;
             json!({"loaded": inst.describe(), "load_ms": t0.elapsed().as_millis() as u64})
+        }
+        "model.plan" => {
+            let m = llama_entry(hub, s(a, "model")?)?;
+            let mut args = a.clone();
+            if let Some(o) = args.as_object_mut() {
+                o.remove("model");
+            }
+            let opts: LoadOpts = serde_json::from_value(args).map_err(|x| Fail::invalid(x.to_string()))?;
+            let st = e.settings();
+            let r = e.resolve_serving(&st, &m, &opts);
+            r.validate().map_err(|x| Fail::invalid(format!("{}: {x}", m.id)))?;
+            let (est, devices, plan) = e.plan_load(&m, &opts).await;
+            let (verdict, evict, reclaimable) = match &plan {
+                crate::serving::Plan::Fits => ("fits", vec![], None),
+                crate::serving::Plan::Evict(v) => ("fits_after_unloading", v.clone(), None),
+                crate::serving::Plan::Refuse { reclaimable_mib } => ("does_not_fit", vec![], Some(*reclaimable_mib)),
+            };
+            json!({"model": m.id, "serving": crate::serving::Serving::from_resolved(&r),
+                   "args": r.args(),
+                   "estimate": est.as_ref().map(crate::serving::estimate_json),
+                   "devices": devices, "free_mib": devices.iter().map(|d| d.free_mib).sum::<u64>(),
+                   "margin_mib": st.vram_margin_mib, "guard": st.vram_guard,
+                   "verdict": if est.is_none() || devices.is_empty() { "unknown" } else { verdict },
+                   "unload": evict, "reclaimable_mib": reclaimable})
         }
         "model.unload" => {
             let name = s(a, "model")?;
@@ -1447,8 +1492,13 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
         .iter()
         .filter(|m| allowed(&m.id))
         .map(|m| {
+            // `serving`: how it is served now when loaded (what the server reports), else what a load would use
+            let serving = match e.loaded().into_iter().find(|i| i.model == m.id) {
+                Some(i) => i.serving(),
+                None => e.serving_preview(m),
+            };
             json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
-                         "meta": m.summary(e.is_loaded(&m.id))})
+                         "meta": m.summary(e.is_loaded(&m.id)), "serving": serving})
         })
         .collect();
     for m in e.ollama_models().await {
@@ -2184,6 +2234,79 @@ unrelated line
 
     fn message(v: &Value) -> String {
         v["error"]["message"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn models_report_how_they_are_served_and_a_load_can_be_planned() {
+        let home = temp_home();
+        let h = hub_without_tools(&home, &["tiny"]);
+        let mut st = h.engine.settings();
+        st.profiles.insert(
+            "tiny".into(),
+            crate::serving::ServeProfile {
+                parallel: Some(4),
+                flags: crate::serving::ServeFlags {
+                    ctx_per_slot: Some(2048),
+                    cache_type_k: Some("q8_0".into()),
+                    cache_type_v: Some("q8_0".into()),
+                    flash_attn: Some("on".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        h.engine.set_settings(st).unwrap();
+        let get = |path: &'static str| {
+            let req = axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let h = h.clone();
+            async move {
+                let resp = router(h).oneshot(req).await.unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            }
+        };
+        // not loaded: what a load would use, so a client can read the context window up front
+        let v = get("/v1/models").await;
+        let sv = &v["data"][0]["serving"];
+        assert_eq!(v["data"][0]["id"], "tiny");
+        assert_eq!(
+            (&sv["n_ctx_per_slot"], &sv["slots"], &sv["n_ctx"]),
+            (&json!(2048), &json!(4), &json!(8192))
+        );
+        assert_eq!(
+            (&sv["cache_type_k"], &sv["flash_attn"], &sv["source"]),
+            (&json!("q8_0"), &json!("on"), &json!("profile"))
+        );
+        // a load that asks for something invalid is refused before any process starts
+        let (code, v) = json_post(
+            &h,
+            "/v1/call/model.load",
+            json!({"model": "tiny", "cache_type_k": "q9"}),
+        )
+        .await;
+        assert_eq!(code, 400, "{v}");
+        assert!(message(&v).contains("cache_type_k"), "{v}");
+        // the plan: the arguments the server would get; with no GPU to ask the verdict is unknown, not a refusal
+        let (code, v) = json_post(&h, "/v1/call/model.plan", json!({"model": "tiny", "parallel": 2})).await;
+        assert_eq!(code, 200, "{v}");
+        let r = &v["result"];
+        assert_eq!(r["verdict"], "unknown");
+        assert_eq!(
+            r["args"].to_string(),
+            r#"["-c","4096","-ngl","999","-np","2","-ctk","q8_0","-ctv","q8_0","-fa","on"]"#
+        );
+        assert_eq!(r["serving"]["slots"], 2);
+        // loaded: model.loaded and /v1/models carry the same block
+        h.engine.adopt("tiny", 1, "k", None);
+        let (_, v) = json_post(&h, "/v1/call/model.loaded", json!({})).await;
+        assert!(v["result"][0]["serving"].is_object(), "{v}"); // a stand-in has nothing to report
+        let v = get("/v1/models").await;
+        assert_eq!(v["data"][0]["meta"]["loaded"], true);
+        assert!(v["data"][0]["serving"].is_object());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

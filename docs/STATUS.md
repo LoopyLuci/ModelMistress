@@ -139,8 +139,8 @@ entropy; reasoning apart from the answer; the templated prompt; stage timings; R
 traces. The dashboard at `/ui` (embedded in the binary) works in any browser and in the desktop app: Thoughts, Traces,
 Knowledge, residency, Data studio, Vocabulary, Factory. **Expert routing** is captured per token for MoE models (a small
 patch to the bundled llama.cpp; tracing setting `routing` or `"mm_routing": true`): checked with Qwen3-Coder-30B-A3B
-on Vulkan, no cost when off, about 4.5x slower generation while on. Not yet: GPU memory (llama-server does not report
-it), tracing peers' requests.
+on Vulkan, no cost when off, about 4.5x slower generation while on. Not yet: tracing peers' requests. GPU memory per model is
+in `model.loaded` (`serving.vram_mib`).
 
 ## Native models
 
@@ -149,6 +149,29 @@ Python/PyTorch environment run by the hub over a JSON-lines protocol, works on W
 Dusty-1.0 is built: Qwen3.5-4B converted to `qwen35moe` (the dense FFN is the shared expert, 64 empty routed slots
 per layer for Knowledge Modules), and its Q8_0 GGUF answers token for token like the base (10 of 10 prompts, log
 probabilities identical). Not yet: training Dusty's experts, consolidation, the base bake-off, anything of Misty.
+
+## Serving for agents (LF1)
+
+Serving profiles, `serving` in `/v1/models` and `model.loaded`, the VRAM planner and `model.plan`
+([serving.md](serving.md)); 24 new unit tests (options, flag building, validation, the estimator on synthetic
+GGUF metadata, the planner, TOML parsing) and a hub test; `cargo test` 352 passed. Measured on Windows 10, RX 7900 XTX
+(24 GB, Vulkan), llama.cpp 7fee178, with the dev build of the hub and its own home folder:
+
+| Check | Result |
+|---|---|
+| Qwen3-Coder-30B-A3B UD-Q4_K_XL, 32768 tokens in one shared KV (`kv_unified`), 4 slots, KV q8_0/q8_0, flash attention on | Loads in 42 s. The server reports `n_ctx` 32768, 4 slots. VRAM of the server process: 18,529 MiB (estimate 18,979 MiB, 2.4 % high). |
+| Same, one stream (256 tokens, temperature 0) | 98 tokens/s on the first request, 149 tokens/s once the prompt was cached. |
+| Same, 4 concurrent requests | 171 tokens/s aggregate (51 tokens/s each). |
+| Tool call, Qwen3-Coder-30B-A3B (the GGUF's template, Jinja), CPU | A request with one tool returned a structured `tool_calls` entry with valid JSON arguments (`finish_reason: tool_calls`); feeding the result back gave a normal answer. |
+| Tool call, Qwen3.5-9B Q4_K_M (Jinja), CPU | Same: structured `tool_calls`, valid arguments, round trip fine. |
+| `--list-devices` free memory | Not reliable: with 5.8 GB held by other programs it said 18.7 GB free, and 5 GB fewer than the truth after an 18.5 GB model loaded. The planner reads Windows' `GPU Adapter Memory` counter instead (matches the 24,560 MiB total minus what is in use). |
+
+Not measured (the GPU was held by another agent's server for the whole time after the first run, so the lock could not be
+used): speculative decoding of Qwen3-Coder with a draft on the GPU (`qwen3:1.7b` from the Ollama store has the same
+Qwen3 vocabulary and is the candidate; the Qwen3.5-9B file also carries a multi-token-prediction layer, `--spec-type
+draft-mtp`), 32,768 tokens **per slot** (131,072 in all: the estimate is 23.9 GB, over what the card has free next to
+a desktop; use `model.plan` first), the tool-call check on the GPU, and the planner's unload path against real servers
+(it is unit-tested with stand-ins). The tool-call checks ran on the CPU; the chat template is the same on the GPU.
 
 ## Not done yet
 

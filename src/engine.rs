@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::catalog::{self, ModelEntry, Roots};
+use crate::serving::{self, Plan, Resident, Resolved, ServeFlags, ServeProfile, Serving};
 
 /// An error with the HTTP status the hub should answer with.
 #[derive(Debug)]
@@ -71,6 +72,16 @@ pub struct Settings {
     pub gpu_layers: i32,
     /// Parallel request slots per model.
     pub parallel: u32,
+    /// Serving options for every model (KV-cache types, flash attention, prompt cache, batch sizes, ...): the
+    /// `[serving]` table. Unset options add no flag.
+    pub serving: ServeProfile,
+    /// Serving options per model id: `[profiles."<model id>"]`. They win over `serving`.
+    pub profiles: BTreeMap<String, ServeProfile>,
+    /// Refuse a load whose estimated VRAM does not fit the GPU (unloading the least recently used models first)
+    /// instead of letting it spill into shared memory. Needs the engine to list devices; else it does nothing.
+    pub vram_guard: bool,
+    /// MiB of VRAM left free beyond a load's estimate.
+    pub vram_margin_mib: u64,
     /// Load a model on its first request.
     pub autoload: bool,
     pub load_timeout_s: u64,
@@ -122,6 +133,10 @@ impl Default for Settings {
             ctx_size: 8192,
             gpu_layers: 999,
             parallel: 2,
+            serving: ServeProfile::default(),
+            profiles: BTreeMap::new(),
+            vram_guard: true,
+            vram_margin_mib: 768,
             autoload: true,
             load_timeout_s: 300,
             idle_unload_s: 0,
@@ -146,9 +161,33 @@ impl Default for Settings {
 impl Settings {
     pub fn load(home: &Path) -> std::result::Result<Self, String> {
         match std::fs::read_to_string(home.join("config.toml")) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("{}: {e}", home.join("config.toml").display())),
+            Ok(s) => {
+                let path = home.join("config.toml");
+                let st: Self = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+                st.check_serving().map_err(|e| format!("{}: {e}", path.display()))?;
+                Ok(st)
+            }
             Err(_) => Ok(Self::default()),
         }
+    }
+
+    /// Checks `[serving]` and every `[profiles]` entry.
+    pub fn check_serving(&self) -> std::result::Result<(), String> {
+        self.serving.check("serving")?;
+        for (id, p) in &self.profiles {
+            p.check(&format!("profiles.\"{id}\""))?;
+        }
+        Ok(())
+    }
+
+    /// The profile for a model id (exact, else case-insensitive).
+    pub fn profile_for(&self, id: &str) -> Option<&ServeProfile> {
+        self.profiles.get(id).or_else(|| {
+            self.profiles
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(id))
+                .map(|(_, v)| v)
+        })
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {
@@ -187,6 +226,13 @@ pub struct LoadOpts {
     /// already running finish on the old one; new ones go to the new one.
     #[serde(default)]
     pub reload: bool,
+    /// Serving options of this load (KV-cache types, flash attention, prompt cache, batch sizes, ...); they win over
+    /// the model's profile. They are plain fields of the request: `{"model": "x", "cache_type_k": "q8_0"}`.
+    #[serde(default, flatten)]
+    pub serve: ServeFlags,
+    /// Load even if the VRAM planner says it does not fit.
+    #[serde(default)]
+    pub skip_vram_check: bool,
 }
 
 /// A LoRA adapter attached to a model.
@@ -284,6 +330,8 @@ pub struct Instance {
     pub reranking: bool,
     pub opts: LoadOpts,
     pub extras: Extras,
+    /// How it is served: context, slots, KV types, VRAM (see [`Serving`]).
+    serving: RwLock<Serving>,
     last_used: AtomicU64,
     /// Requests being served now (see [`Lease`]).
     inflight: AtomicUsize,
@@ -317,7 +365,10 @@ impl Instance {
         json!({"model": self.model, "backend": "llama.cpp", "pid": self.pid, "port": self.port,
                "uptime_s": self.started.elapsed().as_secs(), "idle_s": self.idle_s(),
                "embeddings": self.embeddings, "reranking": self.reranking, "args": self.args, "log": self.log,
-               "lora": self.extras.lora, "draft": self.extras.draft})
+               "lora": self.extras.lora, "draft": self.extras.draft, "serving": self.serving()})
+    }
+    pub fn serving(&self) -> Serving {
+        self.serving.read().clone()
     }
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire)
@@ -419,6 +470,7 @@ impl Engine {
     }
 
     pub fn set_settings(&self, s: Settings) -> Result<()> {
+        s.check_serving().map_err(Fail::invalid)?;
         s.save(&self.home)?;
         *self.settings.write() = s;
         *self.llama_version.lock() = None;
@@ -814,6 +866,7 @@ impl Engine {
         }
         // A reload keeps the old instance serving while the new one loads (both are in memory for a while), then
         // `install` switches over.
+        self.fit_vram(entry, opts).await?;
         let t0 = Instant::now();
         let inst = Arc::new(self.spawn(entry, opts).await?);
         self.install(inst.clone());
@@ -885,6 +938,7 @@ impl Engine {
             reranking: false,
             opts: LoadOpts::default(),
             extras: Extras::default(),
+            serving: RwLock::new(Serving::default()),
             last_used: AtomicU64::new(now_s()),
             inflight: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
@@ -937,7 +991,257 @@ impl Engine {
         all.len()
     }
 
+    // ---- serving profiles and the VRAM planner ------------------------------------------------------------
+
+    /// The options a load of `entry` with `opts` ends up with (see [`serving`]).
+    pub fn resolve_serving(&self, s: &Settings, entry: &ModelEntry, opts: &LoadOpts) -> Resolved {
+        Resolved::new(
+            (opts.ctx_size, opts.gpu_layers, opts.parallel, &opts.serve),
+            s.profile_for(&entry.id),
+            &s.serving,
+            (s.ctx_size, s.gpu_layers, s.parallel),
+        )
+    }
+
+    /// What a model would be served with if autoload loaded it now, for `/v1/models`: the profile's context window
+    /// and slots before anything is loaded.
+    pub fn serving_preview(&self, entry: &ModelEntry) -> Serving {
+        let s = self.settings();
+        let r = self.resolve_serving(&s, entry, &LoadOpts::default());
+        let mut v = Serving::from_resolved(&r);
+        if r.ctx_total == 0 {
+            // 0 = the model's own, divided between the slots as llama-server does
+            let own = entry.context_length().unwrap_or(0);
+            v.n_ctx = own;
+            v.n_ctx_per_slot = if v.kv_unified { own } else { own / v.slots.max(1) };
+        }
+        v.source = "profile";
+        v
+    }
+
+    /// The VRAM a load is expected to take (None: the GGUF header lacks what the estimate needs, or no layer is on
+    /// the GPU).
+    pub fn estimate_for(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<serving::VramEstimate> {
+        let shape = serving::shape_from_meta(&entry.meta, entry.size_bytes)?;
+        let own = entry.context_length().unwrap_or(4096) as u32;
+        let ctx = if r.ctx_total == 0 { own } else { r.ctx_total };
+        let extras = self.extras(&entry.id);
+        let draft = extras
+            .draft
+            .as_ref()
+            .filter(|d| d.gpu_layers.unwrap_or(r.gpu_layers) != 0 && !opts.embeddings && !opts.reranking)
+            .and_then(|d| std::fs::metadata(&d.path).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let native_moe = entry.native.is_some() && entry.experts().is_some();
+        let cpu_moe = match (opts.n_cpu_moe, opts.cpu_moe) {
+            (Some(n), _) if n > 0 => false,
+            (_, Some(c)) => c,
+            _ => native_moe,
+        };
+        let placement = serving::Placement {
+            ctx_total: ctx as u64,
+            slots: r.slots as u64,
+            gpu_layers: r.gpu_layers,
+            cache_type_k: r.flags.cache_type_k.clone().unwrap_or_else(|| "f16".into()),
+            cache_type_v: r.flags.cache_type_v.clone().unwrap_or_else(|| "f16".into()),
+            ubatch: r.flags.ubatch_size.unwrap_or(512) as u64,
+            cpu_moe,
+            n_cpu_moe: opts.n_cpu_moe.unwrap_or(0) as u64,
+            extra_gpu_bytes: draft,
+        };
+        Some(serving::estimate_vram(&shape, &placement)).filter(|e| e.total_mib > 0)
+    }
+
+    /// The GPUs and their free memory, from `llama-server --list-devices` (empty: a CPU build, or it cannot tell).
+    pub async fn gpu_devices(&self) -> Vec<serving::Device> {
+        let Some(exe) = self.llama_server() else {
+            return vec![];
+        };
+        let mut cmd = tokio::process::Command::new(&exe);
+        cmd.arg("--list-devices")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        no_window(&mut cmd);
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await else {
+            return vec![];
+        };
+        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        let mut devices = serving::parse_devices(&text);
+        // llama-server's "free" does not see memory other processes hold (measured: 18.5 GB taken, 5 GB fewer
+        // reported). With one GPU, Windows' own counter of dedicated memory in use is the truth.
+        if let [d] = &mut devices[..] {
+            if let Some(used) = typeperf(r"\GPU Adapter Memory(*)\Dedicated Usage")
+                .await
+                .and_then(|t| serving::adapter_used_mib(&t))
+            {
+                d.free_mib = d.total_mib.saturating_sub(used);
+            }
+        }
+        devices
+    }
+
+    /// Plans a load against the GPU's free memory: the estimate, the devices, and what to do.
+    pub async fn plan_load(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+    ) -> (Option<serving::VramEstimate>, Vec<serving::Device>, Plan) {
+        let devices = self.gpu_devices().await;
+        let (est, plan) = self.plan_for(entry, opts, &devices);
+        (est, devices, plan)
+    }
+
+    /// [`plan_load`](Self::plan_load) for devices already listed.
+    pub fn plan_for(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        devices: &[serving::Device],
+    ) -> (Option<serving::VramEstimate>, Plan) {
+        let s = self.settings();
+        let r = self.resolve_serving(&s, entry, opts);
+        let Some(est) = self.estimate_for(entry, opts, &r) else {
+            return (None, Plan::Fits);
+        };
+        if devices.is_empty() {
+            return (Some(est), Plan::Fits);
+        }
+        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        let resident: Vec<Resident> = self
+            .loaded()
+            .iter()
+            .filter(|i| i.model != entry.id)
+            .map(|i| {
+                let sv = i.serving();
+                Resident {
+                    model: i.model.clone(),
+                    idle_s: i.idle_s(),
+                    vram_mib: sv
+                        .vram_mib
+                        .map(|v| v.round() as u64)
+                        .or(sv.estimated_vram_mib)
+                        .unwrap_or(0),
+                    busy: i.inflight() > 0,
+                }
+            })
+            .collect();
+        let plan = serving::plan(est.total_mib, free, s.vram_margin_mib, &resident);
+        (Some(est), plan)
+    }
+
+    /// What a load must do about VRAM, given the devices: Ok(None) = go ahead, Ok(Some(models)) = unload these
+    /// first, Err = refuse.
+    pub fn vram_decision(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        devices: &[serving::Device],
+    ) -> Result<Option<(Vec<String>, u64)>> {
+        let (est, plan) = self.plan_for(entry, opts, devices);
+        let Some(est) = est else { return Ok(None) };
+        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        match plan {
+            Plan::Fits => Ok(None),
+            Plan::Evict(models) => Ok(Some((models, est.total_mib + self.settings().vram_margin_mib))),
+            Plan::Refuse { reclaimable_mib } => Err(Fail::new(
+                503,
+                "insufficient_vram",
+                format!(
+                    concat!(
+                        "{} needs about {} MiB of VRAM (weights {}, KV cache {}, state {}, compute {}) and the GPU ",
+                        "has {} MiB free with {} MiB more in models that could be unloaded. Lower ctx_size or ",
+                        "parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or load with ",
+                        "skip_vram_check: true to try anyway."
+                    ),
+                    entry.id,
+                    est.total_mib,
+                    est.weights_mib,
+                    est.kv_mib,
+                    est.state_mib,
+                    est.compute_mib,
+                    free,
+                    reclaimable_mib
+                ),
+            )),
+        }
+    }
+
+    /// Before a load: make sure its estimated VRAM fits, unloading least recently used models if that helps, else
+    /// refuse. Does nothing when the guard is off, the load says to skip it, or the estimate/devices are unknown.
+    async fn fit_vram(&self, entry: &ModelEntry, opts: &LoadOpts) -> Result<()> {
+        if !self.settings().vram_guard || opts.skip_vram_check {
+            return Ok(());
+        }
+        let devices = self.gpu_devices().await;
+        let Some((models, want)) = self.vram_decision(entry, opts, &devices)? else {
+            return Ok(());
+        };
+        for m in &models {
+            self.unload(m);
+        }
+        // an unloaded server gives its memory back a moment later
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let now: u64 = self.gpu_devices().await.iter().map(|d| d.free_mib).sum();
+            if now >= want {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(Fail::new(
+                    503,
+                    "insufficient_vram",
+                    format!(
+                        "{} needs about {} MiB of VRAM; after unloading {} the GPU has {now} MiB free",
+                        entry.id,
+                        want,
+                        models.join(", ")
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Once a server is up: what it says about itself (`/props`) and the memory it took (its log).
+    async fn learn_serving(&self, inst: &Instance, estimate: Option<u64>) {
+        let props: Option<Value> = match self
+            .http
+            .get(format!("http://127.0.0.1:{}/props", inst.port))
+            .bearer_auth(&inst.key)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json().await.ok(),
+            _ => None,
+        };
+        let log = std::fs::read(&inst.log)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let process = if inst.pid > 0 {
+            typeperf(&format!(r"\GPU Process Memory(pid_{}_*)\Dedicated Usage", inst.pid))
+                .await
+                .and_then(|t| serving::process_used_mib(&t))
+        } else {
+            None
+        };
+        let mut sv = inst.serving.write();
+        if let Some(p) = props {
+            sv.apply_props(&p);
+        }
+        sv.vram_mib = process.map(|m| m as f64).or_else(|| serving::vram_from_log(&log));
+        sv.estimated_vram_mib = estimate;
+    }
+
     async fn spawn(&self, entry: &ModelEntry, opts: &LoadOpts) -> Result<Instance> {
+        let resolved = self.resolve_serving(&self.settings(), entry, opts);
+        resolved
+            .validate()
+            .map_err(|e| Fail::invalid(format!("{}: {e}", entry.id)))?;
         let exe = self.llama_server().ok_or_else(|| {
             Fail::unavailable(
                 "llama-server was not found: set llama_server with config.set, put it in <home>/engines/llama.cpp, \
@@ -957,14 +1261,9 @@ impl Engine {
             port.to_string(),
             "-a".into(),
             entry.id.clone(),
-            "-c".into(),
-            opts.ctx_size.unwrap_or(s.ctx_size).to_string(),
-            "-ngl".into(),
-            opts.gpu_layers.unwrap_or(s.gpu_layers).to_string(),
-            "-np".into(),
-            opts.parallel.unwrap_or(s.parallel).max(1).to_string(),
-            "--metrics".into(),
         ];
+        args.extend(resolved.args());
+        args.push("--metrics".into());
         if let Some(t) = opts.threads {
             args.extend(["-t".into(), t.to_string()]);
         }
@@ -1037,6 +1336,7 @@ impl Engine {
             } else {
                 extras
             },
+            serving: RwLock::new(Serving::from_resolved(&resolved)),
             last_used: AtomicU64::new(now_s()),
             inflight: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
@@ -1046,6 +1346,7 @@ impl Engine {
         // Wait until it answers /health with 200 (it answers 503 while loading).
         let deadline = Instant::now() + Duration::from_secs(s.load_timeout_s.max(5));
         let url = format!("http://127.0.0.1:{port}/health");
+        let estimate = self.estimate_for(entry, opts, &resolved).map(|e| e.total_mib);
         loop {
             if let Some(status) = inst.child.lock().as_mut().and_then(|c| c.try_wait().ok().flatten()) {
                 inst.stop();
@@ -1065,6 +1366,7 @@ impl Engine {
                         inst.stop();
                         return Err(f);
                     }
+                    self.learn_serving(&inst, estimate).await;
                     return Ok(inst);
                 }
             }
@@ -1321,6 +1623,25 @@ fn load_extras(home: &Path) -> HashMap<String, Extras> {
         .unwrap_or_default()
 }
 
+/// One sample of a Windows performance counter, as `typeperf` prints it. None elsewhere, or if it fails.
+async fn typeperf(counter: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut cmd = tokio::process::Command::new("typeperf");
+    cmd.args([counter, "-sc", "1"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    no_window(&mut cmd);
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
@@ -1523,6 +1844,205 @@ mod tests {
         assert_eq!(Settings::load(&d).unwrap().max_loaded, 5);
         std::fs::write(d.join("config.toml"), "max_loaded = \"x\"").unwrap();
         assert!(Settings::load(&d).is_err());
+    }
+
+    fn coder_entry() -> ModelEntry {
+        let mut meta = serde_json::Map::new();
+        for (k, v) in [
+            ("general.architecture", json!("tmoe")),
+            ("tmoe.block_count", json!(48)),
+            ("tmoe.context_length", json!(262144)),
+            ("tmoe.embedding_length", json!(2048)),
+            ("tmoe.attention.head_count", json!(32)),
+            ("tmoe.attention.head_count_kv", json!(4)),
+            ("tmoe.attention.key_length", json!(128)),
+            ("tmoe.attention.value_length", json!(128)),
+            ("tmoe.expert_count", json!(128)),
+            ("tmoe.expert_feed_forward_length", json!(768)),
+        ] {
+            meta.insert(k.into(), v);
+        }
+        ModelEntry {
+            id: "coder".into(),
+            source: "folder",
+            path: PathBuf::from("coder.gguf"),
+            size_bytes: 17 << 30,
+            mmproj: None,
+            meta,
+            native: None,
+        }
+    }
+
+    #[test]
+    fn profiles_come_from_config_toml_and_shape_the_server_arguments() {
+        let d = crate::testing::TestDir::new("mm-profiles");
+        std::fs::write(
+            d.join("config.toml"),
+            "ctx_size = 4096
+[serving]
+flash_attn = \"on\"
+[profiles.coder]
+ctx_per_slot = 32768
+parallel = 4
+             cache_type_k = \"q8_0\"
+cache_type_v = \"q8_0\"
+cache_prompt = true
+cache_reuse = 256
+",
+        )
+        .unwrap();
+        let s = Settings::load(&d).unwrap();
+        let e = Engine::new(d.clone(), s.clone());
+        let entry = coder_entry();
+        let r = e.resolve_serving(&s, &entry, &LoadOpts::default());
+        assert_eq!(
+            r.args().join(" "),
+            "-c 131072 -ngl 999 -np 4 -ctk q8_0 -ctv q8_0 -fa on --cache-prompt --cache-reuse 256"
+        );
+        // a model without a profile gets [serving] and the old settings
+        let mut other = coder_entry();
+        other.id = "other".into();
+        assert_eq!(
+            e.resolve_serving(&s, &other, &LoadOpts::default()).args().join(" "),
+            "-c 4096 -ngl 999 -np 2 -fa on"
+        );
+        // the load request wins over the profile
+        let opts: LoadOpts =
+            serde_json::from_value(json!({"parallel": 1, "cache_type_k": "f16", "ctx_size": 8192})).unwrap();
+        assert_eq!(opts.serve.cache_type_k.as_deref(), Some("f16"));
+        let r = e.resolve_serving(&s, &entry, &opts);
+        assert_eq!(
+            r.args().join(" "),
+            "-c 8192 -ngl 999 -np 1 -ctk f16 -ctv q8_0 -fa on --cache-prompt --cache-reuse 256"
+        );
+        // what /v1/models shows before a load
+        let sv = e.serving_preview(&entry);
+        assert_eq!((sv.n_ctx, sv.n_ctx_per_slot, sv.slots), (131_072, 32_768, 4));
+        assert_eq!(
+            (sv.cache_type_k.as_str(), sv.flash_attn.as_str(), sv.source),
+            ("q8_0", "on", "profile")
+        );
+        // the estimate sees the quantised cache: 4 kv heads x 48 layers x 256 x 34/32 B x 131072 tokens = 6528 MiB
+        let est = e
+            .estimate_for(
+                &entry,
+                &LoadOpts::default(),
+                &e.resolve_serving(&s, &entry, &LoadOpts::default()),
+            )
+            .unwrap();
+        assert_eq!(est.kv_mib, 6528);
+        // saved and read back
+        s.save(&d).unwrap();
+        assert_eq!(Settings::load(&d).unwrap().profiles, s.profiles);
+    }
+
+    #[test]
+    fn a_bad_profile_is_reported_and_a_good_config_is_unchanged() {
+        let d = crate::testing::TestDir::new("mm-profile-bad");
+        for (toml, what) in [
+            (
+                "[profiles.m]
+cache_type_k = \"q9\"
+",
+                "cache_type_k",
+            ),
+            (
+                "[profiles.m]
+cache_tyep_k = \"q8_0\"
+",
+                "cache_tyep_k",
+            ),
+            (
+                "[serving]
+parallel = 0
+",
+                "parallel",
+            ),
+            (
+                "[profiles.m]
+cache_type_v = \"q4_0\"
+flash_attn = \"off\"
+",
+                "flash attention",
+            ),
+        ] {
+            std::fs::write(d.join("config.toml"), toml).unwrap();
+            let e = Settings::load(&d).unwrap_err();
+            assert!(e.contains(what), "{toml}: {e}");
+        }
+        // config.set goes through set_settings: refused, and nothing saved
+        let eng = Engine::new(d.clone(), Settings::default());
+        let mut bad = Settings::default();
+        bad.profiles.insert(
+            "m".into(),
+            ServeProfile {
+                parallel: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(eng.set_settings(bad).unwrap_err().status, 400);
+        // a config from before profiles existed has none, and the same arguments as always
+        std::fs::write(
+            d.join("config.toml"),
+            "ctx_size = 16384
+parallel = 1
+",
+        )
+        .unwrap();
+        let s = Settings::load(&d).unwrap();
+        assert!(s.profiles.is_empty() && s.serving == ServeProfile::default() && s.vram_guard);
+        let r = eng.resolve_serving(&s, &coder_entry(), &LoadOpts::default());
+        assert_eq!(r.args(), ["-c", "16384", "-ngl", "999", "-np", "1"]);
+    }
+
+    #[test]
+    fn a_load_that_does_not_fit_is_planned_not_spilled() {
+        let d = crate::testing::TestDir::new("mm-plan");
+        let e = Engine::new(
+            d.clone(),
+            Settings {
+                ollama_url: String::new(),
+                ..Default::default()
+            },
+        );
+        let gpu = |free| {
+            vec![serving::Device {
+                name: "Vulkan0: test".into(),
+                total_mib: 24_000,
+                free_mib: free,
+            }]
+        };
+        let entry = coder_entry(); // ~17 GiB of weights, 8 GiB of KV at 131072 tokens in f16
+        let big = LoadOpts {
+            ctx_size: Some(131_072),
+            ..Default::default()
+        };
+        // 5000 MiB free, nothing loaded to unload: refused with the numbers and the way out
+        let f = e.vram_decision(&entry, &big, &gpu(5000)).unwrap_err();
+        assert_eq!((f.status, f.code), (503, "insufficient_vram"));
+        assert!(
+            f.message.contains("skip_vram_check") && f.message.contains("5000 MiB free"),
+            "{}",
+            f.message
+        );
+        // plenty free: go ahead
+        assert_eq!(e.vram_decision(&entry, &big, &gpu(40_000)).unwrap(), None);
+        // experts in system memory: a small load that fits where the whole model does not
+        let moe = LoadOpts {
+            cpu_moe: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(e.vram_decision(&entry, &moe, &gpu(5000)).unwrap(), None);
+        // no devices listed (a CPU build): the guard has nothing to go on and lets the load through
+        assert_eq!(e.vram_decision(&entry, &big, &[]).unwrap(), None);
+        // a loaded model that is idle is unloaded to make room, a busy one is not
+        let other = e.adopt("other", 1, "k", None);
+        other.serving.write().vram_mib = Some(30_000.0);
+        let (models, want) = e.vram_decision(&entry, &big, &gpu(5000)).unwrap().unwrap();
+        assert_eq!(models, ["other"]);
+        assert!(want > 17_000);
+        let _lease = e.lease(&other).unwrap();
+        assert!(e.vram_decision(&entry, &big, &gpu(5000)).is_err());
     }
 
     #[test]
