@@ -12,6 +12,10 @@
 - **VRAM planner**: a load whose estimate does not fit the GPU unloads the least recently used idle models or is
   refused with `503 insufficient_vram` instead of spilling (`vram_guard`, `vram_margin_mib`, `skip_vram_check`).
   New operation `model.plan`. See `docs/serving.md`.
+- A mistake in `[serving]` or a `[profiles]` entry (unknown key, wrong type, bad value) is now a warning, logged at start
+  and shown by `service.status` and `config.get` as `config_warnings`; that field keeps its default and the hub starts.
+- A draft model (`speculative`) is now actually used: MM passes `--spec-type draft-simple`, which the pinned llama-server
+  needs. Measured slower on Qwen3-Coder-30B-A3B, so it stays off unless set (see `docs/STATUS.md`).
 
 ## 0.2.1 — 2026-10-11
 

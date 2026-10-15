@@ -114,6 +114,107 @@ impl ServeProfile {
     }
 }
 
+impl ServeProfile {
+    /// Reads a `[serving]` or `[profiles.x]` table without ever failing: a key that is not a serving option, a value of
+    /// the wrong type and a value `validate_flags` refuses each become a warning and that one field keeps its default
+    /// (unset), so a typo never stops the hub. `check` stays strict for config.set.
+    pub fn lenient(table: &toml::Table, what: &str) -> (ServeProfile, Vec<String>) {
+        let mut warnings = vec![];
+        let mut good = toml::Table::new();
+        for (k, v) in table {
+            let mut one = toml::Table::new();
+            one.insert(k.clone(), v.clone());
+            match toml::Value::Table(one).try_into::<ServeProfile>() {
+                Err(e) => warnings.push(format!(
+                    "{what}: \"{k}\" ignored (default used): {}",
+                    e.message().trim()
+                )),
+                Ok(p) if !p.unknown.is_empty() => {
+                    warnings.push(format!("{what}: unknown serving option \"{k}\" ignored"))
+                }
+                Ok(_) => {
+                    good.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let mut p: ServeProfile = toml::Value::Table(good).try_into().unwrap_or_default();
+        p.sanitize(what, &mut warnings);
+        (p, warnings)
+    }
+
+    /// Unsets each field whose value `validate_flags` would refuse, with a warning.
+    fn sanitize(&mut self, what: &str, warnings: &mut Vec<String>) {
+        let mut drop = |name: &str, why: String| warnings.push(format!("{what}: {name} ignored (default used): {why}"));
+        for (name, t) in [
+            ("cache_type_k", &mut self.flags.cache_type_k),
+            ("cache_type_v", &mut self.flags.cache_type_v),
+        ] {
+            if t.as_deref().is_some_and(|v| !kv_type_ok(v)) {
+                drop(
+                    name,
+                    format!(
+                        "\"{}\" is not one of {}",
+                        t.take().unwrap_or_default(),
+                        KV_TYPES.join(", ")
+                    ),
+                );
+            }
+        }
+        let f = &mut self.flags;
+        if f.flash_attn
+            .as_deref()
+            .is_some_and(|v| !matches!(v, "on" | "off" | "auto"))
+        {
+            let v = f.flash_attn.take().unwrap_or_default();
+            drop("flash_attn", format!("\"{v}\" must be \"on\", \"off\" or \"auto\""));
+        }
+        if let Some(v) = f.cache_type_v.clone() {
+            if !matches!(v.as_str(), "f32" | "f16" | "bf16") && f.flash_attn.as_deref() == Some("off") {
+                f.cache_type_v = None;
+                drop(
+                    "cache_type_v",
+                    format!("\"{v}\" needs flash attention, but flash_attn is \"off\""),
+                );
+            }
+        }
+        if self.parallel == Some(0) {
+            self.parallel = None;
+            drop("parallel", "must be at least 1".into());
+        }
+        if f.ctx_per_slot == Some(0) {
+            f.ctx_per_slot = None;
+            drop("ctx_per_slot", "must be at least 1".into());
+        }
+        for (name, n) in [("batch_size", &mut f.batch_size), ("ubatch_size", &mut f.ubatch_size)] {
+            if *n == Some(0) {
+                *n = None;
+                drop(name, "must be at least 1".into());
+            }
+        }
+        if let (Some(b), Some(ub)) = (f.batch_size, f.ubatch_size) {
+            if ub > b {
+                f.ubatch_size = None;
+                drop("ubatch_size", format!("{ub} is larger than batch_size {b}"));
+            }
+        }
+        if f.cache_ram_mib.is_some_and(|n| n < -1) {
+            f.cache_ram_mib = None;
+            drop(
+                "cache_ram_mib",
+                "must be -1 (no limit), 0 (off) or a size in MiB".into(),
+            );
+        }
+        if f.cache_reuse.is_some() && f.cache_prompt == Some(false) {
+            f.cache_reuse = None;
+            drop("cache_reuse", "needs cache_prompt".into());
+        }
+        if f.chat_template_file.as_ref().is_some_and(|p| !p.is_file()) {
+            let p = f.chat_template_file.take().unwrap_or_default();
+            drop("chat_template_file", format!("{} is not a file", p.display()));
+        }
+    }
+}
+
 fn kv_type_ok(t: &str) -> bool {
     KV_TYPES.contains(&t)
 }

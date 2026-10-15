@@ -166,10 +166,32 @@ GGUF metadata, the planner, TOML parsing) and a hub test; `cargo test` 352 passe
 | Tool call, Qwen3.5-9B Q4_K_M (Jinja), CPU | Same: structured `tool_calls`, valid arguments, round trip fine. |
 | `--list-devices` free memory | Not reliable: with 5.8 GB held by other programs it said 18.7 GB free, and 5 GB fewer than the truth after an 18.5 GB model loaded. The planner reads Windows' `GPU Adapter Memory` counter instead (matches the 24,560 MiB total minus what is in use). |
 
-Not measured (the GPU was held by another agent's server for the whole time after the first run, so the lock could not be
-used): speculative decoding of Qwen3-Coder with a draft on the GPU (`qwen3:1.7b` from the Ollama store has the same
-Qwen3 vocabulary and is the candidate; the Qwen3.5-9B file also carries a multi-token-prediction layer, `--spec-type
-draft-mtp`), 32,768 tokens **per slot** (131,072 in all: the estimate is 23.9 GB, over what the card has free next to
+Speculative decoding on the GPU (Qwen3-Coder-30B-A3B UD-Q4_K_XL as the target, `qwen3:1.7b` from the Ollama store as the
+draft, KV q8_0/q8_0, flash attention, one slot, temperature 0, 400 tokens, three coding prompts; tokens/s are the
+server's own `predicted_per_second`, the mean of the three after a warm-up request). This found a bug: the draft model
+was loaded but never used, because the pinned llama-server needs `--spec-type draft-simple` (default `none`) and MM
+did not pass it. Fixed. The rows below are with the flag:
+
+| Context | Setup | tokens/s | Draft tokens accepted | VRAM of the server |
+|---|---|---|---|---|
+| 32768 | no draft | 147 (146-148) | - | 18,478 MiB |
+| 32768 | draft, `n_max` 2 | 15-17 | 73-83 % | 19,210 MiB (card full: 3-5 GB spilled to shared memory) |
+| 32768 | draft, `n_max` 4 | 14-15 | 60-71 % | same |
+| 32768 | draft, `n_max` 8 / 16 | 8-11 / 6-8 | 48-53 % / 33-35 % | same |
+| 8192 | no draft | 151 | - | 17,228 MiB |
+| 8192 | draft, `n_max` 2 | 102 | 73 % | 18,687 MiB |
+| 8192 | draft, `n_max` 4 | 103 | 60 % | 18,687 MiB |
+
+Result: speculative decoding makes this model slower, 30 % even when everything fits (ctx 8192) and 10 times slower at ctx
+32768 on a 24 GB card shared with a desktop, where the draft model and its KV cache push the load into shared memory. A
+mixture-of-experts target with 3 B active parameters is already about as fast as a 1.7 B dense draft, and verifying
+several tokens at once touches more experts. So it stays **off by default** (a model has no draft until `draft` or
+`speculative` sets one; `--off` removes it); do not use it for this model. Quantising the draft cache
+(`-ctkd q4_0 -ctvd q4_0`, through `extra_args`) saved about 500 MiB and did not change that. Not tried: a dense target.
+Another finding: `speculative` on a loaded model reloads it while the old copy still runs, so the VRAM check counts
+both and refuses a model that fills the card (unload first).
+
+Not measured: 32,768 tokens **per slot** (131,072 in all: the estimate is 23.9 GB, over what the card has free next to
 a desktop; use `model.plan` first), the tool-call check on the GPU, and the planner's unload path against real servers
 (it is unit-tested with stand-ins). The tool-call checks ran on the CPU; the chat template is the same on the GPU.
 

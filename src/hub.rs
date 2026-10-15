@@ -728,7 +728,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "system": system_report(),
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
                    "llama_built_in": crate::engine::bundled::version(),
-                   "models_known": e.catalog().len(), "loaded": loaded})
+                   "models_known": e.catalog().len(), "loaded": loaded,
+                   "config_warnings": e.settings().warnings})
         }
         "backend.list" => {
             let st = e.settings();
@@ -1455,6 +1456,9 @@ fn shown_settings(st: &Settings) -> Value {
     let mut v = json!(st);
     if st.hf_token.as_deref().is_some_and(|t| !t.is_empty()) {
         v["hf_token"] = json!("(set)");
+    }
+    if !st.warnings.is_empty() {
+        v["config_warnings"] = json!(st.warnings);
     }
     v
 }
@@ -2234,6 +2238,27 @@ unrelated line
 
     fn message(v: &Value) -> String {
         v["error"]["message"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_typo_in_a_profile_is_a_warning_the_hub_shows() {
+        let home = temp_home();
+        std::fs::write(
+            home.join("config.toml"),
+            "[profiles.tiny]\nparallel = \"x\"\ncache_tyep_k = \"q8_0\"\ncache_type_v = \"q9\"\nctx_per_slot = 2048\n",
+        )
+        .unwrap();
+        let h = Hub {
+            engine: Engine::new(home.to_path_buf(), Settings::load(&home).unwrap()),
+            ..hub(&home)
+        };
+        let (code, v) = json_post(&h, "/v1/call/service.status", json!({})).await;
+        assert_eq!(code, 200, "{v}");
+        let w = v["result"]["config_warnings"].as_array().unwrap();
+        assert_eq!(w.len(), 3, "{v}");
+        let (_, v) = json_post(&h, "/v1/call/config.get", json!({})).await;
+        assert_eq!(v["result"]["config_warnings"].as_array().unwrap().len(), 3, "{v}");
+        assert_eq!(v["result"]["profiles"]["tiny"]["ctx_per_slot"], 2048);
     }
 
     #[tokio::test]

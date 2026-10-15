@@ -77,6 +77,10 @@ pub struct Settings {
     pub serving: ServeProfile,
     /// Serving options per model id: `[profiles."<model id>"]`. They win over `serving`.
     pub profiles: BTreeMap<String, ServeProfile>,
+    /// What `load` found wrong in `[serving]` and `[profiles]` and worked around (each bad field uses its default).
+    /// Not part of the file; service.status and config.get show it.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
     /// Refuse a load whose estimated VRAM does not fit the GPU (unloading the least recently used models first)
     /// instead of letting it spill into shared memory. Needs the engine to list devices; else it does nothing.
     pub vram_guard: bool,
@@ -135,6 +139,7 @@ impl Default for Settings {
             parallel: 2,
             serving: ServeProfile::default(),
             profiles: BTreeMap::new(),
+            warnings: vec![],
             vram_guard: true,
             vram_margin_mib: 768,
             autoload: true,
@@ -163,8 +168,42 @@ impl Settings {
         match std::fs::read_to_string(home.join("config.toml")) {
             Ok(s) => {
                 let path = home.join("config.toml");
-                let st: Self = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
-                st.check_serving().map_err(|e| format!("{}: {e}", path.display()))?;
+                let bad = |e: toml::de::Error| format!("{}: {e}", path.display());
+                let mut table: toml::Table = toml::from_str(&s).map_err(bad)?;
+                // [serving] and [profiles] are read leniently (a typo there is a warning); everything else is strict
+                let (serving, profiles) = (table.remove("serving"), table.remove("profiles"));
+                let mut st: Self = toml::Value::Table(table).try_into().map_err(bad)?;
+                let mut warnings = vec![];
+                match serving {
+                    None => {}
+                    Some(toml::Value::Table(t)) => {
+                        let (p, w) = ServeProfile::lenient(&t, "serving");
+                        st.serving = p;
+                        warnings.extend(w);
+                    }
+                    Some(_) => warnings.push("serving: not a table, ignored (defaults used)".into()),
+                }
+                match profiles {
+                    None => {}
+                    Some(toml::Value::Table(all)) => {
+                        for (id, v) in all {
+                            let what = format!("profiles.\"{id}\"");
+                            match v {
+                                toml::Value::Table(t) => {
+                                    let (p, w) = ServeProfile::lenient(&t, &what);
+                                    st.profiles.insert(id, p);
+                                    warnings.extend(w);
+                                }
+                                _ => warnings.push(format!("{what}: not a table, ignored")),
+                            }
+                        }
+                    }
+                    Some(_) => warnings.push("profiles: not a table, ignored".into()),
+                }
+                for w in &warnings {
+                    eprintln!("model-mistress: warning: {}: {w}", path.display());
+                }
+                st.warnings = warnings;
                 Ok(st)
             }
             Err(_) => Ok(Self::default()),
@@ -294,7 +333,13 @@ pub fn moe_args(entry: &ModelEntry, opts: &LoadOpts) -> Vec<String> {
 }
 
 pub fn draft_args(d: &Draft, default_gpu_layers: i32) -> Vec<String> {
-    let mut a = vec!["--spec-draft-model".to_string(), d.path.display().to_string()];
+    // the pinned llama-server loads a draft model but does not use it unless `--spec-type` says how (default: none)
+    let mut a = vec![
+        "--spec-type".to_string(),
+        "draft-simple".to_string(),
+        "--spec-draft-model".to_string(),
+        d.path.display().to_string(),
+    ];
     if let Some(n) = d.n_max {
         a.extend(["--spec-draft-n-max".into(), n.to_string()]);
     }
@@ -471,6 +516,8 @@ impl Engine {
 
     pub fn set_settings(&self, s: Settings) -> Result<()> {
         s.check_serving().map_err(Fail::invalid)?;
+        let mut s = s;
+        s.warnings.clear(); // what was saved is valid
         s.save(&self.home)?;
         *self.settings.write() = s;
         *self.llama_version.lock() = None;
@@ -1967,9 +2014,50 @@ flash_attn = \"off\"
             ),
         ] {
             std::fs::write(d.join("config.toml"), toml).unwrap();
-            let e = Settings::load(&d).unwrap_err();
-            assert!(e.contains(what), "{toml}: {e}");
+            // a typo in a serving table is a warning and that field keeps its default; it never stops the hub
+            let s = Settings::load(&d).unwrap();
+            assert!(s.warnings.iter().any(|w| w.contains(what)), "{toml}: {:?}", s.warnings);
+            let bad_field = |p: &ServeProfile| {
+                p.parallel == Some(0) || p.flags.cache_type_k.is_some() || p.flags.cache_type_v.is_some()
+            };
+            assert!(!bad_field(&s.serving) && !s.profiles.values().any(bad_field), "{toml}");
+            // ... and the hub-side engine starts with those settings
+            let eng = Engine::new(d.clone(), s);
+            assert!(!eng.settings().warnings.is_empty());
         }
+        // a bad value type, a bad enum value and an unknown key: only the bad fields fall back
+        std::fs::write(
+            d.join("config.toml"),
+            "max_loaded = 3
+[serving]
+parallel = \"many\"
+cache_type_k = \"q8_0\"
+[profiles.m]
+ctx_per_slot = 4096
+cache_type_v = \"q9\"
+flashattn = true
+",
+        )
+        .unwrap();
+        let s = Settings::load(&d).unwrap();
+        assert_eq!((s.max_loaded, s.serving.parallel), (3, None));
+        assert_eq!(s.serving.flags.cache_type_k.as_deref(), Some("q8_0"));
+        let m = &s.profiles["m"];
+        assert_eq!(
+            (m.flags.ctx_per_slot, m.flags.cache_type_v.as_deref()),
+            (Some(4096), None)
+        );
+        assert_eq!(s.warnings.len(), 3, "{:?}", s.warnings);
+        s.check_serving().unwrap();
+        // top-level mistakes are still errors
+        std::fs::write(
+            d.join("config.toml"),
+            "max_loaded = \"x\"\n[serving]\nparallel = \"y\"\n",
+        )
+        .unwrap();
+        assert!(Settings::load(&d).is_err());
+        std::fs::write(d.join("config.toml"), "[serving\n").unwrap();
+        assert!(Settings::load(&d).is_err());
         // config.set goes through set_settings: refused, and nothing saved
         let eng = Engine::new(d.clone(), Settings::default());
         let mut bad = Settings::default();
@@ -2113,6 +2201,8 @@ parallel = 1
         assert_eq!(
             draft_args(&d, 99),
             [
+                "--spec-type",
+                "draft-simple",
                 "--spec-draft-model",
                 "d.gguf",
                 "--spec-draft-n-max",
@@ -2130,6 +2220,8 @@ parallel = 1
         assert_eq!(
             draft_args(&d, 99),
             [
+                "--spec-type",
+                "draft-simple",
                 "--spec-draft-model",
                 "d.gguf",
                 "--spec-draft-n-min",

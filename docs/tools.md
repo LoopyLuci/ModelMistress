@@ -77,9 +77,14 @@ model-mistress draft qwen3:8b --off
 The operation `speculative` takes `model`, `draft_model` (a model id or a `.gguf` path) or `off: true`, and optionally
 `n_max`, `n_min` (tokens drafted at a time) and `gpu_layers` (the draft model's layers on the GPU; -1 = auto, default
 the same as the model's). Like LoRA, it is kept per model in `<home>/model_options.json` and a loaded model is loaded
-again with `--spec-draft-model`, `--spec-draft-n-max`, `--spec-draft-n-min` and `--spec-draft-ngl`. A draft model that
+again with `--spec-type draft-simple` (without it llama-server loads the draft model and never uses it), `--spec-draft-model`, `--spec-draft-n-max`, `--spec-draft-n-min` and `--spec-draft-ngl`. A draft model that
 does not match fails the load; the old setup is restored and llama-server's message returned. Those option names are
 the pinned llama.cpp's; another `llama_server` may call them `--model-draft` and `--draft-max`.
+
+Speculative decoding is **off unless you set a draft model**, and `draft <model> --off` turns it off again. Measured on the
+24 GB card it does not pay for a mixture-of-experts model such as Qwen3-Coder-30B-A3B (about 3 B active parameters, 150
+tokens/s alone): the draft costs as much as the model, so the numbers in `docs/STATUS.md` show it slower. Try it on a dense
+model that is slow on its own, and keep the card's memory free (the draft model and its cache must fit next to the model).
 
 ## Embeddings and reranking
 
