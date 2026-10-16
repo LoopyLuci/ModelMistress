@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "model-mistress"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "model-mistress-desktop"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",

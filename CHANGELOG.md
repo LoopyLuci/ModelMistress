@@ -1,21 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-15
+
+ModelMistress serves coding agents, and the native-model system gains experts, specialists and routing traces.
 
 ### Serving for agents
-- **Serving profiles**: `[profiles."<model id>"]` and `[serving]` in `config.toml`, and the same fields in `model.load`:
-  `ctx_per_slot`, `cache_type_k`, `cache_type_v`, `flash_attn`, `cache_prompt`, `cache_reuse`, `cache_ram_mib`,
-  `kv_unified`, `batch_size`, `ubatch_size`, `jinja`, `chat_template_file` (plus the existing `ctx_size`, `gpu_layers`,
-  `parallel`). Checked before a server starts. Unset options add no flag, so existing configs start models as before.
-- `GET /v1/models` and `model.loaded` report `serving`: the real context window per slot, slots, KV types and the VRAM
-  of each loaded model.
-- **VRAM planner**: a load whose estimate does not fit the GPU unloads the least recently used idle models or is
-  refused with `503 insufficient_vram` instead of spilling (`vram_guard`, `vram_margin_mib`, `skip_vram_check`).
-  New operation `model.plan`. See `docs/serving.md`.
-- A mistake in `[serving]` or a `[profiles]` entry (unknown key, wrong type, bad value) is now a warning, logged at start
-  and shown by `service.status` and `config.get` as `config_warnings`; that field keeps its default and the hub starts.
-- A draft model (`speculative`) is now actually used: MM passes `--spec-type draft-simple`, which the pinned llama-server
-  needs. Measured slower on Qwen3-Coder-30B-A3B, so it stays off unless set (see `docs/STATUS.md`).
+- **Per-model serving profiles**: context per slot, KV cache type, flash attention, prompt cache and reuse, Jinja
+  tool-call templates and batch sizes, set per model in `[profiles]`.
+- **VRAM planner**: estimates what a model needs before loading it and refuses, or evicts idle models, instead of
+  spilling into shared memory (on by default). Serving details are reported on `/v1/models`.
+- A typo in `[serving]` or `[profiles]` is a warning (logged, and listed as `config_warnings` in
+  `service.status` and `config.get`); that field falls back to its default instead of stopping the hub.
+- Speculative decoding now really uses its draft model (`--spec-type`). Measured on a 24 GB GPU it was slower for
+  Qwen3-Coder-30B-A3B at 8k and 32k, so it stays off unless set per model.
+
+### Native models and Knowledge Modules
+- **Experts KMs** are assembled into their core model and hot-swapped in.
+- **Specialist KMs are callable** (`km.specialist.call`): the input is checked, the engine runs the KM's model, and
+  the call is recorded.
+- **Expert-routing capture**: a llama-server patch reports which experts each MoE layer chose per token, and traces
+  record it (no cost when off; about 4.5x slower generation while on).
+
+### Fixes
+- Tests delete their own temp folders (about 2,000 had piled up).
+- Engine patches are stored byte for byte, so a CRLF checkout no longer makes `git apply` refuse them.
 
 ## 0.2.1 — 2026-10-11
 

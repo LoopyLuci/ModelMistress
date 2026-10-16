@@ -1,6 +1,6 @@
 [package]
 name = "model-mistress"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Model Mistress Team"]
 license = "Apache-2.0"
