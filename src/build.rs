@@ -106,6 +106,7 @@ fn main() {
         "-DSD_BUILD_EXAMPLES=ON".into(),
         "-DSD_WEBP=OFF".into(),
         "-DSD_WEBM=OFF".into(),
+        "-DSD_SERVER_BUILD_FRONTEND=OFF".into(), // sd-server's web UI needs pnpm and a download; only sd-cli is used
     ];
     flags.extend(match backend.as_str() {
         "vulkan" => Some(on("SD_VULKAN")),
