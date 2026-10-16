@@ -18,7 +18,11 @@ llama.cpp's). It follows the same switch as llama.cpp, `MM_GGML_BACKEND` = `vulk
 or `cpu`, and `MM_CMAKE_GENERATOR` / `MM_CMAKE_ARGS`. WebP and WebM output are off: images are PNG. It is written to
 `<home>/engines/bundled/<hash>/` on first start, next to `llama-server`. Without `bundled-engine`, ModelMistress looks
 for `sd-cli` beside the `llama-server` it uses, or at the path in the environment variable `MM_SD_CLI`; if it is missing
-the endpoint answers `501` and says so. On Windows a CMake build tree with long paths needs a short `CARGO_TARGET_DIR`.
+the endpoint answers `501` and says so. On Windows a CMake build tree with long paths needs a short `CARGO_TARGET_DIR`:
+the nested Vulkan shader sub-build writes paths about 183 characters deep below cargo's `OUT_DIR`, and `rc.exe`
+fails on the longest one with `RC2136: missing '=' in EXSTYLE=<flags>`. `build.rs` (and `ci/pipeline.py`'s
+preflight) stop early with a clear message when the deepest path would exceed 243 characters; with the default
+layout that means a `CARGO_TARGET_DIR` of roughly 18 characters or fewer (`C:\ct\m3` works, `C:\ct\mm030` does not).
 
 ## Why the command line program and not sd.cpp's server
 

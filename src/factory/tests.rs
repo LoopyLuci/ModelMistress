@@ -967,7 +967,10 @@ async fn budgets_stop_a_task_cleanly_and_can_be_raised() {
 
     // wall time
     let r = rig().await;
-    r.knobs().delay_ms = 400;
+    // One call outlasts the whole budget, so the check before the next call must trip. A smaller
+    // delay only works if enough calls run one after another, which a fast or loaded machine
+    // (calls overlapping, the task ending first) does not guarantee.
+    r.knobs().delay_ms = 1100;
     let mut b = r.body();
     b["budget"] = json!({"wall_s": 1});
     let (_, t) = r.run(b).await;

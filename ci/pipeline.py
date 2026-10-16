@@ -82,6 +82,25 @@ def target_dir() -> Path:
 
 
 # ---- stages ------------------------------------------------------------------------------------------------------------
+# Windows only: the deepest file stable-diffusion.cpp's nested sub-build writes, below cargo's OUT_DIR
+# (<target>/release/build/model-mistress-<16 hex>/out). Keep in step with src/build.rs.
+SD_BELOW_OUT = ("/stable-diffusion.cpp-build/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/"
+                "vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-xxxxxx/CMakeFiles/cmTC_xxxxx.dir/manifest.rc")
+SD_MAX_DEEPEST_PATH = 243      # 241 builds; 244 fails in rc.exe with RC2136 "missing '=' in EXSTYLE=<flags>"
+
+
+def deepest_build_path(target: str) -> int:
+    """Length of the deepest path the bundled sd.cpp build creates under this target directory."""
+    return len(target) + len("/release/build/model-mistress-0123456789abcdef/out") + len(SD_BELOW_OUT)
+
+
+def target_dir_problem(target: str, windows: bool = os.name == "nt") -> str:
+    if not windows or deepest_build_path(target) <= SD_MAX_DEEPEST_PATH:
+        return ""
+    return (f"CARGO_TARGET_DIR is too long ({deepest_build_path(target)} characters for the deepest build file, "
+            f"{SD_MAX_DEEPEST_PATH} at most; rc.exe fails with RC2136): set a shorter one, for example C:\\t")
+
+
 def preflight() -> tuple[bool, str]:
     code, out = run(["cargo", "--version"], 60)
     if code != 0:
@@ -89,6 +108,9 @@ def preflight() -> tuple[bool, str]:
     ver = tuple(int(x) for x in re.findall(r"(\d+)\.(\d+)", out)[0])
     if ver < (1, 85):
         return False, f"cargo {out.split()[1]} is older than 1.85 (rustup update)"
+    problem = target_dir_problem(str(target_dir().resolve()))
+    if problem:
+        return False, problem
     where = target_dir()
     while not where.exists() and where.parent != where:  # the drive the build will go to, even before it exists
         where = where.parent

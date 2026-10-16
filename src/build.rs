@@ -100,6 +100,7 @@ fn main() {
     // stable-diffusion.cpp: a CMake project of its own, with its own copy of ggml (it patches it), so the two never
     // share a library or a symbol. Only the command line program is built; WebP and WebM output are off (PNG only).
     let build = out.join("stable-diffusion.cpp-build");
+    check_path_depth(&out);
     let mut flags: Vec<String> = vec![
         "-DGGML_NATIVE=OFF".into(),
         "-DGGML_OPENMP=OFF".into(),
@@ -135,6 +136,37 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=MM_BUNDLED_SD_VERSION={sd_version}");
+}
+
+/// The deepest file stable-diffusion.cpp's nested vulkan-shaders-gen sub-build writes, below OUT_DIR (the part of
+/// the path that is fixed whatever the target directory is): CMake's try-compile manifest.rc.
+const SD_DEEPEST_BELOW_OUT: &str = "/stable-diffusion.cpp-build/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/\
+vulkan-shaders-gen-build/CMakeFiles/CMakeScratch/TryCompile-xxxxxx/CMakeFiles/cmTC_xxxxx.dir/manifest.rc";
+/// Observed on two builds: with OUT_DIR 58 characters long the deepest path is 241 and the build works; at 61 (244)
+/// rc.exe failed with "RC2136: missing '=' in EXSTYLE=<flags>". The limit lies in between (an estimate, not an exact
+/// measurement); this is the longest accepted.
+const SD_MAX_DEEPEST_PATH: usize = 243;
+
+/// Length of the deepest path the sd.cpp sub-build will create under `out`.
+fn deepest_path_len(out: &str) -> usize {
+    out.trim_start_matches(r"\\?\").len() + SD_DEEPEST_BELOW_OUT.len()
+}
+
+/// On Windows, stops early with a clear message when CARGO_TARGET_DIR is so long that rc.exe would fail deep in
+/// the sd.cpp sub-build with an obscure error.
+fn check_path_depth(out: &Path) {
+    if !cfg!(windows) {
+        return;
+    }
+    let n = deepest_path_len(&out.display().to_string());
+    if n > SD_MAX_DEEPEST_PATH {
+        panic!(
+            "bundled-engine: the build directory is too deep ({n} characters for the deepest file, {SD_MAX_DEEPEST_PATH} \
+             at most: rc.exe fails with RC2136 on longer paths). Set CARGO_TARGET_DIR to a shorter path \
+             (for example C:\\t) and build again. Currently: {}",
+            out.display()
+        );
+    }
 }
 
 /// Applies `patch` to the working tree of the git checkout `dir`. Skips it when it is already applied (the reverse
