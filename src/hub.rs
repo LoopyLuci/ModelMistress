@@ -24,6 +24,7 @@
 //!   POST /v1/vision/detect          the same: objects with boxes
 //!   POST /v1/vision/embed           the same: an embedding vector of the picture
 //!
+//!   /api/*                          Ollama's server API (tags, show, chat, generate, embed, ps, pull, create...): see ollama_api.rs
 //!   GET  /v1/native/...             traces, live stream, rerun and diff (owner only; see docs/native/observability.md)
 //!   GET  /ui/                       the dashboard (static files; its API calls need the owner's token)
 //!
@@ -294,6 +295,41 @@ fn core_operations() -> Vec<Value> {
             false,
             json!({}),
             &[],
+        ),
+        op(
+            "model.show",
+            "One model's details as Ollama's show gives them (modelfile, parameters, template, model_info)",
+            false,
+            false,
+            json!({"model": model}),
+            &["model"],
+        ),
+        op(
+            "model.create",
+            "Register a named preset from a Modelfile (FROM, SYSTEM, PARAMETER, TEMPLATE, ADAPTER, MESSAGE) or its parts",
+            true,
+            false,
+            json!({
+                "model": {"type": "string", "description": "the new preset's name"},
+                "modelfile": {"type": "string", "description": "the Modelfile text"},
+                "from": model,
+                "system": {"type": "string"},
+                "template": {"type": "string"},
+                "license": {"type": "string"},
+                "parameters": {"type": "object"},
+                "adapters": {"type": "array", "items": {"type": "string"}, "description": "LoRA .gguf files (paths or names in <home>/lora)"},
+                "messages": {"type": "array", "items": {"type": "object"}},
+                "base_dir": {"type": "string", "description": "relative ADAPTER paths are looked up here"}
+            }),
+            &["model"],
+        ),
+        op(
+            "model.copy",
+            "Copy a preset, or make a preset on a plain model, under a new name",
+            true,
+            false,
+            json!({"source": model, "destination": {"type": "string"}}),
+            &["source", "destination"],
         ),
         op(
             "model.plan",
@@ -780,6 +816,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "summary": m.summary(e.is_loaded(&m.id)), "metadata": m.meta})
         }
         "model.loaded" => json!(loaded_report(e)),
+        "model.show" => crate::ollama_api::show(hub, s(a, "model")?)?,
+        "model.create" => crate::ollama_api::create(hub, a)?,
+        "model.copy" => crate::ollama_api::copy(hub, s(a, "source")?, s(a, "destination")?)?,
         "model.load" => {
             let m = llama_entry(hub, s(a, "model")?)?;
             let mut args = a.clone();
@@ -1326,7 +1365,7 @@ async fn quantize(hub: &Hub, a: &Value) -> ApiResult<Value> {
 }
 
 /// A .gguf file: a path, or a name in `<home>/<folder>` (with or without `.gguf`).
-fn find_gguf(home: &std::path::Path, folder: &str, name: &str) -> ApiResult<PathBuf> {
+pub(crate) fn find_gguf(home: &std::path::Path, folder: &str, name: &str) -> ApiResult<PathBuf> {
     let direct = PathBuf::from(name);
     let found = if direct.is_file() {
         Some(direct)
@@ -1935,6 +1974,7 @@ pub fn router(hub: Hub) -> Router {
             "/v1/audio/translations",
             post(translations).layer(DefaultBodyLimit::max(MAX_AUDIO_BYTES)),
         )
+        .merge(crate::ollama_api::routes())
         .merge(crate::trace::api::routes())
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())

@@ -91,7 +91,10 @@ impl BrainBuilderIntegration {
             return Err(format!("Model '{}' not found", model_name));
         }
         drop(registry);
-        Ok(format!("BrainBuilder inference: {}", input.chars().take(50).collect::<String>()))
+        Ok(format!(
+            "BrainBuilder inference: {}",
+            input.chars().take(50).collect::<String>()
+        ))
     }
 
     pub async fn unload_model(&self, model_name: &str) -> Result<String, String> {
@@ -123,10 +126,18 @@ pub mod bridge {
 
     impl BrainBuilderResponse {
         pub fn success(data: impl Into<serde_json::Value>) -> Self {
-            Self { success: true, result: data.into(), error: None }
+            Self {
+                success: true,
+                result: data.into(),
+                error: None,
+            }
         }
         pub fn error(msg: impl Into<String>) -> Self {
-            Self { success: false, result: serde_json::json!({}), error: Some(msg.into()) }
+            Self {
+                success: false,
+                result: serde_json::json!({}),
+                error: Some(msg.into()),
+            }
         }
     }
 }

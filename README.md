@@ -108,11 +108,32 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 | `GET /ui` | the dashboard |
 
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
-`model.plan`, `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `job.list`, `job.get`, `job.cancel`,
+`model.plan`, `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `model.show`, `model.create`, `model.copy`, `job.list`, `job.get`, `job.cancel`,
 `chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `vision.analyze`, `quantize`, `lora`, `speculative`, `embeddings.create`,
 `rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
 `config.set`, and the families `km.*`, `factory.*` and `trace.*` (`GET /v1/operations` lists every one with its
 schema). Every operation is also an MCP tool.
+
+### Ollama-compatible API
+
+The hub also speaks Ollama's server API on the same host, port and token, so an Ollama client or tool can point
+at ModelMistress (`OLLAMA_HOST=http://127.0.0.1:<port>`). The token is required, as for `/v1`: send it as
+`Authorization: Bearer <token>` (from `control.json`, or `MM_TOKEN`). A client that cannot send a header needs a
+local proxy that adds it. The owner's token only; a peer key is refused on `/api/*`.
+
+| Route | Maps to |
+| --- | --- |
+| `GET /api/version`, `/api/tags`, `/api/ps` | the version; the catalog (plus presets); the loaded models |
+| `POST /api/show` | `model.info` metadata, the preset's Modelfile, template, parameters |
+| `POST /api/chat` | the chat path of `/v1/chat/completions`; NDJSON when streaming (the default) |
+| `POST /api/generate` | a one-turn chat, or `/v1/completions` with `raw` or a `template`; `system`, `options`, `keep_alive`, `stream` |
+| `POST /api/embed`, `/api/embeddings` | `/v1/embeddings` |
+| `POST /api/pull`, `DELETE /api/delete` | `model.pull` (status lines), `model.delete` (only what MM downloaded) or a preset |
+| `POST /api/create`, `POST /api/copy` | a Modelfile preset; a copy of one |
+
+`create NAME -f Modelfile` (or `POST /api/create`) reads FROM, SYSTEM, TEMPLATE, PARAMETER, ADAPTER, MESSAGE and
+LICENSE and keeps a preset in `<home>/presets.json`; using its name runs the FROM model with those defaults. CLI:
+`show`, `ps`, `cp`, `create`. See `docs/STATUS.md`.
 
 ## Serving agents
 

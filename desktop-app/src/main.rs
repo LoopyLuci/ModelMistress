@@ -4,11 +4,7 @@
 //! ModelMistress's hub, with the hub's token. The hub is the one already running (found through its control file),
 //! else the `model-mistress` program shipped with the app (`hub_proc`), else, in development builds, one inside the app.
 
-#![cfg_attr(
-  all(not(debug_assertions), target_os = "windows"),
-  windows_subsystem = "windows"
-)]
-
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 // the slash-command registry and the BrainBuilder bridge carry metadata the window does not use yet
 #![allow(dead_code)]
 
@@ -117,7 +113,9 @@ fn list_commands() -> Result<Vec<String>, String> {
 async fn hub_call(state: tauri::State<'_, AppState>, op: String, args: Option<Value>) -> Result<Value, String> {
     let hub = state.link().await?;
     let c = hub.client().await.map_err(err)?;
-    c.call(&op, args.unwrap_or_else(|| serde_json::json!({}))).await.map_err(err)
+    c.call(&op, args.unwrap_or_else(|| serde_json::json!({})))
+        .await
+        .map_err(err)
 }
 
 /// The models on this machine, as rows for the model list.
@@ -262,7 +260,10 @@ fn main() {
         .expect("error while building tauri application");
     app.run(|handle, event| {
         if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-            hub_proc::note(&handle.state::<AppState>().shell.home, &format!("exit requested: {code:?}"));
+            hub_proc::note(
+                &handle.state::<AppState>().shell.home,
+                &format!("exit requested: {code:?}"),
+            );
             if !handle.state::<AppState>().quitting.load(Ordering::SeqCst) {
                 api.prevent_exit();
                 quit(handle);

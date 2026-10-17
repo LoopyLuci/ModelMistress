@@ -16,6 +16,7 @@ pub mod hosting;
 pub mod hub;
 pub mod image;
 pub mod km;
+pub mod ollama_api;
 pub mod pull;
 pub mod serving;
 pub mod speech;
@@ -25,6 +26,8 @@ pub mod trace;
 pub mod tts;
 pub mod vision;
 
+#[cfg(test)]
+mod ollama_tests;
 #[cfg(test)]
 mod tests_hosting;
 

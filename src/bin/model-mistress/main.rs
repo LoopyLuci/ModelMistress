@@ -65,6 +65,19 @@ enum Cmd {
     Search { query: String },
     /// Delete a model ModelMistress downloaded.
     Rm { model: String },
+    /// One model's details (Ollama's `show`): modelfile, parameters, template, model info.
+    Show { model: String },
+    /// The loaded models (Ollama's `ps`).
+    Ps,
+    /// Copy a model preset, or name a plain model as a preset (Ollama's `cp`).
+    Cp { source: String, destination: String },
+    /// Register a named model preset from a Modelfile: `create mymodel -f Modelfile`.
+    Create {
+        name: String,
+        /// The Modelfile (FROM, SYSTEM, PARAMETER, TEMPLATE, ADAPTER, MESSAGE).
+        #[arg(short, long, default_value = "Modelfile")]
+        file: PathBuf,
+    },
     /// One question, one answer.
     Chat { model: String, prompt: String },
     /// Speech to text with the built-in whisper.cpp (WAV or MP3): `transcribe talk.wav --model base.en`.
@@ -497,6 +510,45 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                     m["downloads"]
                 );
             }
+        }
+        Cmd::Show { model } => {
+            let v = client().await?.call("model.show", json!({"model": model})).await?;
+            println!("{}", v["modelfile"].as_str().unwrap_or(""));
+            show(&json!({"details": v["details"], "parameters": v["parameters"], "capabilities": v["capabilities"]}));
+        }
+        Cmd::Ps => {
+            let v = client().await?.call("model.loaded", json!({})).await?;
+            println!("{:<48} {:>9}  {:>8}", "NAME", "VRAM MiB", "IDLE s");
+            for m in v.as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{:<48} {:>9}  {:>8}",
+                    m["model"].as_str().unwrap_or(""),
+                    m["serving"]["vram_mib"]
+                        .as_f64()
+                        .map_or("-".into(), |x| format!("{x:.0}")),
+                    m["idle_s"]
+                );
+            }
+        }
+        Cmd::Cp { source, destination } => show(
+            &client()
+                .await?
+                .call("model.copy", json!({"source": source, "destination": destination}))
+                .await?,
+        ),
+        Cmd::Create { name, file } => {
+            let text = anyhow::Context::with_context(std::fs::read_to_string(&file), || file.display().to_string())?;
+            // the hub resolves relative ADAPTER paths against the Modelfile's folder
+            let dir = std::path::absolute(&file)?.parent().map(|d| d.to_path_buf());
+            show(
+                &client()
+                    .await?
+                    .call(
+                        "model.create",
+                        json!({"model": name, "modelfile": text, "base_dir": dir}),
+                    )
+                    .await?,
+            );
         }
         Cmd::Rm { model } => show(&client().await?.call("model.delete", json!({"model": model})).await?),
         Cmd::Transcribe {

@@ -2,6 +2,23 @@
 
 Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in llama.cpp (commit 7fee178, Vulkan).
 
+## Ollama-compatible API
+
+`src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):
+`version`, `tags`, `show`, `chat`, `generate`, `embed`, `embeddings`, `ps`, `pull`, `delete`, `create`, `copy`.
+Tested over a hub with stand-ins for llama-server (no real model): shapes, NDJSON streaming however the bytes are
+cut, presets end to end, token required. Not yet run against a real Ollama client.
+
+- Same token as `/v1`, loopback only for the owner's token; a tokenless Ollama client needs a header-adding proxy
+  (decision for the owner: an opt-in tokenless-loopback setting).
+- Modelfile `create` makes a *preset* (`<home>/presets.json`): FROM must already be an MM model (pull it first);
+  ADAPTER files are attached to the FROM model when the preset is used (MM's LoRA is per model, so this is shared
+  with other users of that model); TEMPLATE is used by `/api/generate` only (chat uses the model's own template).
+- `digest` in `/api/tags` is a stable stand-in (id, size, mtime), not a content hash. `size_vram` is the VRAM the
+  server reported, else 0. `keep_alive: 0` unloads after the request; other values are ignored (`idle_unload_s`
+  is global). `num_ctx` and `num_gpu` options are load-time settings and are ignored per request.
+- CLI: `show`, `ps`, `cp`, `create -f Modelfile`; operations `model.show`, `model.create`, `model.copy`.
+
 ## Works (tested end to end)
 
 - **Nothing else to install.** Built with `--features bundled-engine`, the one `model-mistress` binary (114 MB)

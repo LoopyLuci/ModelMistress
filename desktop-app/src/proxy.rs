@@ -43,11 +43,18 @@ pub fn cors_headers(origin: Option<&str>) -> HeaderMap {
 }
 
 async fn forward(State(relay): State<Relay>, req: Request<Body>) -> Response<Body> {
-    let origin = req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let cors = cors_headers(origin.as_deref());
     let mut out = Response::builder();
     if req.method() == Method::OPTIONS {
-        let mut r = out.status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap_or_default();
+        let mut r = out
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap_or_default();
         r.headers_mut().extend(cors);
         return r;
     }
@@ -127,7 +134,12 @@ mod tests {
     async fn the_relay_forwards_streams_and_answers_preflight() {
         // a stand-in hub: echoes the Authorization header and streams two events
         let hub = Router::new().fallback(|req: Request<Body>| async move {
-            let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let auth = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
             let s = futures_util::stream::iter([
                 Ok::<_, std::io::Error>(format!("data: {auth}\n\n")),
                 Ok("data: [DONE]\n\n".to_string()),
@@ -160,7 +172,12 @@ mod tests {
         assert_eq!(r.headers()["content-type"], "text/event-stream");
         assert_eq!(r.headers()["access-control-allow-origin"], "http://tauri.localhost");
         assert_eq!(r.text().await.unwrap(), "data: Bearer abc\n\ndata: [DONE]\n\n");
-        let other = c.get(format!("{url}/x")).header("Origin", "http://evil.example").send().await.unwrap();
+        let other = c
+            .get(format!("{url}/x"))
+            .header("Origin", "http://evil.example")
+            .send()
+            .await
+            .unwrap();
         assert!(!other.headers().contains_key("access-control-allow-origin"));
     }
 }

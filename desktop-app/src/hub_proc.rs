@@ -57,7 +57,11 @@ pub fn plan(hub_answers: bool, bundled: Option<PathBuf>) -> Plan {
 
 /// `model-mistress(.exe)` in the folder of the app's own executable.
 pub fn bundled_hub(app_exe: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) { "model-mistress.exe" } else { "model-mistress" };
+    let name = if cfg!(windows) {
+        "model-mistress.exe"
+    } else {
+        "model-mistress"
+    };
     let p = app_exe.parent()?.join(name);
     p.is_file().then_some(p)
 }
@@ -135,9 +139,14 @@ impl Shell {
         match self.start_inner(app_exe, embedded).await {
             Ok(started) => {
                 let url = read_control(&self.home).map(|c| c.url).unwrap_or_default();
-                self.set(Phase::Ready { url, started_by_app: started });
+                self.set(Phase::Ready {
+                    url,
+                    started_by_app: started,
+                });
             }
-            Err(e) => self.set(Phase::Failed { message: format!("{e:#}") }),
+            Err(e) => self.set(Phase::Failed {
+                message: format!("{e:#}"),
+            }),
         }
     }
 
@@ -183,12 +192,15 @@ impl Shell {
         *self.child.lock().unwrap() = Some(child);
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
-            if let Some(status) = self.child.lock().unwrap().as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+            if let Some(status) = self
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+            {
                 *self.child.lock().unwrap() = None;
-                bail!(
-                    "the hub program exited at start ({status}).\n{}",
-                    log_tail(&log_path)
-                );
+                bail!("the hub program exited at start ({status}).\n{}", log_tail(&log_path));
             }
             if read_control(&self.home).is_some_and(|c| c.pid == Some(pid)) && hub_answers(&self.home).await {
                 return Ok(());
@@ -196,7 +208,10 @@ impl Shell {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         self.kill_child();
-        bail!("the hub did not answer /v1/health within 90 seconds.\n{}", log_tail(&log_path))
+        bail!(
+            "the hub did not answer /v1/health within 90 seconds.\n{}",
+            log_tail(&log_path)
+        )
     }
 
     fn kill_child(&self) {
@@ -249,7 +264,11 @@ impl Shell {
 /// One line in `<home>/desktop-app.log`, for finding out afterwards what the app did.
 pub fn note(home: &Path, line: &str) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(home.join("desktop-app.log")) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(home.join("desktop-app.log"))
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -279,7 +298,10 @@ mod tests {
     #[test]
     fn control_file_is_parsed() {
         let c = parse_control(br#"{"url":"http://127.0.0.1:5000/","token":"t","pid":7,"api":1}"#).unwrap();
-        assert_eq!((c.url.as_str(), c.token.as_str(), c.pid), ("http://127.0.0.1:5000", "t", Some(7)));
+        assert_eq!(
+            (c.url.as_str(), c.token.as_str(), c.pid),
+            ("http://127.0.0.1:5000", "t", Some(7))
+        );
         assert!(parse_control(br#"{"url":"x"}"#).is_none());
         assert!(parse_control(b"not json").is_none());
     }
@@ -288,7 +310,10 @@ mod tests {
     fn a_running_hub_is_used_before_anything_is_started() {
         let bin = Some(PathBuf::from("model-mistress.exe"));
         assert_eq!(plan(true, bin.clone()), Plan::Attach);
-        assert_eq!(plan(false, bin.clone()), Plan::Spawn(PathBuf::from("model-mistress.exe")));
+        assert_eq!(
+            plan(false, bin.clone()),
+            Plan::Spawn(PathBuf::from("model-mistress.exe"))
+        );
         assert_eq!(plan(false, None), Plan::Embedded);
     }
 
@@ -314,7 +339,11 @@ mod tests {
         let d = model_mistress::testing::TestDir::new("mm-desktop-test");
         let exe = d.join("app.exe");
         assert!(bundled_hub(&exe).is_none());
-        let name = if cfg!(windows) { "model-mistress.exe" } else { "model-mistress" };
+        let name = if cfg!(windows) {
+            "model-mistress.exe"
+        } else {
+            "model-mistress"
+        };
         std::fs::write(d.join(name), b"x").unwrap();
         assert_eq!(bundled_hub(&exe), Some(d.join(name)));
     }
