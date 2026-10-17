@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +91,12 @@ pub struct Settings {
     pub load_timeout_s: u64,
     /// Unload a model after this many idle seconds (0 = never).
     pub idle_unload_s: u64,
+    /// Models loaded for embeddings or reranking that may stay up next to the `max_loaded` chat models (they are
+    /// counted apart, so an embeddings request does not evict a chat model that fits).
+    pub max_loaded_embedding: usize,
+    /// Let requests from this machine (the peer address is 127.0.0.1 or ::1) call the hub without a token, so
+    /// Ollama clients that send no Authorization header work. Off by default; see the README.
+    pub allow_loopback_no_token: bool,
     /// Used when a request names no model.
     pub default_model: Option<String>,
     /// Extra arguments for every llama-server.
@@ -145,6 +151,8 @@ impl Default for Settings {
             autoload: true,
             load_timeout_s: 300,
             idle_unload_s: 0,
+            max_loaded_embedding: 1,
+            allow_loopback_no_token: false,
             default_model: None,
             extra_args: vec![],
             download_dir: None,
@@ -378,6 +386,9 @@ pub struct Instance {
     /// How it is served: context, slots, KV types, VRAM (see [`Serving`]).
     serving: RwLock<Serving>,
     last_used: AtomicU64,
+    /// The idle-unload override of a request's keep_alive: 0 = none (the global `idle_unload_s` applies), -1 =
+    /// keep forever, else the unix second it expires at.
+    keep: AtomicI64,
     /// Requests being served now (see [`Lease`]).
     inflight: AtomicUsize,
     /// No longer in `loaded`: it stops when its last request is done.
@@ -402,6 +413,22 @@ impl Drop for Lease {
 impl Instance {
     fn touch(&self) {
         self.last_used.store(now_s(), Ordering::Relaxed);
+    }
+    /// Whether the idle unload takes this model now, given the global `idle` seconds (0 = never).
+    pub fn expired(&self, idle: u64) -> bool {
+        match self.keep.load(Ordering::Relaxed) {
+            0 => idle > 0 && self.idle_s() > idle,
+            k if k < 0 => false,
+            at => now_s() as i64 >= at && self.inflight() == 0,
+        }
+    }
+    /// Seconds until the idle unload takes this model, given the global `idle` (None: never).
+    pub fn expires_in(&self, idle: u64) -> Option<u64> {
+        match self.keep.load(Ordering::Relaxed) {
+            0 => (idle > 0).then(|| idle.saturating_sub(self.idle_s())),
+            k if k < 0 => None,
+            at => Some((at as u64).saturating_sub(now_s())),
+        }
     }
     pub fn idle_s(&self) -> u64 {
         now_s().saturating_sub(self.last_used.load(Ordering::Relaxed))
@@ -909,7 +936,7 @@ impl Engine {
                 }
             }
             self.unload(&entry.id);
-            self.make_room();
+            self.make_room(opts.embeddings || opts.reranking);
         }
         // A reload keeps the old instance serving while the new one loads (both are in memory for a while), then
         // `install` switches over.
@@ -987,6 +1014,7 @@ impl Engine {
             extras: Extras::default(),
             serving: RwLock::new(Serving::default()),
             last_used: AtomicU64::new(now_s()),
+            keep: AtomicI64::new(0),
             inflight: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -996,15 +1024,27 @@ impl Engine {
         inst
     }
 
-    fn make_room(&self) {
-        let max = self.settings.read().max_loaded.max(1);
+    /// Make room for one more model of the same class: chat models are counted against `max_loaded`, embedding and
+    /// reranking ones against `max_loaded_embedding`, so one kind does not evict the other. The most idle of the
+    /// class goes first.
+    fn make_room(&self, embedding_class: bool) {
+        let max = {
+            let s = self.settings.read();
+            if embedding_class {
+                s.max_loaded_embedding
+            } else {
+                s.max_loaded
+            }
+            .max(1)
+        };
         loop {
             let victim = {
                 let l = self.loaded.lock();
-                if l.len() < max {
+                let same = || l.values().filter(|i| (i.embeddings || i.reranking) == embedding_class);
+                if same().count() < max {
                     return;
                 }
-                l.values().max_by_key(|i| i.idle_s()).map(|i| i.model.clone())
+                same().max_by_key(|i| i.idle_s()).map(|i| i.model.clone())
             };
             match victim {
                 Some(v) => {
@@ -1012,6 +1052,22 @@ impl Engine {
                 }
                 None => return,
             }
+        }
+    }
+
+    /// A request's `keep_alive` for a loaded model: 0 unloads it now, a negative value keeps it forever, seconds
+    /// set its idle-unload deadline from now. `None` goes back to the global `idle_unload_s`.
+    pub fn set_keep_alive(&self, id: &str, secs: Option<i64>) {
+        let Some(inst) = self.loaded.lock().get(id).cloned() else {
+            return;
+        };
+        match secs {
+            Some(0) => {
+                self.unload(id);
+            }
+            Some(s) if s < 0 => inst.keep.store(-1, Ordering::Relaxed),
+            Some(s) => inst.keep.store(now_s() as i64 + s, Ordering::Relaxed),
+            None => inst.keep.store(0, Ordering::Relaxed),
         }
     }
 
@@ -1385,6 +1441,7 @@ impl Engine {
             },
             serving: RwLock::new(Serving::from_resolved(&resolved)),
             last_used: AtomicU64::new(now_s()),
+            keep: AtomicI64::new(0),
             inflight: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -1488,7 +1545,7 @@ impl Engine {
                 .as_mut()
                 .map(|c| c.try_wait().ok().flatten().is_some())
                 .unwrap_or(true);
-            if dead || (idle > 0 && i.idle_s() > idle) {
+            if dead || i.expired(idle) {
                 gone.push(i.model.clone());
             }
         }
@@ -1833,6 +1890,38 @@ mod job {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_embedding_model_does_not_evict_the_chat_model() {
+        let home = crate::testing::temp_home();
+        let e = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                max_loaded: 1,
+                max_loaded_embedding: 1,
+                ..Default::default()
+            },
+        );
+        e.adopt("chat", 1, "k", None);
+        e.adopt_as("emb", 1, "k", true, None);
+        // room for a second embedding model: only the embedding one goes
+        e.make_room(true);
+        assert!(e.is_loaded("chat") && !e.is_loaded("emb"));
+        e.adopt_as("emb", 1, "k", true, None);
+        // room for a second chat model: only the chat one goes (LRU within the class)
+        e.make_room(false);
+        assert!(!e.is_loaded("chat") && e.is_loaded("emb"));
+        // under budget: nothing goes
+        e.adopt("chat", 1, "k", None);
+        e.set_settings(Settings {
+            max_loaded: 2,
+            max_loaded_embedding: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        e.make_room(true);
+        e.make_room(false);
+        assert!(e.is_loaded("chat") && e.is_loaded("emb"));
+    }
 
     fn moe_entry(native: bool, experts: u64) -> ModelEntry {
         let mut meta = serde_json::Map::new();

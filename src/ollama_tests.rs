@@ -316,3 +316,71 @@ async fn the_v1_routes_and_operations_still_work() {
     let (_, v, _) = call(&h, "POST", "/v1/call/model.show", Some(json!({"model": "tiny"}))).await;
     assert_eq!(v["result"]["details"]["format"], "gguf");
 }
+
+#[test]
+fn tokenless_loopback_only_when_the_flag_is_on_and_the_peer_is_loopback() {
+    let a = |s: &str| Some(s.parse::<std::net::SocketAddr>().unwrap());
+    assert!(hub::tokenless_allowed(true, a("127.0.0.1:5")));
+    assert!(hub::tokenless_allowed(true, a("[::1]:5")));
+    assert!(hub::tokenless_allowed(true, a("[::ffff:127.0.0.1]:5")));
+    assert!(!hub::tokenless_allowed(true, a("192.168.1.5:5")));
+    assert!(!hub::tokenless_allowed(true, None));
+    assert!(!hub::tokenless_allowed(false, a("127.0.0.1:5")));
+}
+
+/// Over the router with a mock peer address (the ConnectInfo the server would add): no header at all.
+#[tokio::test]
+async fn tokenless_requests_through_the_router() {
+    use tower::ServiceExt;
+    let home = testing::temp_home();
+    let h = testing::hub(&home, &["tiny"]);
+    let go = |peer: &str, token: bool| {
+        let mut r = axum::http::Request::builder().uri("/api/version");
+        if token {
+            r = r.header("authorization", format!("Bearer {TOKEN}"));
+        }
+        let mut req = r.body(axum::body::Body::empty()).unwrap();
+        let addr: std::net::SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+        req
+    };
+    let status = |h: Hub, req: axum::http::Request<axum::body::Body>| async move {
+        hub::router(h).oneshot(req).await.unwrap().status().as_u16()
+    };
+    // default: a token is required
+    assert_eq!(status(h.clone(), go("127.0.0.1:9", false)).await, 401);
+    assert_eq!(status(h.clone(), go("127.0.0.1:9", true)).await, 200);
+    let mut s = h.engine.settings();
+    s.allow_loopback_no_token = true;
+    h.engine.set_settings(s).unwrap();
+    assert_eq!(status(h.clone(), go("127.0.0.1:9", false)).await, 200);
+    assert_eq!(status(h.clone(), go("[::1]:9", false)).await, 200);
+    assert_eq!(status(h.clone(), go("10.1.2.3:9", false)).await, 401);
+    assert_eq!(status(h.clone(), go("127.0.0.1:9", true)).await, 200);
+}
+
+#[tokio::test]
+async fn keep_alive_sets_a_deadline_per_model() {
+    let home = testing::temp_home();
+    let h = testing::hub(&home, &["a", "b"]);
+    let (ia, ib) = (h.engine.adopt("a", 1, "k", None), h.engine.adopt("b", 1, "k", None));
+    assert_eq!(ia.expires_in(0), None);
+    h.engine.set_keep_alive("a", Some(300));
+    let left = ia.expires_in(0).unwrap();
+    assert!((298..=300).contains(&left), "{left}");
+    assert_eq!(ib.expires_in(0), None); // the other model keeps the global default
+    h.engine.set_keep_alive("a", Some(-1));
+    assert_eq!(ia.expires_in(60), None); // forever beats the global idle
+    h.engine.set_keep_alive("a", None);
+    assert_eq!(ia.expires_in(60), Some(60));
+    // an expired deadline is what housekeeping unloads; the other model is not expired
+    h.engine.set_keep_alive("a", Some(1));
+    assert!(!ia.expired(0));
+    std::thread::sleep(Duration::from_millis(2100));
+    assert!(ia.expired(0) && !ib.expired(0));
+    h.engine.set_keep_alive("a", Some(-1));
+    assert!(!ia.expired(1));
+    // 0 unloads now
+    h.engine.set_keep_alive("b", Some(0));
+    assert!(!h.engine.is_loaded("b"));
+}

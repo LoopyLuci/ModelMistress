@@ -89,7 +89,7 @@ model that is slow on its own, and keep the card's memory free (the draft model 
 ## Embeddings and reranking
 
 Both are served by a model loaded for the purpose, next to the chat model: `max_loaded` (default 2) models stay
-loaded, so a chat model and an embedding model fit together. A model is loaded for one use at a time (llama.cpp
+loaded, plus `max_loaded_embedding` (default 1) embedding or rerank models counted apart, so a chat model and an embedding model fit together and neither evicts the other. A model is loaded for one use at a time (llama.cpp
 serves embeddings or reranking only, then); asking a model that is loaded for another use gets a `409` that says
 how to load it.
 

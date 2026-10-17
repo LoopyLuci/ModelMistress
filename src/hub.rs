@@ -144,6 +144,12 @@ pub fn owner_allowed(peer: Option<SocketAddr>) -> bool {
     peer.is_none_or(|a| a.ip().to_canonical().is_loopback())
 }
 
+/// A request with no credentials passes only when `allow_loopback_no_token` is on and the peer address (never a
+/// header) is loopback. No address known is not enough here, unlike [`owner_allowed`].
+pub fn tokenless_allowed(flag: bool, peer: Option<SocketAddr>) -> bool {
+    flag && peer.is_some_and(|a| a.ip().to_canonical().is_loopback())
+}
+
 async fn auth(State(hub): State<Hub>, mut req: Request, next: Next) -> Response {
     let from = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let h = req.headers();
@@ -161,7 +167,13 @@ async fn auth(State(hub): State<Hub>, mut req: Request, next: Next) -> Response 
         ))
         .into_response()
     };
-    let Some(given) = given else { return unauthorized() };
+    let Some(given) = given else {
+        if tokenless_allowed(hub.engine.settings().allow_loopback_no_token, from) {
+            req.extensions_mut().insert(Caller(None));
+            return next.run(req).await;
+        }
+        return unauthorized();
+    };
     if same(given.as_bytes(), hub.token.as_bytes()) {
         if !owner_allowed(from) {
             return ApiError(Fail::new(

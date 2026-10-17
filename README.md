@@ -119,7 +119,17 @@ schema). Every operation is also an MCP tool.
 The hub also speaks Ollama's server API on the same host, port and token, so an Ollama client or tool can point
 at ModelMistress (`OLLAMA_HOST=http://127.0.0.1:<port>`). The token is required, as for `/v1`: send it as
 `Authorization: Bearer <token>` (from `control.json`, or `MM_TOKEN`). A client that cannot send a header needs a
-local proxy that adds it. The owner's token only; a peer key is refused on `/api/*`.
+local proxy that adds it, or the opt-in `allow_loopback_no_token = true` in `config.toml` (default `false`): then
+requests whose connecting address is `127.0.0.1` or `::1` need no token on `/api/*` and `/v1`. The check is on the
+socket's peer address, never a header, and other addresses still need the token. The tradeoff: every program and
+user on this machine (and any local reverse proxy that forwards to the hub, which then looks local) gets full
+owner access with no secret, so turn it on only on a machine you trust. The owner's token only; a peer key is
+refused on `/api/*`.
+
+`keep_alive` on `/api/chat`, `/api/generate` and `/api/embed` is per model, as in Ollama: seconds or `"5m"`; `0`
+unloads the model after the request, a negative value keeps it loaded, and a request without it falls back to
+`idle_unload_s`. A chat model and an embedding model stay loaded together: chat models count against
+`max_loaded`, embedding and rerank models against `max_loaded_embedding` (default 1), least recently used first.
 
 | Route | Maps to |
 | --- | --- |

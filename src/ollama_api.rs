@@ -758,11 +758,10 @@ pub fn ps(hub: &Hub) -> Value {
             let m = cat.iter().find(|m| m.id == i.model)?;
             let vram = i.serving().vram_mib.map_or(0, |mib| (mib * 1_048_576.0) as u64);
             // Ollama's "never expires" is the zero time
-            let expires = if idle > 0 {
-                (chrono::Utc::now() + chrono::Duration::seconds(idle.saturating_sub(i.idle_s()) as i64))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-            } else {
-                "0001-01-01T00:00:00Z".into()
+            let expires = match i.expires_in(idle) {
+                Some(s) => (chrono::Utc::now() + chrono::Duration::seconds(s as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                None => "0001-01-01T00:00:00Z".into(),
             };
             let mut row = tag_entry(m, &m.id, "");
             row["size_vram"] = json!(vram);
@@ -994,7 +993,7 @@ fn line(v: &Value) -> String {
 /// Send `body` to llama-server at `path` and answer in Ollama's shape, streamed or not.
 async fn run(hub: Hub, req: &Value, path: &'static str, body: Value, kind: Kind, shown: String) -> R<Response> {
     let stream = streaming(req);
-    let unload_after = req.get("keep_alive").and_then(keep_alive_s) == Some(0);
+    let keep = req.get("keep_alive").and_then(keep_alive_s);
     let t0 = Instant::now();
     let (model, resp, lease) = hub.engine.forward(path, body).await?;
     let status = resp.status();
@@ -1016,9 +1015,7 @@ async fn run(hub: Hub, req: &Value, path: &'static str, body: Value, kind: Kind,
         hub.engine
             .record(&model, true, t0.elapsed().as_millis() as u64, v.get("usage"));
         drop(lease);
-        if unload_after {
-            hub.engine.unload(&model);
-        }
+        hub.engine.set_keep_alive(&model, keep);
         return Ok(Json(answer(kind, &shown, &v, t0.elapsed())).into_response());
     }
     hub.engine.record(&model, true, t0.elapsed().as_millis() as u64, None);
@@ -1043,9 +1040,7 @@ async fn run(hub: Hub, req: &Value, path: &'static str, body: Value, kind: Kind,
                 yield Ok(line(&v));
             }
             drop(lease);
-            if unload_after {
-                hub.engine.unload(&model);
-            }
+            hub.engine.set_keep_alive(&model, keep);
         }
         .boxed(),
     ))
@@ -1053,11 +1048,13 @@ async fn run(hub: Hub, req: &Value, path: &'static str, body: Value, kind: Kind,
 
 /// An empty request loads the model (or, with `keep_alive: 0`, unloads it): Ollama's idiom.
 async fn load_only(hub: &Hub, req: &Value, real: &str, shown: &str, kind: Kind) -> R<Response> {
-    let reason = if req.get("keep_alive").and_then(keep_alive_s) == Some(0) {
+    let keep = req.get("keep_alive").and_then(keep_alive_s);
+    let reason = if keep == Some(0) {
         hub.engine.unload(real);
         "unload"
     } else {
         hub::call(hub, "model.load", &json!({"model": real})).await?;
+        hub.engine.set_keep_alive(real, keep);
         "load"
     };
     let mut v = json!({"model": shown, "created_at": now(), "done": true, "done_reason": reason});
@@ -1116,9 +1113,12 @@ async fn embeddings_call(hub: &Hub, req: &Value, legacy: bool) -> R<Json<Value>>
     let body = embed_body(req, &real);
     crate::tools::check_embeddings(&body).map_err(Fail::invalid)?;
     let t0 = Instant::now();
-    let (model, resp, _lease) = hub.engine.forward("/v1/embeddings", body).await?;
+    let (model, resp, lease) = hub.engine.forward("/v1/embeddings", body).await?;
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(Value::Null);
+    drop(lease);
+    hub.engine
+        .set_keep_alive(&model, req.get("keep_alive").and_then(keep_alive_s));
     hub.engine.record(
         &model,
         status.is_success(),

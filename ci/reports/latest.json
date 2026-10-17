@@ -1,36 +1,36 @@
 {
  "passed": true,
- "at": "20261017-111911",
- "seconds": 454.1,
+ "at": "20261017-162429",
+ "seconds": 462.2,
  "stages": [
   {
    "stage": "preflight",
    "ok": true,
-   "seconds": 0.1,
+   "seconds": 0.0,
    "message": ""
   },
   {
    "stage": "static",
    "ok": true,
-   "seconds": 64.6,
+   "seconds": 52.4,
    "message": ""
   },
   {
    "stage": "tests",
    "ok": true,
-   "seconds": 95.6,
+   "seconds": 98.3,
    "message": ""
   },
   {
    "stage": "build",
    "ok": true,
-   "seconds": 291.6,
+   "seconds": 309.2,
    "message": ""
   },
   {
    "stage": "smoke",
    "ok": true,
-   "seconds": 2.2,
+   "seconds": 2.3,
    "message": ""
   }
  ]

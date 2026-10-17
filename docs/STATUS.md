@@ -15,8 +15,8 @@ cut, presets end to end, token required. Not yet run against a real Ollama clien
   ADAPTER files are attached to the FROM model when the preset is used (MM's LoRA is per model, so this is shared
   with other users of that model); TEMPLATE is used by `/api/generate` only (chat uses the model's own template).
 - `digest` in `/api/tags` is a stable stand-in (id, size, mtime), not a content hash. `size_vram` is the VRAM the
-  server reported, else 0. `keep_alive: 0` unloads after the request; other values are ignored (`idle_unload_s`
-  is global). `num_ctx` and `num_gpu` options are load-time settings and are ignored per request.
+  server reported, else 0. `keep_alive` is per model: 0 unloads after the request, negative keeps it loaded, seconds or "5m" set its
+  idle deadline; omitted falls back to the global `idle_unload_s`. `num_ctx` and `num_gpu` options are load-time settings and are ignored per request.
 - CLI: `show`, `ps`, `cp`, `create -f Modelfile`; operations `model.show`, `model.create`, `model.copy`.
 
 ## Works (tested end to end)
@@ -214,7 +214,7 @@ a desktop; use `model.plan` first), the tool-call check on the GPU, and the plan
 
 ## Not done yet
 
-- A model is loaded for one use at a time: chat, embeddings or reranking (llama.cpp serves one of them per server).
+- A single model file is loaded for one use at a time (llama.cpp serves chat, embeddings or reranking per server); a chat model and a separate embedding model do load together (`max_loaded` / `max_loaded_embedding`).
 - Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
   multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
