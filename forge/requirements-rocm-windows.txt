@@ -17,3 +17,6 @@ protobuf==4.25.9
 tqdm==4.70.1
 PyYAML==6.0.3
 pytest==9.1.1
+peft==0.19.1
+accelerate==1.13.0
+# bitsandbytes (QLoRA) is optional and has no Windows/ROCm build: install it on Linux if wanted

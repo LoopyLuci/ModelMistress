@@ -317,7 +317,7 @@ pub fn operations() -> Vec<Value> {
         ),
         op(
             "forge.run",
-            "Run a pipeline step (python -m mm_forge <step>) with JSON arguments, as a job with progress, logs and metrics. Steps: env_info, preflight, dusty_convert, dusty_equiv, generate",
+            "Run a pipeline step (python -m mm_forge <step>) with JSON arguments, as a job with progress, logs and metrics. Steps: env_info, preflight, dusty_convert, dusty_equiv, generate, generate_serve, lora_train, qlora_train, merge_lora, merged_to_gguf, lora_to_gguf",
             true,
             false,
             json!({

@@ -145,7 +145,7 @@ router, choosing KMs automatically for chat, using skill/tool KMs at inference, 
 Tasks run plan → gather → generate → verify → tag → build → evaluate → publish (64 tests). Run for real with
 Qwen3-1.7B as author and reviewer on the CPU: 20 records generated, 11 rejected (8 duplicates, 3 unsupported by their
 sources), data and memory KMs built and imported, uplift measured, promotion held by the gate. A 0.6B reviewer accepted
-everything, so reviewers should be about 1.7B or larger. Not yet: adapter training (needs the Forge), executable code
+everything, so reviewers should be about 1.7B or larger. Not yet: adapter training (the Forge now has LoRA; not wired into the factory), executable code
 checks (the hook exists; tool-call schema checks are built in), learning the quality scorer from review decisions,
 automatic resume after a hub restart (a task is marked `interrupted` and resumes on request).
 
@@ -218,7 +218,7 @@ a desktop; use `model.plan` first), the tool-call check on the GPU, and the plan
 - Other engines (vLLM, ExLlama); image edits and a resident image model (sd.cpp's server); GPU execution providers, float16 and
   multi-input models and segmentation or pose outputs for vision.
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
-- Training beyond the Forge's conversion and checks: expert training, distillation, adapters.
+- Training: LoRA and QLoRA fine-tuning, merge and GGUF export are in the Forge (QLoRA needs bitsandbytes, Linux/CUDA only in practice; untested on a real GPU run). Not yet: expert training, distillation, DPO.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
 
 ## Legacy code

@@ -14,7 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(f"mm_forge {__version__}; steps:")
         for name, (_, doc) in sorted(steps.STEPS.items()):
-            print(f"  {name:<14} {doc}")
+            print(f"  {name:<16} {doc}")
         return 0 if argv else 2
     if argv[0] == "--version":
         print(__version__)

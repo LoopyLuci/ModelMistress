@@ -65,7 +65,8 @@ Object on Windows, a process group elsewhere); the tree also dies when the hub e
 | `forge.run` | `forge run <step> '<json>'` | job (`--detach` to return at once) |
 | `forge.runs`, `forge.run.get`, `forge.run.cancel` | `forge runs`, `forge show <run> [--metric m]`, `forge cancel <run>` | |
 
-Steps: `env_info`, `preflight`, `dusty_convert`, `dusty_equiv`, `generate`, `generate_serve`.
+Steps: `env_info`, `preflight`, `dusty_convert`, `dusty_equiv`, `generate`, `generate_serve`, `lora_train`,
+`qlora_train`, `merge_lora`, `merged_to_gguf`, `lora_to_gguf`.
 Checkpoint helpers (`mm_forge.checkpoint`: safetensors with a hash manifest, a streaming sharded writer) and
 deterministic seeding (`mm_forge.seeding`) are the building blocks for the training steps that follow.
 
@@ -154,17 +155,66 @@ folder whose architecture llama.cpp's converter knows gets `needs_conversion` (t
 `forge.generate` returns tokens with logprobs and `forge.unload` stops it; ONNX is planned only (`not_available`).
 `--plan-only` only says what would be done. The KM runtime proper is another branch's work.
 
+## Fine-tuning: `lora_train`, `qlora_train`, export
+
+Replaces Unsloth: PEFT LoRA (and 4-bit QLoRA) on PyTorch, on the GPU (ROCm or CUDA) or, with `device: "cpu"`, the CPU.
+Start a run with `model-mistress forge run lora_train '<json>'` (or the `forge.run` operation); `forge show <run>
+--metric loss` follows it, `forge cancel <run>` stops it, and starting the same arguments again resumes it.
+
+```
+model-mistress forge run lora_train '{"base_model": "<HF folder>", "data": "train.jsonl", "out_dir": "<run folder>",
+  "rank": 16, "alpha": 16, "learning_rate": 2e-4, "epochs": 2, "batch_size": 2, "grad_accum": 4, "max_seq_length": 1024}'
+```
+
+Arguments: `base_model` (folder or repo id), `data` (file or list), `out_dir`; LoRA `rank` 16, `alpha` 16, `dropout` 0,
+`target_modules` (default the attention and MLP projections present), `rslora`, `dora`; `learning_rate` 2e-4,
+`epochs` 1 or `max_steps`, `batch_size` 2, `grad_accum` 4, `max_seq_length` 1024, `warmup_steps`, `weight_decay`,
+`max_grad_norm`; `load_in_4bit` (always on for `qlora_train`), `dtype` (auto = bf16 on the GPU), `device`
+(auto|gpu|cpu; `auto` without a GPU fails rather than training on the CPU), `gradient_checkpointing`, `eval_fraction`,
+`eval_every`, `save_every` 50, `keep_checkpoints` 2, `resume` true, `seed`, `merge` (also write `<out_dir>/merged`),
+`vram_check`, `free_vram_gb`.
+
+**Data** (`mm_forge.traindata`; `.jsonl`, `.json`, `.parquet`; formats are detected per row): chat
+`{"messages": [...]}`, ShareGPT `{"conversations": [{"from", "value"}]}`, alpaca `{"instruction", "input", "output"}`
+(+ `system`), `prompt`/`completion`, `question`/`answer`, and plain `{"text"}` (trained in full). Rows are rendered with
+the model's chat template (ChatML, saved with the result, when the base has none) and the loss is on the assistant's
+turns only. `eval_fraction` splits off a seeded eval set (at most 200 rows).
+
+**Checkpoints and resume**: every `save_every` steps and at the end, `<out_dir>/checkpoints/ckpt-<step>` holds the
+adapter tensors (`checkpoint.py`: safetensors + hash manifest), the optimizer state (hash in the manifest) and the
+position in the data. A run started with the same `out_dir` continues from the newest checkpoint whose hashes verify,
+so cancelling (which kills the worker) loses at most `save_every` steps; the batch order is deterministic, and a
+resumed run ends with the same adapter as an uninterrupted one (tested). Metrics per step: `loss`, `lr`, `grad_norm`,
+`gpu_mem_gb`, and `eval_loss`. The adapter ends in `<out_dir>/adapter`; `train.json` summarises the run.
+
+**VRAM preflight**: before loading, the free VRAM (`torch.cuda.mem_get_info`, or `free_vram_gb`) is compared with a
+pessimistic estimate (weights, adapters with Adam state, activations, the logits). If the request does not fit, the
+batch is halved (`grad_accum` raised to keep the effective batch), then 4-bit is used if it is available; if nothing
+fits the run fails at once with the free and needed GiB. What was changed is logged and returned as `vram_plan`.
+
+**QLoRA caveat**: it needs `bitsandbytes` with a GPU backend, which in practice means Linux with CUDA (or a ROCm build
+on Linux). It is not in the Windows/ROCm requirements and was not available on the development machine. Without it
+`qlora_train` falls back to 16-bit LoRA with a warning (`qlora_fallback: false` makes it fail instead); LoRA in
+bf16/fp16 is the supported path on Windows/ROCm.
+
+**Export**: `merge_lora` (`base_model`, `adapter`, `out_dir`) merges the adapter into the base as safetensors plus
+tokenizer; `merged_to_gguf` (`model_dir`, `out_dir`, `name`, `outtypes`, `quantize`, `quantize_exe`) converts a Hugging
+Face folder with llama.cpp's `convert_hf_to_gguf.py` and `llama-quantize` (the Dusty path); `lora_to_gguf` does both.
+The GGUF files are imported into the hub like any model. A real run needs `forge install` (torch, transformers,
+peft), a base model folder and a dataset; ABP calls it as `forge.run` with the step name and these arguments.
+
 ## Tests
 
 * Python (`forge/tests`, `python -m pytest tests`, about 10 seconds): protocol, seeding, checkpoints (sparse holes),
   the Dusty tensor mapping and exactness on a tiny synthetic checkpoint, the comparison logic, the generation
-  server on a tiny random Llama (CPU, and GPU when there is one).
+  server on a tiny random Llama (CPU, and GPU when there is one), and fine-tuning (datasets, VRAM planning,
+  checkpoint and resume, export wiring, a tiny LoRA run on the CPU with a tokenizer built in the test).
 * Rust (`cargo test -p model-mistress forge`): protocol parsing, the run store, the process runner (stdin, noise,
   timeout, cancel kills a grandchild), format and engine planning, and the operations against a real venv made by
   `forge.install` with a stand-in `mm_forge` package (install, run, metrics, failure, cancel, load, generate).
 
 ## Not yet
 
-Training steps (data, teach, expert and adapter training, evaluate, promote), the dashboard views, budgets
+Expert training, distillation, DPO, evaluate and promote steps, the dashboard views, budgets
 (GPU hours, idle windows, pausing for the owner's work), Linux/WSL requirements, a general safetensors to GGUF
 conversion step, ONNX language models.
