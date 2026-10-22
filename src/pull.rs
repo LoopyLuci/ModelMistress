@@ -255,6 +255,11 @@ pub async fn plan_hf(engine: &Engine, spec: &str, file: Option<&str>, with_proje
 }
 
 pub async fn plan_ollama(engine: &Engine, spec: &str) -> Result<Plan> {
+    if !engine.settings().ollama_discovery {
+        return Err(Fail::unavailable(
+            "Ollama models are turned off (ollama_discovery is false), so nothing is pulled from the Ollama library",
+        ));
+    }
     let (ns, name, tag) = split_ollama(spec)?;
     let url = format!("{OLLAMA_REGISTRY}/v2/{ns}/{name}/manifests/{tag}");
     let r = engine

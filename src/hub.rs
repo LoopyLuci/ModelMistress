@@ -781,20 +781,26 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         }
         "backend.list" => {
             let st = e.settings();
-            let ollama = e.ollama_models().await;
-            let running = !st.ollama_url.is_empty()
-                && e.http
-                    .get(format!("{}/api/version", st.ollama_url.trim_end_matches('/')))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                    .is_ok();
+            let ollama = if st.ollama_discovery {
+                let models = e.ollama_models().await;
+                let running = !st.ollama_url.is_empty()
+                    && e.http
+                        .get(format!("{}/api/version", st.ollama_url.trim_end_matches('/')))
+                        .timeout(Duration::from_secs(3))
+                        .send()
+                        .await
+                        .is_ok();
+                json!({"id": "ollama", "available": running, "url": st.ollama_url, "models": models.len(),
+                       "note": "models served as ollama/<name>, passed through to Ollama"})
+            } else {
+                json!({"id": "ollama", "enabled": false, "models": 0,
+                       "note": "turned off by ollama_discovery = false in config.toml"})
+            };
             json!([
                 {"id": "llama.cpp", "available": e.llama_server().is_some(), "path": e.llama_server(),
                  "version": e.llama_version().await, "built_in": crate::engine::bundled::version(),
                  "models": e.catalog().len(), "loaded": e.loaded().len()},
-                {"id": "ollama", "available": running, "url": st.ollama_url, "models": ollama.len(),
-                 "note": "models served as ollama/<name>, passed through to Ollama"}
+                ollama
             ])
         }
         "model.list" => {
@@ -2100,6 +2106,34 @@ unrelated line
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
         }
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_off_refuses_ollama_pulls_and_says_so_in_backends() {
+        let home = crate::testing::temp_home();
+        let mut h = hub(&home);
+        h.engine = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ollama_discovery: false,
+                ..Default::default()
+            },
+        );
+        // a pull from the Ollama library is refused before anything is fetched or written
+        match call(&h, "model.pull", &json!({"model": "qwen3:8b"})).await {
+            Err(_) => {}
+            Ok(v) => panic!("the pull must be refused, got {v}"),
+        }
+        assert!(!crate::pull::download_dir(&h.engine).join("ollama").exists());
+        // backend.list says Ollama is off by config, with no url or availability
+        let v = match call(&h, "backend.list", &json!({})).await {
+            Ok(v) => v,
+            Err(_) => panic!("backend.list failed"),
+        };
+        let o = v.as_array().unwrap().iter().find(|b| b["id"] == "ollama").unwrap();
+        assert_eq!(o["enabled"], false);
+        assert!(o.get("url").is_none() && o.get("available").is_none(), "{o}");
+        assert!(o["note"].as_str().unwrap().contains("ollama_discovery"));
     }
 
     fn wav(samples: &[i16]) -> Vec<u8> {

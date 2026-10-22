@@ -4,7 +4,8 @@
 
 - **`ollama_discovery` setting** (default `true`, so nothing changes): `false` stops using Ollama models entirely.
   No Ollama store is scanned (the detected ones, `ollama_dirs`, the download folder's `ollama` store), and
-  `ollama/<name>` is refused with an error. Also in the desktop settings form.
+  `ollama/<name>` is refused with an error, and `model.pull` from the Ollama library is refused too. `backend.list`
+  reports Ollama as turned off by config. Also in the desktop settings form.
 
 ## 0.3.0 — 2026-10-15
 

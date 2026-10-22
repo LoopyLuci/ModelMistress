@@ -79,7 +79,7 @@ PATH. Downloads go to `download_dir` (default `<home>`); gated Hugging Face repo
 
 Ollama models are on by default: the Ollama stores found on this machine, `ollama_dirs`, and `ollama/<name>` passed to
 a running Ollama. `ollama_discovery = false` in `config.toml` turns all of that off: no model with source `ollama` is
-listed, and `ollama/<name>` is refused with an error. Hugging Face and folder models are unaffected.
+listed, `ollama/<name>` is refused with an error, and `model.pull` from the Ollama library is refused. Hugging Face and folder models are unaffected.
 
 Build llama.cpp from source with the GPU backend you have (for example `-DGGML_VULKAN=ON` for AMD or Intel
 GPUs, `-DGGML_CUDA=ON` for NVIDIA).
