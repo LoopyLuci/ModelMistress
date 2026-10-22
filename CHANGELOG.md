@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`MM_HOME` is the home folder everywhere**: `default_home()` (used by every client that finds the hub without a
+  folder), the desktop app and the CI pipeline now use `MM_HOME` when it is set (blank values are ignored), else the
+  platform folder as before. `--home` still wins for one command. The CLI already read `MM_HOME`; it now goes
+  through the same rule.
+
 - **`ollama_discovery` setting** (default `true`, so nothing changes): `false` stops using Ollama models entirely.
   No Ollama store is scanned (the detected ones, `ollama_dirs`, the download folder's `ollama` store), and
   `ollama/<name>` is refused with an error, and `model.pull` from the Ollama library is refused too. `backend.list`

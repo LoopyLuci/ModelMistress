@@ -19,7 +19,7 @@ behind one OpenAI-compatible API and a control API for programs and agents."
 )]
 struct Args {
     /// Where the control file, settings and logs live.
-    #[arg(long, global = true, env = "MM_HOME")]
+    #[arg(long, global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -368,9 +368,14 @@ async fn key_op(home: &std::path::Path, op: &str, args: Value) -> anyhow::Result
     }
 }
 
+/// The hub's home: `--home` when given, else `MM_HOME`, else the standard folder.
+fn home_from_args(explicit: Option<PathBuf>) -> PathBuf {
+    explicit.unwrap_or_else(default_home)
+}
+
 fn main() {
     let args = Args::parse();
-    let home = args.home.clone().unwrap_or_else(default_home);
+    let home = home_from_args(args.home.clone());
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let code = rt.block_on(async move {
         match run(
@@ -956,4 +961,22 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         Cmd::Mcp => serve_mcp(client().await?).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test: it sets MM_HOME, and a second test doing the same in parallel would race on the variable.
+    #[test]
+    fn home_flag_beats_mm_home_and_mm_home_is_the_default() {
+        std::env::set_var("MM_HOME", "/from-env");
+        let flagged = Args::try_parse_from(["model-mistress", "--home", "/explicit", "status"]).unwrap();
+        let bare = Args::try_parse_from(["model-mistress", "status"]).unwrap();
+        let with_flag = home_from_args(flagged.home.clone());
+        let without_flag = home_from_args(bare.home.clone());
+        std::env::remove_var("MM_HOME");
+        assert_eq!(with_flag, PathBuf::from("/explicit"));
+        assert_eq!(without_flag, PathBuf::from("/from-env"));
+    }
 }

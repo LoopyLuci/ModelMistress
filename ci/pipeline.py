@@ -194,6 +194,10 @@ def http(method: str, url: str, token: str = "", body: bytes | None = None, time
 
 
 def user_home() -> Path:
+    # Same rule as the hub's default_home(): MM_HOME (trimmed, not expanded) when set, else the platform folder.
+    mm_home = os.environ.get("MM_HOME", "").strip()
+    if mm_home:
+        return Path(mm_home)
     if os.name == "nt":
         return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ModelMistress"
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "ModelMistress"

@@ -1,5 +1,6 @@
 //! Talking to a running model-mistress hub: find its control file, call its operations, and bridge them to MCP over stdio.
 
+use std::ffi::OsString;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
@@ -12,7 +13,22 @@ pub struct Client {
     http: reqwest::Client,
 }
 
+/// The home folder: `MM_HOME` when it is set to something other than blanks (trimmed, taken as given), else the
+/// platform's standard folder.
 pub fn default_home() -> PathBuf {
+    home_for(std::env::var_os("MM_HOME"))
+}
+
+fn home_for(mm_home: Option<OsString>) -> PathBuf {
+    let set = mm_home.and_then(|v| match v.to_str() {
+        Some(s) => Some(s.trim()).filter(|t| !t.is_empty()).map(PathBuf::from),
+        None => Some(PathBuf::from(v)),
+    });
+    set.unwrap_or_else(platform_home)
+}
+
+/// The standard folder for this platform, without `MM_HOME`.
+fn platform_home() -> PathBuf {
     let base = if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -344,4 +360,32 @@ pub async fn serve_mcp(hub: Client) -> Result<()> {
         out.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mm_home_is_the_home_when_set() {
+        assert_eq!(home_for(Some("/srv/mm".into())), PathBuf::from("/srv/mm"));
+    }
+
+    #[test]
+    fn mm_home_is_trimmed_and_not_expanded() {
+        assert_eq!(home_for(Some("  /srv/mm  ".into())), PathBuf::from("/srv/mm"));
+        assert_eq!(home_for(Some("~/mm".into())), PathBuf::from("~/mm"));
+    }
+
+    #[test]
+    fn empty_or_blank_mm_home_is_ignored() {
+        assert_eq!(home_for(Some("".into())), platform_home());
+        assert_eq!(home_for(Some("   ".into())), platform_home());
+    }
+
+    #[test]
+    fn unset_mm_home_is_the_platform_folder() {
+        assert_eq!(home_for(None), platform_home());
+        assert!(platform_home().ends_with("ModelMistress"));
+    }
 }

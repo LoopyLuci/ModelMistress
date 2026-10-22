@@ -27,9 +27,7 @@ pub struct HubLink {
 impl HubLink {
     /// The hub in `home` (default: MM_HOME, else the standard folder).
     pub fn new(home: Option<PathBuf>) -> Self {
-        let home = home
-            .or_else(|| std::env::var_os("MM_HOME").map(PathBuf::from))
-            .unwrap_or_else(default_home);
+        let home = home.unwrap_or_else(default_home);
         Self {
             home: Some(home),
             client: Arc::new(Mutex::new(None)),

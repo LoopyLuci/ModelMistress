@@ -74,8 +74,10 @@ the Vulkan SDK; `MM_GGML_BACKEND=cuda|hip|metal|cpu` picks another (see `src/bui
 ModelMistress uses a `llama-server` you name with `llama_server`, put in `<home>/engines/llama.cpp/`, or have on
 PATH. Downloads go to `download_dir` (default `<home>`); gated Hugging Face repos need `hf_token` or HF_TOKEN.
 
-`<home>` is `%LOCALAPPDATA%\ModelMistress` on Windows, `~/.local/share/ModelMistress` on Linux, or `--home` /
-`MM_HOME`. Settings live in `<home>/config.toml` (every field optional; `config.get` shows them all).
+`<home>` is `MM_HOME` when that is set (taken as given, trimmed; an empty value is ignored). Otherwise it is
+`%LOCALAPPDATA%\ModelMistress` on Windows, `~/Library/Application Support/ModelMistress` on macOS, or
+`$XDG_DATA_HOME/ModelMistress` (default `~/.local/share/ModelMistress`) on Linux. `--home` beats `MM_HOME` for one
+command. The desktop app and the CI pipeline follow the same rule. Settings live in `<home>/config.toml` (every field optional; `config.get` shows them all).
 
 Ollama models are on by default: the Ollama stores found on this machine, `ollama_dirs`, and `ollama/<name>` passed to
 a running Ollama. `ollama_discovery = false` in `config.toml` turns all of that off: no model with source `ollama` is
