@@ -49,6 +49,7 @@ const GROUPS: { title: string; help?: string; fields: Field[] }[] = [
     help: 'Where models are found and where downloads go. Changes apply to the next rescan.',
     fields: [
       { key: 'model_dirs', label: 'Folders of .gguf files', kind: 'lines', help: 'Searched four levels deep.' },
+      { key: 'ollama_discovery', label: 'Use Ollama models', kind: 'bool', help: 'Off: no Ollama store is scanned and ollama/<name> is refused.' },
       { key: 'ollama_dirs', label: 'Ollama model stores', kind: 'lines', help: 'The folder that holds manifests and blobs.' },
       { key: 'hf_dirs', label: 'Hugging Face caches', kind: 'lines' },
       { key: 'download_dir', label: 'Download folder', kind: 'path', nullable: true, help: 'Where downloads are saved (empty: the hub home folder).' },

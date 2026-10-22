@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **`ollama_discovery` setting** (default `true`, so nothing changes): `false` stops using Ollama models entirely.
+  No Ollama store is scanned (the detected ones, `ollama_dirs`, the download folder's `ollama` store), and
+  `ollama/<name>` is refused with an error. Also in the desktop settings form.
+
 ## 0.3.0 — 2026-10-15
 
 ModelMistress serves coding agents, and the native-model system gains experts, specialists and routing traces.

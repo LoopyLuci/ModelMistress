@@ -60,6 +60,9 @@ pub struct Settings {
     pub model_dirs: Vec<PathBuf>,
     /// Extra Ollama stores (the folder that holds `manifests` and `blobs`).
     pub ollama_dirs: Vec<PathBuf>,
+    /// Use Ollama models at all: the stores found on this machine, `ollama_dirs`, the download folder's `ollama`
+    /// store, and `ollama/<name>` passed to a running Ollama. Off: no model with source "ollama" is listed or served.
+    pub ollama_discovery: bool,
     /// Extra Hugging Face hub caches.
     pub hf_dirs: Vec<PathBuf>,
     /// A running Ollama to pass `ollama/<name>` models to ("" = never).
@@ -137,6 +140,7 @@ impl Default for Settings {
             llama_server: None,
             model_dirs: vec![],
             ollama_dirs: vec![],
+            ollama_discovery: true,
             hf_dirs: vec![],
             ollama_url: "http://127.0.0.1:11434".into(),
             max_loaded: 2,
@@ -555,13 +559,19 @@ impl Engine {
     pub fn roots(&self) -> Roots {
         let s = self.settings.read();
         let mut r = Roots::detected();
-        r.ollama.splice(0..0, s.ollama_dirs.iter().cloned());
+        if s.ollama_discovery {
+            r.ollama.splice(0..0, s.ollama_dirs.iter().cloned());
+        } else {
+            r.ollama.clear();
+        }
         r.huggingface.splice(0..0, s.hf_dirs.iter().cloned());
         r.folders.splice(0..0, s.model_dirs.iter().cloned());
         r.folders.push(self.home.join("models"));
         let downloads = s.download_dir.clone().unwrap_or_else(|| self.home.clone());
         r.huggingface.push(downloads.join("hub"));
-        r.ollama.push(downloads.join("ollama"));
+        if s.ollama_discovery {
+            r.ollama.push(downloads.join("ollama"));
+        }
         r.native.push(self.forge_data_dir());
         r
     }
@@ -868,6 +878,11 @@ impl Engine {
     pub fn resolve(&self, name: &str) -> Result<Target> {
         let name = name.trim();
         if let Some(rest) = name.strip_prefix("ollama/") {
+            if !self.settings.read().ollama_discovery {
+                return Err(Fail::unavailable(
+                    "Ollama models are turned off (ollama_discovery is false)",
+                ));
+            }
             if self.settings.read().ollama_url.is_empty() {
                 return Err(Fail::unavailable(
                     "passing models to Ollama is turned off (ollama_url is empty)",
@@ -1644,8 +1659,11 @@ impl Engine {
 
     /// Models a running Ollama has (empty when it is not running).
     pub async fn ollama_models(&self) -> Vec<Value> {
-        let base = self.settings.read().ollama_url.trim_end_matches('/').to_string();
-        if base.is_empty() {
+        let (base, on) = {
+            let s = self.settings.read();
+            (s.ollama_url.trim_end_matches('/').to_string(), s.ollama_discovery)
+        };
+        if base.is_empty() || !on {
             return vec![];
         }
         let Ok(r) = self
@@ -2257,6 +2275,43 @@ parallel = 1
         assert_eq!(id(""), "err invalid");
         assert_eq!(id("ollama/x"), "err unavailable"); // passing to Ollama is off here
         assert_eq!(safe_name("unsloth/Qwen:Q4"), "unsloth_Qwen_Q4");
+    }
+
+    #[test]
+    fn ollama_discovery_off_lists_and_passes_no_ollama_model() {
+        let d = crate::testing::TestDir::new("mm-ollama-discovery");
+        let store = d.join("store");
+        std::fs::create_dir_all(store.join("blobs")).unwrap();
+        crate::catalog::tests_support::gguf(&store.join("blobs/sha256-aa"), "llama", "L");
+        let p = store.join("manifests/registry.ollama.ai/library/llama3.2");
+        std::fs::create_dir_all(&p).unwrap();
+        let layer = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:aa"}]}"#;
+        std::fs::write(p.join("1b"), layer).unwrap();
+        let settings = |discovery: bool| Settings {
+            ollama_dirs: vec![store.to_path_buf()],
+            ollama_discovery: discovery,
+            ..Default::default()
+        };
+        std::fs::write(d.join("config.toml"), "ollama_discovery = false\n").unwrap();
+        assert!(!Settings::load(&d).unwrap().ollama_discovery);
+        assert!(Settings::default().ollama_discovery);
+        let on = Engine::new(d.to_path_buf(), settings(true));
+        let off = Engine::new(d.to_path_buf(), settings(false));
+        let ollama_ids = |e: &Engine| -> Vec<String> {
+            catalog::scan(&e.roots())
+                .into_iter()
+                .filter(|m| m.source == "ollama")
+                .map(|m| m.id)
+                .collect()
+        };
+        assert_eq!(ollama_ids(&on), ["llama3.2:1b"]);
+        assert!(ollama_ids(&off).is_empty());
+        assert!(off.roots().ollama.is_empty());
+        assert!(matches!(on.resolve("ollama/qwen3:8b"), Ok(Target::Ollama(n)) if n == "qwen3:8b"));
+        match off.resolve("ollama/qwen3:8b") {
+            Err(f) => assert_eq!((f.status, f.code), (503, "unavailable")),
+            Ok(_) => panic!("pass-through must be refused with ollama_discovery off"),
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! Only the first part of a split model (`-00001-of-0000N.gguf`) is listed; llama.cpp loads the rest.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -100,11 +101,16 @@ impl Roots {
     /// The usual places on this machine, from the environment.
     pub fn detected() -> Self {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+        Self::detected_at(home.as_deref(), std::env::var_os("OLLAMA_MODELS"))
+    }
+
+    /// `detected`, with the home folder and `OLLAMA_MODELS` given (so a test can use a fake home).
+    pub fn detected_at(home: Option<&Path>, ollama_models: Option<OsString>) -> Self {
         let mut r = Roots::default();
-        if let Some(p) = std::env::var_os("OLLAMA_MODELS") {
+        if let Some(p) = ollama_models {
             r.ollama.push(PathBuf::from(p));
         }
-        if let Some(h) = &home {
+        if let Some(h) = home {
             r.ollama.push(h.join(".ollama").join("models"));
         }
         if cfg!(target_os = "linux") {
@@ -117,7 +123,7 @@ impl Roots {
         if let Some(p) = std::env::var_os("HF_HOME") {
             r.huggingface.push(PathBuf::from(p).join("hub"));
         }
-        if let Some(h) = &home {
+        if let Some(h) = home {
             r.huggingface.push(h.join(".cache").join("huggingface").join("hub"));
             r.folders.push(h.join(".cache").join("lm-studio").join("models"));
         }
@@ -578,6 +584,23 @@ mod tests {
         assert!(!m.contains_key("tokenizer.ggml.model"));
         std::fs::write(d.join("bad.gguf"), b"nope").unwrap();
         assert!(read_meta(&d.join("bad.gguf")).is_err());
+    }
+
+    #[test]
+    fn detected_ollama_store_is_under_the_home_folder() {
+        let d = tmp("detected");
+        let home = d.join("home");
+        let store = home.join(".ollama/models");
+        std::fs::create_dir_all(store.join("blobs")).unwrap();
+        gguf(&store.join("blobs/sha256-aa"), "llama", "L");
+        let p = store.join("manifests/registry.ollama.ai/library/llama3.2");
+        std::fs::create_dir_all(&p).unwrap();
+        let layer = r#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:aa"}]}"#;
+        std::fs::write(p.join("1b"), layer).unwrap();
+        let found = scan(&Roots::detected_at(Some(&home), None));
+        assert!(found.iter().any(|e| e.source == "ollama" && e.id == "llama3.2:1b"));
+        let none = scan(&Roots::detected_at(Some(&d.join("nobody")), None));
+        assert!(none.iter().all(|e| e.source != "ollama"));
     }
 
     #[test]
