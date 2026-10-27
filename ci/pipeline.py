@@ -260,6 +260,16 @@ def pids_alive(pids: list[int]) -> list[int]:
     return alive
 
 
+NOT_CHAT_ARCH = {"clip", "sd", "sd3", "flux", "whisper", "wavtokenizer-dec"}
+NOT_CHAT_NAME = re.compile(r"embed|rerank", re.IGNORECASE)
+
+
+def chat_model(m: dict) -> bool:
+    """A model a chat can talk to: the dashboard's rule (no speech, vision, image or embedding/reranking models)."""
+    return (m.get("source") not in ("whisper", "vision") and not m.get("kind") and not m.get("vision")
+            and m.get("architecture") not in NOT_CHAT_ARCH and not NOT_CHAT_NAME.search(str(m.get("id", ""))))
+
+
 def smoke() -> tuple[bool, str]:
     exe = target_dir() / "release" / f"model-mistress{EXE}"
     home = Path(tempfile.mkdtemp(prefix="mm-smoke-"))
@@ -303,7 +313,7 @@ def smoke() -> tuple[bool, str]:
         checks.append(("a malformed input is a 400", call("model.load", {"model": 5})[0] == 400))
         status, st = call("service.status")
         live = st.get("result", {}).get("llama_server")
-        small = sorted((m for m in models.get("result", []) if m.get("size_gb", 99) <= 2.0 and not m.get("vision")),
+        small = sorted((m for m in models.get("result", []) if m.get("size_gb", 99) <= 2.0 and chat_model(m)),
                        key=lambda m: m["size_gb"])
         if live and small:
             model = small[0]["id"]
