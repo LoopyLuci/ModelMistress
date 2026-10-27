@@ -1643,6 +1643,36 @@ impl Drop for Tracker {
     }
 }
 
+/// llama-server's own error answers under the hub's stable codes, in the hub's `{"error": {code, message, type}}`
+/// shape. A prompt over the context window is `context_exceeded` (400, with both token counts). A server that is still
+/// loading is `loading`, and one with no free slot is `busy` (503, with a retry-after in seconds). Any other answer is
+/// `None` and passes through unchanged.
+fn upstream_error(status: StatusCode, body: &Value) -> Option<(StatusCode, Value, Option<u64>)> {
+    let message = body["error"]["message"].as_str()?.to_string();
+    let ty = body["error"]["type"].as_str()?;
+    if status == StatusCode::BAD_REQUEST && ty == "exceed_context_size_error" {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            json!({"error": {"code": "context_exceeded", "type": "context_exceeded", "message": message,
+                             "n_prompt_tokens": &body["n_prompt_tokens"], "n_ctx": &body["n_ctx"]}}),
+            None,
+        ));
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE && ty == "unavailable_error" {
+        let (code, wait) = if message.to_ascii_lowercase().contains("loading") {
+            ("loading", 2)
+        } else {
+            ("busy", 1)
+        };
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"code": code, "type": code, "message": message, "retry_after_s": wait}}),
+            Some(wait),
+        ));
+    }
+    None
+}
+
 async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> ApiResult<Response> {
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let asked = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1657,7 +1687,7 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
             return Err(f.into());
         }
     };
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = resp.headers().get("content-type").cloned();
     let mut tracker = Tracker {
         _lease: lease,
@@ -1667,6 +1697,7 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
         tail: String::new(),
         events: 0,
     };
+    let mut retry: Option<u64> = None;
     let mut out = if streaming && status.is_success() {
         hub.engine.record(&model, true, t0.elapsed().as_millis() as u64, None);
         // the tracker lives as long as the stream: the model stays up, and the peer's request stays counted as
@@ -1680,9 +1711,8 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
         })))
     } else {
         let bytes = resp.bytes().await.map_err(|x| Fail::unavailable(x.to_string()))?;
-        let usage = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("usage").cloned());
+        let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+        let usage = parsed.as_ref().and_then(|v| v.get("usage").cloned());
         hub.engine.record(
             &model,
             status.is_success(),
@@ -1690,11 +1720,22 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
             usage.as_ref(),
         );
         tracker.observe(&bytes);
-        Response::new(Body::from(bytes))
+        match parsed.as_ref().and_then(|v| upstream_error(status, v)) {
+            Some((mapped, body, wait)) => {
+                status = mapped;
+                retry = wait;
+                Response::new(Body::from(body.to_string()))
+            }
+            None => Response::new(Body::from(bytes)),
+        }
     };
     *out.status_mut() = status;
     if let Some(c) = ctype {
         out.headers_mut().insert("content-type", c);
+    }
+    if let Some(wait) = retry {
+        out.headers_mut()
+            .insert("retry-after", wait.to_string().parse().unwrap());
     }
     Ok(out)
 }
@@ -2092,6 +2133,40 @@ unrelated line
         assert_eq!(b[1]["what"], "CPU_Mapped model");
         assert_eq!(b[2]["what"], "Vulkan0 KV");
         assert!(log_buffers(std::path::Path::new("no/such.log")).is_empty());
+    }
+
+    #[test]
+    fn llama_server_errors_get_the_hubs_codes() {
+        let overflow = json!({"error": {"code": 400, "type": "exceed_context_size_error",
+            "message": "request (9000 tokens) exceeds the available context size (4096 tokens), try increasing it"},
+            "n_prompt_tokens": 9000, "n_ctx": 4096});
+        let (s, body, wait) = upstream_error(StatusCode::BAD_REQUEST, &overflow).unwrap();
+        assert_eq!(
+            (s, body["error"]["code"].as_str(), wait),
+            (StatusCode::BAD_REQUEST, Some("context_exceeded"), None)
+        );
+        assert_eq!(
+            (
+                body["error"]["n_prompt_tokens"].as_u64(),
+                body["error"]["n_ctx"].as_u64()
+            ),
+            (Some(9000), Some(4096))
+        );
+
+        let busy = json!({"error": {"code": 503, "type": "unavailable_error", "message": "no slot available"}});
+        let (s, body, wait) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &busy).unwrap();
+        assert_eq!(
+            (s, body["error"]["code"].as_str(), wait),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("busy"), Some(1))
+        );
+
+        let loading = json!({"error": {"code": 503, "type": "unavailable_error", "message": "Loading model"}});
+        let (_, body, wait) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &loading).unwrap();
+        assert_eq!((body["error"]["code"].as_str(), wait), (Some("loading"), Some(2)));
+
+        // any other error keeps its own body: a bad request is not a context overflow
+        let bad = json!({"error": {"code": 400, "type": "invalid_request_error", "message": "bad"}});
+        assert!(upstream_error(StatusCode::BAD_REQUEST, &bad).is_none());
     }
     use tower::ServiceExt;
 

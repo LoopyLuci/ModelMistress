@@ -104,7 +104,8 @@ def target_dir_problem(target: str, windows: bool = os.name == "nt") -> str:
     if not windows or deepest_build_path(target) <= SD_MAX_DEEPEST_PATH:
         return ""
     return (f"CARGO_TARGET_DIR is too long ({deepest_build_path(target)} characters for the deepest build file, "
-            f"{SD_MAX_DEEPEST_PATH} at most; rc.exe fails with RC2136): set a shorter one, for example C:\\t")
+            f"{SD_MAX_DEEPEST_PATH} at most; rc.exe fails with RC2136): set a shorter one, a short folder near a "
+            "drive's root (for example <drive>:\\t)")
 
 
 def preflight() -> tuple[bool, str]:
@@ -177,11 +178,16 @@ def dashboard() -> tuple[bool, str]:
     return True, ""
 
 
+def gui_python() -> str:
+    # The interpreter the GUI stage tests with: MM_GUI_PYTHON when set (a venv that holds the pinned gui requirements).
+    return os.environ.get("MM_GUI_PYTHON") or sys.executable
+
+
 def gui() -> tuple[bool, str]:
     text = "".join((ROOT / "gui" / name).read_text(encoding="utf-8") for name in ("requirements.txt", "requirements-dev.txt"))
     pins = dict(re.findall(r"^([A-Za-z0-9_.-]+)==(\S+)", text, re.MULTILINE))
     probe = "import importlib.metadata as m, json, sys; print(json.dumps({n: m.version(n) for n in sys.argv[1:]}))"
-    code, out = run([sys.executable, "-c", probe, *pins], 120)
+    code, out = run([gui_python(), "-c", probe, *pins], 120)
     try:
         installed = json.loads(out.strip().splitlines()[-1]) if code == 0 else {}
     except (ValueError, IndexError):
@@ -189,8 +195,8 @@ def gui() -> tuple[bool, str]:
     wrong = [f"{n} {installed.get(n, 'missing')} (pinned {v})" for n, v in pins.items() if installed.get(n) != v]
     if wrong:
         return False, "the GUI's packages differ from gui/requirements*.txt: " + ", ".join(wrong) + \
-            "\npip install -r gui/requirements-dev.txt"
-    code, out = run([sys.executable, "-m", "pytest", "gui/tests", "-q", "-p", "no:cacheprovider"], 900,
+            f"\npip install -r gui/requirements-dev.txt   (into {gui_python()}; MM_GUI_PYTHON picks another)"
+    code, out = run([gui_python(), "-m", "pytest", "gui/tests", "-q", "-p", "no:cacheprovider"], 900,
                     env={"QT_QPA_PLATFORM": "offscreen"})
     if code != 0:
         return False, "\n".join(out.splitlines()[-30:])
