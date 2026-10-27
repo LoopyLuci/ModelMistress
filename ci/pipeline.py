@@ -2,7 +2,7 @@
 """ModelMistress's local CI/CD pipeline: everything a change must pass before it is pushed, on this machine.
 
     python ci/pipeline.py              every stage
-    python ci/pipeline.py --fast       preflight, static, tests
+    python ci/pipeline.py --fast       preflight, static, dashboard, gui, tests
     python ci/pipeline.py --only smoke
     python ci/pipeline.py --install-hook   run it on every `git push` (skip once: MM_SKIP_PIPELINE=1)
 
@@ -10,6 +10,10 @@ Stages:
   preflight  cargo is new enough, disk space, the git state
   static     rustfmt on the core's files; clippy -D warnings on the core and CLI (the legacy modules' lints are
              allowed in src/lib.rs); no secret-shaped strings or files over 5 MB in the push
+  dashboard  the web dashboard (frontend/): npm ci from the lock file, vue-tsc type-check, Vitest, vite build into
+             frontend/dist, which the hub embeds in its next build
+  gui        the Python desktop GUI (gui/): its pytest suite under the offscreen Qt platform (needs PySide6 and
+             pytest: pip install -r gui/requirements-dev.txt)
   tests      cargo test on the core and CLI
   build      the release binary, with llama.cpp built in when engines/llama.cpp is checked out and cmake is here
   smoke      a real hub in a throwaway home: health, a refused caller without the token, 13+ operations, the
@@ -39,7 +43,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 LOGS, REPORTS = ROOT / "ci" / "logs", ROOT / "ci" / "reports"
 LOCK = ROOT / "ci" / ".pipeline.lock"
-STAGES = ["preflight", "static", "tests", "build", "smoke"]
+FRONTEND = ROOT / "frontend"
+STAGES = ["preflight", "static", "dashboard", "gui", "tests", "build", "smoke"]
+FAST_STAGES = ["preflight", "static", "dashboard", "gui", "tests"]
 FMT_CLEAN = ["src/catalog.rs", "src/engine.rs", "src/hub.rs", "src/client.rs", "src/lib.rs", "src/pull.rs", "src/build.rs",
              "src/bin/model-mistress/main.rs"]                    # grow this as legacy modules are rebuilt
 SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_|AKIA[0-9A-Z]{16}|"
@@ -64,8 +70,8 @@ def kill_tree(pid: int) -> None:
             pass
 
 
-def run(cmd: list[str], timeout: float = 1800, env: dict | None = None) -> tuple[int, str]:
-    p = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+def run(cmd: list[str], timeout: float = 1800, env: dict | None = None, cwd: Path = ROOT) -> tuple[int, str]:
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                          errors="replace", env={**os.environ, **(env or {})}, creationflags=NO_WINDOW,
                          start_new_session=os.name != "nt")
     try:
@@ -154,6 +160,41 @@ def static() -> tuple[bool, str]:
             pass
     if bad:
         return False, "the push would add:\n" + "\n".join(bad)
+    return True, ""
+
+
+def dashboard() -> tuple[bool, str]:
+    npm = shutil.which("npm")
+    if not npm:
+        return False, "npm is not installed (https://nodejs.org)"
+    for args in (["ci"], ["run", "typecheck"], ["run", "test"], ["run", "build"]):
+        code, out = run([npm, *args], 900, cwd=FRONTEND)
+        if code != 0:
+            return False, f"npm {' '.join(args)} failed:\n" + "\n".join(out.splitlines()[-25:])
+    if not (FRONTEND / "dist" / "index.html").is_file():
+        return False, "frontend/dist/index.html was not built"
+    say("  ->     type-check, unit tests and build clean; frontend/dist is current")
+    return True, ""
+
+
+def gui() -> tuple[bool, str]:
+    text = "".join((ROOT / "gui" / name).read_text(encoding="utf-8") for name in ("requirements.txt", "requirements-dev.txt"))
+    pins = dict(re.findall(r"^([A-Za-z0-9_.-]+)==(\S+)", text, re.MULTILINE))
+    probe = "import importlib.metadata as m, json, sys; print(json.dumps({n: m.version(n) for n in sys.argv[1:]}))"
+    code, out = run([sys.executable, "-c", probe, *pins], 120)
+    try:
+        installed = json.loads(out.strip().splitlines()[-1]) if code == 0 else {}
+    except (ValueError, IndexError):
+        installed = {}
+    wrong = [f"{n} {installed.get(n, 'missing')} (pinned {v})" for n, v in pins.items() if installed.get(n) != v]
+    if wrong:
+        return False, "the GUI's packages differ from gui/requirements*.txt: " + ", ".join(wrong) + \
+            "\npip install -r gui/requirements-dev.txt"
+    code, out = run([sys.executable, "-m", "pytest", "gui/tests", "-q", "-p", "no:cacheprovider"], 900,
+                    env={"QT_QPA_PLATFORM": "offscreen"})
+    if code != 0:
+        return False, "\n".join(out.splitlines()[-30:])
+    say(f"  ->     {(out.strip().splitlines() or [''])[-1]}")
     return True, ""
 
 
@@ -312,7 +353,8 @@ def smoke() -> tuple[bool, str]:
             time.sleep(0.5)
 
 
-FUNCS = {"preflight": preflight, "static": static, "tests": tests, "build": build, "smoke": smoke}
+FUNCS = {"preflight": preflight, "static": static, "dashboard": dashboard, "gui": gui, "tests": tests, "build": build,
+         "smoke": smoke}
 
 
 def install_hook() -> int:
@@ -348,7 +390,7 @@ def main() -> int:
             print(f"another pipeline run (pid {pid}) is going; wait for it", file=sys.stderr)
             return 1
     LOCK.write_text(str(os.getpid()))
-    stages = a.only or (STAGES[:3] if a.fast else STAGES)
+    stages = a.only or (FAST_STAGES if a.fast else STAGES)
     results, t0 = [], time.time()
     try:
         for name in STAGES:

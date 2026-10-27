@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A Python desktop window** (`gui/`, PySide6 6.12.0): Status, Models, Chat and Settings. It is a client of the hub's
+  HTTP API (standard library only on the Python side), so the hub keeps no Python dependency. Run `python -m mm_gui`
+  from `gui/`; see [gui/README.md](gui/README.md).
+- **Dashboard gates**: `npm run check` in `frontend/` runs a vue-tsc type-check, Vitest unit tests (26) and the build.
+  `ci/pipeline.py` has a `dashboard` stage (the same checks, from the lock file) and a `gui` stage (the window's
+  tests, with the pinned PySide6 and pytest). `src/build.rs` rebuilds the hub when `frontend/dist` changes.
 - **`MM_HOME` is the home folder everywhere**: `default_home()` (used by every client that finds the hub without a
   folder), the desktop app and the CI pipeline now use `MM_HOME` when it is set (blank values are ignored), else the
   platform folder as before. `--home` still wins for one command. The CLI already read `MM_HOME`; it now goes

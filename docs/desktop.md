@@ -44,14 +44,26 @@ Other commands: `execute_command` (slash commands), `hub_models`, `hub_chat_stre
 ## Build
 
 ```
-cd frontend && npm ci && npm run build
+cd frontend && npm ci && npm run check
 cargo build --release -p model-mistress --features bundled-engine
 copy target\release\model-mistress.exe desktop-app\binaries\model-mistress-x86_64-pc-windows-msvc.exe
 cd desktop-app && cargo tauri build --bundles nsis,msi
 ```
 The installers appear under `target/release/bundle/`. NSIS and WiX are fetched by `cargo tauri` on first use.
 
+`npm run check` is the dashboard's gate: a vue-tsc type-check, the Vitest unit tests, then the build into
+`frontend/dist`, which the hub embeds when it is built (`src/trace/ui.rs`). `src/build.rs` rebuilds the hub when
+`frontend/dist` changes and warns when it is missing. `python ci/pipeline.py` runs the same checks as its `dashboard`
+stage.
+
 ## Tests
 
 `cargo test -p model-mistress-desktop`: the lifecycle decisions (`hub_proc`) and the app's `api`, `commands` and
 `config` modules, which start a hub in the test process on a free port with a stand-in for `llama-server`.
+
+`npm run check` in `frontend/` covers the dashboard (type-check, then unit tests, then the build).
+
+## The Python window
+
+`gui/` is a desktop window written entirely in Python (PySide6). It is a client of the hub, like the desktop app but
+without Node or Rust: it reads the hub's control file and calls the same HTTP API. See [gui/README.md](../gui/README.md).

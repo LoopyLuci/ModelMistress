@@ -91,6 +91,9 @@ GPUs, `-DGGML_CUDA=ON` for NVIDIA).
 On Windows, `ModelMistress_<version>_x64-setup.exe` installs the app and the hub together. The app uses a hub that
 already runs, else starts the one it ships with (and stops it again on quit). See [docs/desktop.md](docs/desktop.md).
 
+There is also a desktop window written entirely in Python (PySide6) in [gui/](gui/). It talks to a running hub through
+the hub's control file and the same HTTP API the dashboard uses.
+
 ## API
 
 Everything but `/v1/health` needs `Authorization: Bearer <token>`.

@@ -115,13 +115,13 @@
               <legend>Input messages</legend>
               <div v-for="(m, i) in draft.input" :key="i" class="msg">
                 <div class="row">
-                  <select v-model="m.role" :aria-label="`role of message ${i + 1}`">
+                  <select v-model="m.role" :aria-label="`role of message ${Number(i) + 1}`">
                     <option v-for="r in ['system', 'user', 'assistant', 'tool']" :key="r" :value="r">{{ r }}</option>
                   </select>
                   <span class="grow"></span>
-                  <button type="button" class="btn" :aria-label="`remove message ${i + 1}`" @click="draft.input.splice(i, 1)">Remove</button>
+                  <button type="button" class="btn" :aria-label="`remove message ${Number(i) + 1}`" @click="draft.input.splice(i, 1)">Remove</button>
                 </div>
-                <textarea v-model="m.content" rows="3" :aria-label="`content of message ${i + 1}`"></textarea>
+                <textarea v-model="m.content" rows="3" :aria-label="`content of message ${Number(i) + 1}`"></textarea>
               </div>
               <button type="button" class="btn" @click="draft.input.push({ role: 'user', content: '' })">Add message</button>
             </fieldset>
@@ -145,7 +145,7 @@
             <div v-if="draft.media?.length" class="media">
               <strong class="small muted">Media</strong>
               <div v-for="(md, i) in draft.media" :key="i" class="medium">
-                <img v-if="mediaUrl(md) && md.kind === 'image'" :src="mediaUrl(md)" :alt="`media ${i + 1}`" />
+                <img v-if="mediaUrl(md) && md.kind === 'image'" :src="mediaUrl(md)" :alt="`media ${Number(i) + 1}`" />
                 <audio v-else-if="mediaUrl(md) && md.kind === 'audio'" :src="mediaUrl(md)" controls></audio>
                 <div v-else class="ph" role="img" :aria-label="`${md.kind} file`">{{ md.kind }}</div>
                 <div class="mono small muted">{{ md.path }}<br />{{ (md.sha256 || '').slice(0, 16) }}</div>

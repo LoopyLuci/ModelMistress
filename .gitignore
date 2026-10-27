@@ -9,3 +9,6 @@ dist/
 !.env.example
 ci/logs/
 ci/.pipeline.lock
+__pycache__/
+.pytest_cache/
+.venv/

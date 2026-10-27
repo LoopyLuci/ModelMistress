@@ -14,6 +14,12 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // The dashboard is embedded from frontend/dist (trace/ui.rs): rebuild when it changes, and say when it is missing.
+    let dist = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../frontend/dist");
+    println!("cargo:rerun-if-changed={}", dist.display());
+    if !dist.join("index.html").is_file() {
+        println!("cargo:warning=frontend/dist is missing: /ui will say the dashboard is not built (npm ci && npm run build)");
+    }
     if std::env::var_os("CARGO_FEATURE_BUNDLED_ENGINE").is_none() {
         return;
     }
