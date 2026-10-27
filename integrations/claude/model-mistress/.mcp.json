@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "model-mistress": {
+      "command": "model-mistress",
+      "args": ["mcp", "--start"]
+    }
+  }
+}

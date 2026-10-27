@@ -1,0 +1,12 @@
+{
+  "name": "model-mistress",
+  "version": "0.3.0",
+  "description": "Local models for Claude Code: list, load, unload and chat with the models that ModelMistress serves on this machine. Works in any project.",
+  "author": {
+    "name": "LoopyLuci"
+  },
+  "homepage": "https://github.com/LoopyLuci/ModelMistress",
+  "repository": "https://github.com/LoopyLuci/ModelMistress",
+  "license": "Apache-2.0",
+  "keywords": ["local-models", "gguf", "llama-cpp", "mcp", "offline"]
+}

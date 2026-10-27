@@ -1,0 +1,17 @@
+{
+  "name": "model-mistress",
+  "owner": {
+    "name": "LoopyLuci"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for ModelMistress, the local model server."
+  },
+  "plugins": [
+    {
+      "name": "model-mistress",
+      "source": "./integrations/claude/model-mistress",
+      "description": "Local models for Claude Code: list, load, unload and chat with the models ModelMistress serves on this machine.",
+      "version": "0.3.0"
+    }
+  ]
+}

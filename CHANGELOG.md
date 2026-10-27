@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Agents and Claude**: `model-mistress mcp --start` starts a hub in the background when none answers (it keeps
+  running after the session), and `mcp --peer` serves only `models_list` and `chat_complete`, with a peer key from
+  `MODELMISTRESS_KEY`. The MCP server now tells the client what its tools are for. A Claude Code plugin is in
+  `integrations/claude/model-mistress` (slash commands, a skill, the MCP server), listed by `.claude-plugin/marketplace.json`.
+  See [docs/claude.md](docs/claude.md), [docs/agents.md](docs/agents.md) and [docs/integrations.md](docs/integrations.md).
+- **Finding the hub**: `MODELMISTRESS_URL` with `MODELMISTRESS_TOKEN` names a hub without a control file. Errors name
+  the URL, the file and the variable that would fix them. Hub errors reach MCP and CLI callers as `code: message`.
+- **Fix**: a hub started from `mcp --start` no longer keeps the MCP client's stdio pipes open (Windows passed them on).
 - **A Python desktop window** (`gui/`, PySide6 6.12.0): Status, Models, Chat and Settings. It is a client of the hub's
   HTTP API (standard library only on the Python side), so the hub keeps no Python dependency. Run `python -m mm_gui`
   from `gui/`; see [gui/README.md](gui/README.md).

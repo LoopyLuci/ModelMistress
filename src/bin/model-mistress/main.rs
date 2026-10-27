@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use model_mistress::client::{default_home, serve_mcp, Client};
+use model_mistress::client::{default_home, serve_mcp, serve_mcp_io, Client, McpAccess};
 use model_mistress::engine::{Engine, Settings};
 use model_mistress::hosting::Keys;
 use model_mistress::hub::{self, new_token, Hub, ServeOpts};
@@ -238,8 +238,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ForgeCmd,
     },
-    /// Serve the operations as MCP tools over stdio (the hub must be running).
-    Mcp,
+    /// Serve the operations as MCP tools over stdio. The hub must be running, or pass `--start` to start one in the
+    /// background; it keeps running after this exits (`stop` ends it).
+    Mcp {
+        /// Start a hub for this home when none answers.
+        #[arg(long)]
+        start: bool,
+        /// Serve only the model routes, with a peer key from MODELMISTRESS_KEY: `models_list` and `chat_complete`.
+        #[arg(long)]
+        peer: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -958,9 +966,94 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 ForgeCmd::Unload { model } => show(&c.call("forge.unload", json!({"model": model})).await?),
             }
         }
-        Cmd::Mcp => serve_mcp(client().await?).await?,
+        Cmd::Mcp { start, peer } => {
+            let hub = match client().await {
+                Ok(hub) => hub,
+                Err(_) if start => {
+                    start_background_hub(&home).await?;
+                    client().await?
+                }
+                Err(e) => return Err(e),
+            };
+            if peer {
+                let key = std::env::var("MODELMISTRESS_KEY").map_err(|_| {
+                    anyhow::anyhow!(
+                        "--peer needs a peer key in MODELMISTRESS_KEY (`model-mistress keys create <name>`)"
+                    )
+                })?;
+                let scoped = Client::new(&hub.url, key.trim());
+                serve_mcp_io(McpAccess::Peer(&scoped), std::io::stdin().lock(), std::io::stdout()).await?
+            } else {
+                serve_mcp(hub).await?
+            }
+        }
     }
     Ok(())
+}
+
+/// Windows hands every inheritable handle to a child process. A hub started from here would keep this process's stdio
+/// pipes open, and whoever reads them (an MCP client, for one) would wait for the hub to exit. So the standard handles
+/// stop being inheritable first; the parent keeps using them.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+
+    extern "system" {
+        fn GetStdHandle(std_handle: u32) -> *mut c_void;
+        fn SetHandleInformation(object: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+    pub fn stop_inheriting_stdio() {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle takes a standard-handle selector and returns this process's handle table entry;
+            // SetHandleInformation only clears the inherit flag of that entry.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle as isize != -1 {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
+/// Start `model-mistress serve` for this home in the background, detached from this process (it keeps running when
+/// the caller exits), and wait until it answers. Its output goes to `<home>/hub.log`.
+async fn start_background_hub(home: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    std::fs::create_dir_all(home)?;
+    let log = std::fs::File::create(home.join("hub.log")).context("creating hub.log")?;
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("--home")
+        .arg(home)
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        win::stop_inheriting_stdio();
+    }
+    cmd.spawn().context("starting the hub in the background")?;
+    for _ in 0..600 {
+        if Client::find(Some(home.to_path_buf())).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "the hub started in the background did not answer within 60 seconds (see {})",
+        home.join("hub.log").display()
+    )
 }
 
 #[cfg(test)]

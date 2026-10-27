@@ -94,6 +94,14 @@ already runs, else starts the one it ships with (and stops it again on quit). Se
 There is also a desktop window written entirely in Python (PySide6) in [gui/](gui/). It talks to a running hub through
 the hub's control file and the same HTTP API the dashboard uses.
 
+## Claude, and ABP
+
+Claude Code can use the models through a plugin that adds an MCP server and slash commands; install it from this
+repository's marketplace (`/plugin marketplace add LoopyLuci/ModelMistress`). See [docs/claude.md](docs/claude.md), and
+[docs/agents.md](docs/agents.md) for what agents can and cannot do yet.
+ModelMistress runs on its own with nothing else installed, and ABP runs it through the module contract in
+`abp-module.toml`; see [docs/integrations.md](docs/integrations.md).
+
 ## API
 
 Everything but `/v1/health` needs `Authorization: Bearer <token>`.
