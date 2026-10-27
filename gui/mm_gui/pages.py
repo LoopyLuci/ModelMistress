@@ -12,11 +12,13 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QStyleFactory,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from mm_gui.hub import Hub
 from mm_gui.models import fmt_mb, fmt_uptime, is_chat_model, model_label
+from mm_gui.prefs import TEXT_SIZES, THEMES, Appearance
 from mm_gui.tasks import run_task
 
 _TRUE = {"true", "yes", "on", "1"}
@@ -50,6 +53,9 @@ class Page(QWidget):
 
     def refresh(self) -> None:
         """Read what the page shows from the hub. Each page says how."""
+
+    def shown(self) -> None:
+        """Called when the window opens this page; a page whose numbers go stale refreshes here."""
 
     def ask(self, what: str, fn: Callable[[Hub], Any], on_done: Callable[[Any], None]) -> None:
         """Run `fn(hub)` on a worker thread; `what` names the call in the status line while it runs."""
@@ -80,27 +86,39 @@ class StatusPage(Page):
         ("memory", "Memory"),
     ]
 
+    GROUPS = [
+        ("Hub", ["version", "pid", "uptime", "home", "engine"]),
+        ("Models and memory", ["models", "loaded", "memory"]),
+    ]
+
     def __init__(self):
         super().__init__("Status")
-        form = QFormLayout()
+        labels = dict(self.FIELDS)
         self.values: dict[str, QLabel] = {}
-        for key, label in self.FIELDS:
-            value = QLabel("-")
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            value.setWordWrap(True)
-            value.setAccessibleName(label)
-            form.addRow(label, value)
-            self.values[key] = value
+        layout = QVBoxLayout(self)
+        for title, keys in self.GROUPS:
+            group = QGroupBox(title)
+            form = QFormLayout(group)
+            for key in keys:
+                value = QLabel("-")
+                value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                value.setWordWrap(True)
+                value.setAccessibleName(labels[key])
+                form.addRow(labels[key], value)
+                self.values[key] = value
+            layout.addWidget(group)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
         layout.addWidget(refresh, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.status)
         layout.addStretch(1)
 
     def refresh(self) -> None:
         self.ask("Reading the hub status", lambda hub: hub.status(), self._show)
+
+    def shown(self) -> None:
+        if self.hub is not None:
+            self.refresh()
 
     def _show(self, st: dict) -> None:
         system = st.get("system") or {}
@@ -228,7 +246,7 @@ class ChatPage(Page):
         self.transcript.setOpenExternalLinks(True)
         self.transcript.setAccessibleName("Conversation")
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Message")
+        self.input.setPlaceholderText("Message (Ctrl+Enter sends)")
         self.input.setAccessibleName("Message")
         self.input.setMaximumHeight(110)
         self.send_button = QPushButton("Send")
@@ -239,6 +257,8 @@ class ChatPage(Page):
         new_chat = QPushButton("New chat")
         new_chat.clicked.connect(self.new_chat)
         QShortcut(QKeySequence("Escape"), self).activated.connect(self.stop)
+        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(sequence), self.input).activated.connect(self.send)
 
         self.messages: list[dict] = []  # {"role": ..., "content": ...}, the last one is the reply being written
         self._cancel: threading.Event | None = None
@@ -397,8 +417,37 @@ def _from_text(text: str, original: Any) -> Any:
 
 
 class SettingsPage(Page):
-    def __init__(self):
+    def __init__(self, appearance: Appearance):
         super().__init__("Settings")
+        self.appearance = appearance
+        self._looks: dict[str, QComboBox] = {}
+        look = QGroupBox("Appearance")
+        look_form = QFormLayout(look)
+        styles = ["Fusion", *(name for name in QStyleFactory.keys() if name != "Fusion")]
+        choices = {
+            "theme": ("Theme", list(THEMES.items())),
+            "style": ("Style", [(name, name) for name in styles]),
+            "text_size": ("Text size", [(key, label) for key, (label, _) in TEXT_SIZES.items()]),
+        }
+        for key, (label, options) in choices.items():
+            box = QComboBox()
+            box.setAccessibleName(label)
+            for value, text in options:
+                box.addItem(text, value)
+            if key == "style":
+                box.setToolTip("Fusion follows the theme on every platform. The Windows styles keep their own look.")
+            box.setCurrentIndex(max(0, box.findData(appearance.prefs.get(key))))
+            box.currentIndexChanged.connect(lambda _index, key=key, box=box: self._look_changed(key, box))
+            look_form.addRow(label, box)
+            self._looks[key] = box
+        note = QLabel("Kept on this computer and applied at once; the hub is not changed.")
+        note.setWordWrap(True)
+        look_form.addRow(note)
+
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter hub settings")
+        self.filter.setAccessibleName("Filter hub settings")
+        self.filter.textChanged.connect(self._filter_rows)
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Setting", "Value"])
         self.table.verticalHeader().setVisible(False)
@@ -414,12 +463,18 @@ class SettingsPage(Page):
         buttons.addWidget(save)
         buttons.addStretch(1)
         layout = QVBoxLayout(self)
+        layout.addWidget(look)
+        layout.addWidget(self.filter)
         layout.addWidget(self.table, 1)
         layout.addLayout(buttons)
         layout.addWidget(self.status)
 
     def refresh(self) -> None:
         self.ask("Reading the settings", lambda hub: hub.config(), self._show)
+
+    def _look_changed(self, key: str, box: QComboBox) -> None:
+        self.appearance.set(key, box.currentData())
+        self.status.setText("Appearance saved.")
 
     def _show(self, cfg: dict) -> None:
         cfg = dict(cfg)
@@ -436,8 +491,15 @@ class SettingsPage(Page):
                 value.setFlags(value.flags() & ~Qt.ItemFlag.ItemIsEditable)  # a secret is not shown or edited here
             self.table.setItem(row, 0, name)
             self.table.setItem(row, 1, value)
+        self.table.resizeColumnToContents(0)
+        self._filter_rows()
         if warnings:
             self.status.setText("Settings warnings: " + "; ".join(str(w) for w in warnings))
+
+    def _filter_rows(self) -> None:
+        text = self.filter.text().strip().lower()
+        for row in range(self.table.rowCount()):
+            self.table.setRowHidden(row, text not in self.table.item(row, 0).text().lower())
 
     def _save(self) -> None:
         changes: dict[str, Any] = {}

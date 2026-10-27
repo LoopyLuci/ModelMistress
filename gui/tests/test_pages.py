@@ -8,11 +8,13 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mm_gui.app import Window  # noqa: E402
 from mm_gui.hub import Hub, HubError  # noqa: E402
 from mm_gui.pages import ChatPage, ModelsPage, SettingsPage, StatusPage  # noqa: E402
+from mm_gui.prefs import Appearance, Preferences  # noqa: E402
 
 
 class FakeHub(Hub):
@@ -48,6 +50,17 @@ class FakeHub(Hub):
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def appearance(app, tmp_path):
+    """The window's look, kept in a temporary file; put back to the platform's look afterwards."""
+    store = QSettings(str(tmp_path / "look.ini"), QSettings.Format.IniFormat)
+    look = Appearance(app, Preferences(store))
+    yield look
+    look.set("text_size", "normal")
+    look.set("theme", "system")
+    look.set("style", "Fusion")
 
 
 def wait_for(app: QApplication, ready, timeout: float = 5.0) -> None:
@@ -123,10 +136,10 @@ def test_chat_shows_a_model_s_markup_as_text(app):
     assert "<img" in page.transcript.toPlainText()
 
 
-def test_settings_save_sends_only_what_changed(app):
+def test_settings_save_sends_only_what_changed(app, appearance):
     hub = FakeHub({"config.get": {"max_loaded": 2, "allow_network": False, "download_dir": "E:/x",
                                   "hf_token": "(set)", "ports": [1, 2]}})
-    page = SettingsPage()
+    page = SettingsPage(appearance)
     page.attach(hub)
     wait_for(app, lambda: page.table.rowCount() == 5)
 
@@ -138,9 +151,9 @@ def test_settings_save_sends_only_what_changed(app):
     assert ("config.set", {"settings": {"max_loaded": 3, "allow_network": True}}) in hub.calls
 
 
-def test_settings_refuse_a_value_of_the_wrong_type(app):
+def test_settings_refuse_a_value_of_the_wrong_type(app, appearance):
     hub = FakeHub({"config.get": {"max_loaded": 2}})
-    page = SettingsPage()
+    page = SettingsPage(appearance)
     page.attach(hub)
     wait_for(app, lambda: page.table.rowCount() == 1)
 
@@ -151,19 +164,19 @@ def test_settings_refuse_a_value_of_the_wrong_type(app):
     assert not any(op == "config.set" for op, *_ in hub.calls)
 
 
-def test_window_reports_a_missing_hub(app, tmp_path):
+def test_window_reports_a_missing_hub(app, tmp_path, appearance):
     def finder(_home):
         raise HubError("ModelMistress is not running")
 
-    window = Window(tmp_path, finder=finder)
+    window = Window(tmp_path, finder=finder, appearance=appearance)
     wait_for(app, lambda: "not running" in window.banner.text())
 
     assert window.retry.isEnabled()
     window.close()
 
 
-def test_window_connects_and_gives_the_hub_to_every_page(app, tmp_path):
-    window = Window(tmp_path, finder=lambda _home: FakeHub())
+def test_window_connects_and_gives_the_hub_to_every_page(app, tmp_path, appearance):
+    window = Window(tmp_path, finder=lambda _home: FakeHub(), appearance=appearance)
 
     wait_for(app, lambda: window.pages[0].values["version"].text() == "0.3.0")
     assert window.banner.text().startswith("Connected to the hub at")

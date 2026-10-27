@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -22,18 +23,32 @@ from PySide6.QtWidgets import (
 
 from mm_gui.hub import Hub, default_home
 from mm_gui.pages import ChatPage, ModelsPage, SettingsPage, StatusPage
+from mm_gui.prefs import Appearance, Preferences
 from mm_gui.tasks import run_task
 
 
 class Window(QMainWindow):
-    def __init__(self, home: Path, finder: Callable[[Path], Hub] = Hub.find):
+    def __init__(self, home: Path, finder: Callable[[Path], Hub] = Hub.find, appearance: Appearance | None = None):
         super().__init__()
         self.home = home
         self.finder = finder
+        if appearance is None:
+            appearance = Appearance(QApplication.instance(), Preferences())
+        self.appearance = appearance
+        self.prefs = appearance.prefs
         self.setWindowTitle("ModelMistress")
-        self.resize(1100, 720)
+        geometry = self.prefs.window_geometry()
+        if geometry is None or not self.restoreGeometry(geometry):
+            self.resize(1100, 720)
 
-        self.pages = [StatusPage(), ModelsPage(), ChatPage(), SettingsPage()]
+        self.heading = QLabel()
+        heading_font = QFont(self.heading.font())
+        heading_font.setBold(True)
+        if heading_font.pointSizeF() > 0:
+            heading_font.setPointSizeF(heading_font.pointSizeF() * 1.3)
+        self.heading.setFont(heading_font)
+        self.heading.setAccessibleName("Page")
+        self.pages = [StatusPage(), ModelsPage(), ChatPage(), SettingsPage(appearance)]
         self.stack = QStackedWidget()
         self.nav = QListWidget()
         self.nav.setFixedWidth(150)
@@ -41,7 +56,10 @@ class Window(QMainWindow):
         for page in self.pages:
             self.nav.addItem(page.title)
             self.stack.addWidget(page)
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._show_page)
+        for row in range(len(self.pages)):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{row + 1}"), self)
+            shortcut.activated.connect(lambda row=row: self.nav.setCurrentRow(row))
         self.nav.setCurrentRow(0)
 
         self.banner = QLabel()
@@ -52,10 +70,15 @@ class Window(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(self.banner, 1)
         top.addWidget(self.retry)
+        page = QVBoxLayout()
+        page.addWidget(self.heading)
+        page.addWidget(self.stack, 1)
         body = QHBoxLayout()
+        body.setSpacing(12)
         body.addWidget(self.nav)
-        body.addWidget(self.stack, 1)
+        body.addLayout(page, 1)
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 10, 12, 12)
         layout.addLayout(top)
         layout.addLayout(body)
         center = QWidget()
@@ -78,6 +101,16 @@ class Window(QMainWindow):
         self.retry.setEnabled(True)
         self.banner.setText(f"{message}. Start the hub (model-mistress serve), then press Connect again.")
 
+    def _show_page(self, row: int) -> None:
+        self.stack.setCurrentIndex(row)
+        self.heading.setText(self.pages[row].title)
+        if self.pages[row].hub is not None:
+            self.pages[row].shown()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.prefs.save_window_geometry(self.saveGeometry())
+        super().closeEvent(event)
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -88,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("ModelMistress")
-    window = Window(args.home or default_home())
+    appearance = Appearance(app, Preferences())
+    appearance.apply()
+    window = Window(args.home or default_home(), appearance=appearance)
     window.show()
     return app.exec()

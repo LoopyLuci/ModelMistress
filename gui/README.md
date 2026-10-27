@@ -20,13 +20,18 @@ platform's standard folder, the same rule the hub uses.
 
 - **Status**: version, process, uptime, engine, models known, loaded models, memory.
 - **Models**: the models on this machine, a filter, load and unload for the selected model, and a disk rescan.
-- **Chat**: streamed replies from a chat model, an optional system prompt, Stop (or Esc). A model's markup stays
-  visible as text instead of being rendered.
-- **Settings**: the hub's settings. Save sends only the values that changed, checked against their type. A secret is
-  not shown.
+- **Chat**: streamed replies from a chat model, an optional system prompt. Ctrl+Enter sends, Stop (or Esc) stops. A
+  model's markup stays visible as text instead of being rendered.
+- **Settings**: two parts. **Appearance** sets the theme (follow the system, light or dark), the style (Fusion, the
+  default, which follows the theme on every platform, or another Qt style) and the text size. It is kept on this computer, applied at once, and never sent to the
+  hub. **Hub settings** are the hub's own; a filter narrows the list, and Save sends only the values that changed,
+  checked against their type. A secret is not shown.
 
-Pulling models and the dashboard's other pages (traces, knowledge modules, factory, speech, images, vision, keys and
-usage) are not in this window yet; the dashboard at `/ui` has them.
+Ctrl+1 to Ctrl+4 switch pages. The Status page refreshes when it is opened. The window remembers its size and place.
+
+Not in this window yet: pulling models, loading with options (context size, GPU layers), peer keys and usage, and the
+dashboard's other pages (traces, knowledge modules, factory, speech, images, vision). The dashboard at `/ui` has the
+pages it has; it has no page for peer keys or usage, which are on the command line (`keys`, `usage`) and in the API.
 
 ## Test
 

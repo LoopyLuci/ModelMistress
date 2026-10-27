@@ -22,6 +22,10 @@
 - **A Python desktop window** (`gui/`, PySide6 6.12.0): Status, Models, Chat and Settings. It is a client of the hub's
   HTTP API (standard library only on the Python side), so the hub keeps no Python dependency. Run `python -m mm_gui`
   from `gui/`; see [gui/README.md](gui/README.md).
+- **Window look**: Settings has an Appearance group (theme: follow the system, light or dark; style, Fusion by default;
+  text size), kept per user and never sent to the hub. Ctrl+1 to Ctrl+4 switch pages, Ctrl+Enter sends in Chat, and the
+  window remembers its size. [docs/gap-analysis.md](docs/gap-analysis.md) lists what is still missing in the hub,
+  the dashboard and the window.
 - **Dashboard gates**: `npm run check` in `frontend/` runs a vue-tsc type-check, Vitest unit tests (26) and the build.
   `ci/pipeline.py` has a `dashboard` stage (the same checks, from the lock file) and a `gui` stage (the window's
   tests, with the pinned PySide6 and pytest). `src/build.rs` rebuilds the hub when `frontend/dist` changes.
