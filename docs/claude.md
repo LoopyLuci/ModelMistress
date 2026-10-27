@@ -65,7 +65,8 @@ configuration file (it is your file, so edit it yourself):
 ## How the hub is found
 
 The server finds the hub through its control file in the ModelMistress home folder: `MM_HOME` when it is set, else the
-platform folder. Pass `--home <folder>` before `mcp` to choose another home. Without `--start`, the server needs a hub
+platform folder. Pass `--home <folder>` before `mcp` to choose another home; that names the hub for the command, so
+`MODELMISTRESS_URL` does not override it. Without `--start`, the server needs a hub
 that is already running and exits with a message when none answers.
 
 A hub that `--start` launches keeps running after the session ends, so the models stay loaded for the next one. Stop it

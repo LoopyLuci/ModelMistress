@@ -368,12 +368,41 @@ async fn key_op(home: &std::path::Path, op: &str, args: Value) -> anyhow::Result
     match Client::find(Some(home.to_path_buf())).await {
         Ok(c) => c.call(op, args).await,
         Err(_) => {
+            if matches!(op, "key.create" | "key.revoke") {
+                refuse_key_write_under_a_live_hub(home, op)?;
+            }
             let keys = Keys::open(home);
             let out = hub::key_call(&keys, op, &args).map_err(|f| anyhow::anyhow!("{}", f.message));
             keys.flush();
             out
         }
     }
+}
+
+/// A hub reads keys.json once, when it starts. A key written to the file while it runs never reaches it, and a revoke
+/// does not stop its keys, so the write is refused when the home's control file names a hub that is still alive but did
+/// not answer. A control file whose hub has exited is no hub, and the write goes ahead.
+fn refuse_key_write_under_a_live_hub(home: &std::path::Path, op: &str) -> anyhow::Result<()> {
+    let Ok(bytes) = std::fs::read(home.join("control.json")) else {
+        return Ok(());
+    };
+    let control: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let Some(pid) = control["pid"].as_u64().map(|p| sysinfo::Pid::from_u32(p as u32)) else {
+        return Ok(());
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_process(pid);
+    if sys.process(pid).is_none() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{op} was not applied: the hub that runs for {} (pid {}, {}) did not answer. A key written to keys.json would not \
+         reach it, and a revoke would not stop its keys. Make it answer (MODELMISTRESS_URL and MODELMISTRESS_TOKEN), or \
+         stop it, then retry.",
+        home.display(),
+        control["pid"],
+        control["url"].as_str().unwrap_or("?")
+    )
 }
 
 /// The hub's home: `--home` when given, else `MM_HOME`, else the standard folder.
@@ -383,6 +412,11 @@ fn home_from_args(explicit: Option<PathBuf>) -> PathBuf {
 
 fn main() {
     let args = Args::parse();
+    if args.home.is_some() {
+        // `--home` names the hub for this command, so an environment URL does not override it. Done before any
+        // thread starts, so nothing reads the variable concurrently.
+        std::env::remove_var("MODELMISTRESS_URL");
+    }
     let home = home_from_args(args.home.clone());
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let code = rt.block_on(async move {
@@ -1071,5 +1105,35 @@ mod tests {
         std::env::remove_var("MM_HOME");
         assert_eq!(with_flag, PathBuf::from("/explicit"));
         assert_eq!(without_flag, PathBuf::from("/from-env"));
+    }
+
+    #[test]
+    fn a_key_write_is_refused_while_a_hub_that_did_not_answer_is_alive() {
+        let home = std::env::temp_dir().join(format!("mm-keyguard-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let control = home.join("control.json");
+        // This test process is alive, so its own pid stands in for a hub that is still running.
+        std::fs::write(
+            &control,
+            json!({"url": "http://127.0.0.1:1", "pid": std::process::id()}).to_string(),
+        )
+        .unwrap();
+        let err = refuse_key_write_under_a_live_hub(&home, "key.create")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("key.create was not applied") && err.contains("did not answer"),
+            "{err}"
+        );
+        // A control file whose hub has exited is no hub: the write goes ahead.
+        std::fs::write(
+            &control,
+            json!({"url": "http://127.0.0.1:1", "pid": 4_000_000_000u64}).to_string(),
+        )
+        .unwrap();
+        assert!(refuse_key_write_under_a_live_hub(&home, "key.revoke").is_ok());
+        std::fs::remove_file(&control).unwrap();
+        assert!(refuse_key_write_under_a_live_hub(&home, "key.create").is_ok());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

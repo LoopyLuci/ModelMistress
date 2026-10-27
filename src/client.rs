@@ -346,8 +346,9 @@ fn hub_address(
     }
     let Some(doc) = control else {
         bail!(
-            "no hub found: {} does not exist and MODELMISTRESS_URL is not set. Start one with `model-mistress serve`, \
-             or set MODELMISTRESS_URL and MODELMISTRESS_TOKEN to a running hub.",
+            "no hub found: {} does not exist and no MODELMISTRESS_URL applies. Start one with `model-mistress serve`, \
+             or set MODELMISTRESS_URL and MODELMISTRESS_TOKEN to a running hub (a command given --home ignores \
+             MODELMISTRESS_URL).",
             control_path.display()
         );
     };
