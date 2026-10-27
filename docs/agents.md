@@ -25,8 +25,10 @@ stands now. "Done" means it works and was checked on this machine; "partly" name
   smaller tool profile is the next step.
 - **Stale skill.** `skills/mcp-server-development/SKILL.md` describes a `McpServer` struct that the working server does
   not use; it should be rewritten from `src/client.rs`.
-- **Smoke test model.** The pipeline's live-chat check picked an embedding model; it now skips embedding and reranking
-  models. This machine has no chat model under 2 GB, so the live chat check is skipped here and reported as skipped.
+- **Smoke test model.** The pipeline's live-chat check picks the smallest chat model of 2 GB or less (never an embedding
+  or reranking model), loads it on the CPU with a 2,048-token context, and sends a real chat and a streamed one. It runs
+  on the CPU so that another hub holding the GPU's memory does not fail it. The owner's own config lists no model folder,
+  so the default run reports the check as skipped; `MM_SMOKE_CONFIG` names a config copy that adds one.
 
 ## Using a scoped key
 

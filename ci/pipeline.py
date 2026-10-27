@@ -318,6 +318,10 @@ def smoke() -> tuple[bool, str]:
         if live and small:
             model = small[0]["id"]
             say(f"  ->     live: {model} through {live}")
+            # On the CPU with a small context: another hub may hold the GPU's memory, and this check is about the chat
+            # path, not the VRAM planner. chat.complete then reuses the loaded copy.
+            status, _ = call("model.load", {"model": model, "gpu_layers": 0, "ctx_size": 2048, "parallel": 1}, 300)
+            checks.append(("the chat model loads on the CPU", status == 200))
             status, r = call("chat.complete", {"model": model, "prompt": "Say hello.", "max_tokens": 64}, 300)
             res = r.get("result", {})   # a thinking model may spend a short budget on reasoning alone
             checks.append(("a real chat answers", status == 200 and bool(res.get("text") or res.get("reasoning"))
