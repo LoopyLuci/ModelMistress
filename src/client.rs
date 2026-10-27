@@ -56,9 +56,7 @@ impl Client {
         };
         let (url, token, source) = hub_address(env_url.as_deref(), env_token.as_deref(), control.as_ref(), &path)?;
         let hub = Self::new(&url, &token);
-        hub.health()
-            .await
-            .with_context(|| format!("model-mistress at {url} is not answering (its address came from {source})"))?;
+        hub.health().await.with_context(|| unanswered(&url, &source))?;
         Ok(hub)
     }
 
@@ -362,6 +360,18 @@ fn hub_address(
     Ok((url.to_string(), token.to_string(), control_path.display().to_string()))
 }
 
+/// Why the hub at `url` did not answer. An address from the control file can be left by an earlier run, or by the copy a
+/// packaged app keeps in a redirected %LOCALAPPDATA%, so that case names the variables that point at the hub meant.
+fn unanswered(url: &str, source: &str) -> String {
+    if source == "MODELMISTRESS_URL" {
+        return format!("model-mistress at {url} is not answering (its address came from MODELMISTRESS_URL)");
+    }
+    format!(
+        "model-mistress at {url} is not answering (its address came from {source}). That file may be left by an earlier \
+         run or by a packaged copy of the app: set MODELMISTRESS_URL and MODELMISTRESS_TOKEN, or MM_HOME, to the hub you mean"
+    )
+}
+
 /// What an MCP client (Claude, for one) is told about this server: what its tools are for and when to use them.
 const MCP_INSTRUCTIONS: &str = "ModelMistress serves local models behind one API. `model_list` shows the models on this \
 machine and which are loaded. `model_load` loads one into memory and `model_unload` frees it: a load can take minutes and \
@@ -538,6 +548,23 @@ mod tests {
         assert!(
             err.contains("/home/mm/control.json") && err.contains("MODELMISTRESS_URL"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_control_file_address_that_refuses_says_the_file_may_be_stale() {
+        let msg = unanswered("http://127.0.0.1:36209", "C:/home/control.json");
+        assert!(
+            msg.contains("C:/home/control.json")
+                && msg.contains("may be left by an earlier run")
+                && msg.contains("MODELMISTRESS_URL")
+                && msg.contains("MM_HOME"),
+            "{msg}"
+        );
+        let msg = unanswered("http://127.0.0.1:1", "MODELMISTRESS_URL");
+        assert!(
+            msg.contains("came from MODELMISTRESS_URL") && !msg.contains("may be left"),
+            "{msg}"
         );
     }
 
