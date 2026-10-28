@@ -360,6 +360,8 @@ enum KeysCmd {
     List,
     /// Revoke a key by id, or all of a peer's keys by name. It stops working at once.
     Revoke { key: String },
+    /// Every change to the keys, with who made it: `hub` (a running hub) or `offline` (no hub answered).
+    Log,
 }
 
 /// The key commands go through a running hub; with none running they work on the files in the home folder (the next
@@ -372,16 +374,16 @@ async fn key_op(home: &std::path::Path, op: &str, args: Value) -> anyhow::Result
                 refuse_key_write_under_a_live_hub(home, op)?;
             }
             let keys = Keys::open(home);
-            let out = hub::key_call(&keys, op, &args).map_err(|f| anyhow::anyhow!("{}", f.message));
+            let out = hub::key_call(&keys, op, &args, "offline").map_err(|f| anyhow::anyhow!("{}", f.message));
             keys.flush();
             out
         }
     }
 }
 
-/// A hub reads keys.json once, when it starts. A key written to the file while it runs never reaches it, and a revoke
-/// does not stop its keys, so the write is refused when the home's control file names a hub that is still alive but did
-/// not answer. A control file whose hub has exited is no hub, and the write goes ahead.
+/// A hub reads keys.json when it starts and again when it writes a key, so a key written to the file while it runs does
+/// not reach it, and a revoke does not stop its keys. The write is refused when the home's control file names a hub
+/// that is still alive but did not answer. A control file whose hub has exited is no hub, and the write goes ahead.
 fn refuse_key_write_under_a_live_hub(home: &std::path::Path, op: &str) -> anyhow::Result<()> {
     let Ok(bytes) = std::fs::read(home.join("control.json")) else {
         return Ok(());
@@ -716,6 +718,19 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 }
             }
             KeysCmd::Revoke { key } => show(&key_op(&home, "key.revoke", json!({"key": key})).await?),
+            KeysCmd::Log => {
+                let log = Keys::open(&home).log().map_err(|e| anyhow::anyhow!("{e}"))?;
+                for e in log {
+                    println!(
+                        "{:<20} {:<8} {:<10} {:<24} {}",
+                        e["at"].as_str().unwrap_or(""),
+                        e["event"].as_str().unwrap_or(""),
+                        e["key"].as_str().unwrap_or(""),
+                        e["peer"].as_str().unwrap_or(""),
+                        e["via"].as_str().unwrap_or("")
+                    );
+                }
+            }
         },
         Cmd::Usage { key } => {
             let a = key.map(|k| json!({"key": k})).unwrap_or(json!({}));

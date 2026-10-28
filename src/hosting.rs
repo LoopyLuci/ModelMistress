@@ -8,6 +8,10 @@
 //! served and the next ones are refused, because tokens are only known afterwards) and concurrent requests (a
 //! streamed answer counts until its last byte). A refused request is a 429 with `Retry-After`. A revoked key stops
 //! working at once. Usage is kept in `<home>/usage.json`, also for revoked keys.
+//!
+//! Every change to the keys is recorded in `keys.json` beside them, with who made it (the hub, or an offline command),
+//! and saved in the same write. A change reads `keys.json` first, so one made by another process is kept rather than
+//! overwritten, and a `keys.json` that cannot be read refuses key changes instead of being replaced.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -42,6 +46,30 @@ struct KeyRec {
     models: Vec<String>,
 }
 
+/// One change to the keys, kept in keys.json with them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyEvent {
+    at: String,
+    /// `created` or `revoked`.
+    event: String,
+    key: String,
+    peer: String,
+    /// Who made the change: `hub` (the running hub) or `offline` (a command, with no hub answering).
+    via: String,
+}
+
+/// The shape of keys.json.
+#[derive(Deserialize)]
+struct KeysFile {
+    #[serde(default)]
+    keys: Vec<KeyRec>,
+    #[serde(default)]
+    events: Vec<KeyEvent>,
+}
+
+/// A file's modified time and size: they change with every write.
+type FileStamp = (Option<std::time::SystemTime>, u64);
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ModelUse {
     requests: u64,
@@ -72,6 +100,11 @@ struct Live {
 #[derive(Default)]
 struct State {
     keys: Vec<KeyRec>,
+    events: Vec<KeyEvent>,
+    /// keys.json as this hub last read or wrote it (None: no file).
+    stamp: Option<FileStamp>,
+    /// Why keys.json cannot be read, when it cannot. Key changes are refused until it can.
+    unreadable: Option<String>,
     usage: HashMap<String, Usage>,
     live: HashMap<String, Live>,
     dirty: bool,
@@ -136,6 +169,32 @@ pub fn pattern_matches(pattern: &str, model: &str) -> bool {
     }
 }
 
+/// A file's stamp; None when there is no file.
+fn stamp_of(path: &Path) -> Option<FileStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok(), m.len()))
+}
+
+/// The keys and changes in `home`'s keys.json. A missing file is empty; one that does not parse is an error.
+fn load(home: &Path) -> Result<(Vec<KeyRec>, Vec<KeyEvent>), String> {
+    let path = home.join("keys.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<KeysFile>(&bytes)
+            .map(|f| (f.keys, f.events))
+            .map_err(|e| format!("{} does not parse: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((vec![], vec![])),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Key changes are refused while keys.json cannot be read, so a damaged file is never replaced by an empty one.
+fn refuse_while_unreadable(st: &State) -> Result<(), String> {
+    match &st.unreadable {
+        Some(e) => Err(format!("no key was changed: {e}; fix or move the file, then retry")),
+        None => Ok(()),
+    }
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, bytes)?;
@@ -155,13 +214,15 @@ impl Keys {
         })
     }
 
-    /// The keys and usage kept in `home` (none yet: an empty set).
+    /// The keys, their changes and usage kept in `home` (none yet: an empty set). A keys.json that cannot be read
+    /// leaves the keys empty and refuses key changes (see `unreadable`).
     pub fn open(home: &Path) -> Arc<Self> {
+        let stamp = stamp_of(&home.join("keys.json"));
+        let (keys, events, unreadable) = match load(home) {
+            Ok((keys, events)) => (keys, events, None),
+            Err(e) => (vec![], vec![], Some(e)),
+        };
         let read = |name: &str| std::fs::read(home.join(name)).ok();
-        let keys: Vec<KeyRec> = read("keys.json")
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| serde_json::from_value(v["keys"].clone()).ok())
-            .unwrap_or_default();
         let usage: HashMap<String, Usage> = read("usage.json")
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
@@ -169,21 +230,54 @@ impl Keys {
             home: Some(home.to_path_buf()),
             st: Mutex::new(State {
                 keys,
+                events,
+                stamp,
+                unreadable,
                 usage,
                 ..Default::default()
             }),
         })
     }
 
-    fn save_keys(&self, st: &State) -> Result<(), String> {
+    /// Why keys.json cannot be read, when it cannot. Key changes are refused until it can.
+    pub fn unreadable(&self) -> Option<String> {
+        self.st.lock().unreadable.clone()
+    }
+
+    /// Take in keys.json now. The hub calls this as it starts serving, so a key written while it was starting counts.
+    pub fn refresh(&self) {
+        let mut st = self.st.lock();
+        self.reload(&mut st);
+    }
+
+    /// Take in keys.json if it changed since this hub last read or wrote it, so a change another process made is kept
+    /// rather than overwritten by the next write.
+    fn reload(&self, st: &mut State) {
+        let Some(home) = &self.home else { return };
+        let now = stamp_of(&home.join("keys.json"));
+        if now == st.stamp {
+            return;
+        }
+        st.stamp = now;
+        match load(home) {
+            Ok((keys, events)) => {
+                st.keys = keys;
+                st.events = events;
+                st.unreadable = None;
+            }
+            Err(e) => st.unreadable = Some(e),
+        }
+    }
+
+    fn save_keys(&self, st: &mut State) -> Result<(), String> {
         let Some(home) = &self.home else { return Ok(()) };
         std::fs::create_dir_all(home).map_err(|e| format!("{}: {e}", home.display()))?;
-        let doc = json!({"keys": st.keys});
-        write_private(
-            &home.join("keys.json"),
-            &serde_json::to_vec_pretty(&doc).unwrap_or_default(),
-        )
-        .map_err(|e| format!("cannot save keys.json: {e}"))
+        let doc = json!({"keys": st.keys, "events": st.events});
+        let path = home.join("keys.json");
+        write_private(&path, &serde_json::to_vec_pretty(&doc).unwrap_or_default())
+            .map_err(|e| format!("cannot save keys.json: {e}"))?;
+        st.stamp = stamp_of(&path);
+        Ok(())
     }
 
     /// Write the usage to disk if it changed (the hub calls this every few seconds and on exit).
@@ -206,8 +300,15 @@ impl Keys {
         self.st.lock().keys.iter().filter(|k| k.revoked.is_none()).count()
     }
 
-    /// Make a key for `peer`. Returns its description and the secret, which is not kept anywhere.
-    pub fn create(&self, peer: &str, quotas: Quotas, models: Vec<String>) -> Result<(Value, String), String> {
+    /// Make a key for `peer`, recorded as made by `via` (`hub` or `offline`). Returns its description and the secret,
+    /// which is not kept anywhere.
+    pub fn create(
+        &self,
+        peer: &str,
+        quotas: Quotas,
+        models: Vec<String>,
+        via: &str,
+    ) -> Result<(Value, String), String> {
         let peer = peer.trim();
         if peer.is_empty() || peer.len() > 64 || peer.chars().any(|c| c.is_control()) {
             return Err("peer must be a name of 1 to 64 characters".into());
@@ -221,19 +322,32 @@ impl Keys {
             .filter(|m| !m.is_empty())
             .collect();
         let secret = format!("mmk_{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let now = now_rfc3339();
         let rec = KeyRec {
             id: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             peer: peer.to_string(),
             hash: hash_of(&secret),
-            created: now_rfc3339(),
+            created: now.clone(),
             revoked: None,
             quotas,
             models,
         };
-        let mut st = self.st.lock();
+        let event = KeyEvent {
+            at: now,
+            event: "created".into(),
+            key: rec.id.clone(),
+            peer: rec.peer.clone(),
+            via: via.into(),
+        };
+        let mut guard = self.st.lock();
+        let st = &mut *guard;
+        self.reload(st);
+        refuse_while_unreadable(st)?;
         st.keys.push(rec.clone());
-        if let Err(e) = self.save_keys(&st) {
+        st.events.push(event);
+        if let Err(e) = self.save_keys(st) {
             st.keys.pop();
+            st.events.pop();
             return Err(e);
         }
         Ok((describe(&rec), secret))
@@ -243,11 +357,16 @@ impl Keys {
         self.st.lock().keys.iter().map(describe).collect()
     }
 
-    /// Revoke the key with this id, or every key of the peer with this name. Returns how many were revoked now.
-    pub fn revoke(&self, key: &str) -> Result<usize, String> {
-        let mut st = self.st.lock();
+    /// Revoke the key with this id, or every key of the peer with this name, recorded as made by `via`. Returns how
+    /// many were revoked now.
+    pub fn revoke(&self, key: &str, via: &str) -> Result<usize, String> {
+        let mut guard = self.st.lock();
+        let st = &mut *guard;
+        self.reload(st);
+        refuse_while_unreadable(st)?;
         let by_id = st.keys.iter().any(|k| k.id == key);
         let at = now_rfc3339();
+        let (keys_before, events_before) = (st.keys.clone(), st.events.len());
         let mut n = 0;
         for k in st.keys.iter_mut() {
             let hit = if by_id {
@@ -257,13 +376,33 @@ impl Keys {
             };
             if hit && k.revoked.is_none() {
                 k.revoked = Some(at.clone());
+                st.events.push(KeyEvent {
+                    at: at.clone(),
+                    event: "revoked".into(),
+                    key: k.id.clone(),
+                    peer: k.peer.clone(),
+                    via: via.into(),
+                });
                 n += 1;
             }
         }
         if n > 0 {
-            self.save_keys(&st)?;
+            if let Err(e) = self.save_keys(st) {
+                st.keys = keys_before;
+                st.events.truncate(events_before);
+                return Err(e);
+            }
         }
         Ok(n)
+    }
+
+    /// Every change to the keys, oldest first, with who made it. Err: keys.json cannot be read.
+    pub fn log(&self) -> Result<Vec<Value>, String> {
+        let st = self.st.lock();
+        match &st.unreadable {
+            Some(e) => Err(e.clone()),
+            None => Ok(st.events.iter().map(|e| json!(e)).collect()),
+        }
     }
 
     /// Usage of the key with this id or of a peer's keys (None: all).
@@ -448,7 +587,7 @@ mod tests {
     use super::*;
 
     fn secret(k: &Arc<Keys>, peer: &str, q: Quotas, models: &[&str]) -> String {
-        k.create(peer, q, models.iter().map(|m| m.to_string()).collect())
+        k.create(peer, q, models.iter().map(|m| m.to_string()).collect(), "hub")
             .unwrap()
             .1
     }
@@ -544,9 +683,9 @@ mod tests {
         let k = Keys::in_memory();
         let s = secret(&k, "dave", Quotas::default(), &[]);
         admitted(k.check(&s)).finish("m", true, 1, 1);
-        assert_eq!(k.revoke("dave").unwrap(), 1);
+        assert_eq!(k.revoke("dave", "hub").unwrap(), 1);
         assert!(matches!(k.check(&s), Verdict::Revoked));
-        assert_eq!(k.revoke("dave").unwrap(), 0);
+        assert_eq!(k.revoke("dave", "hub").unwrap(), 0);
         assert_eq!(k.active(), 0);
         assert_eq!(k.usage(Some("dave"))[0]["requests"], 1);
         assert!(matches!(k.check("mmk_nonsense"), Verdict::Unknown));
@@ -578,6 +717,7 @@ mod tests {
                     ..Default::default()
                 },
                 vec!["m".into()],
+                "hub",
             )
             .unwrap();
         admitted(k.check(&s)).finish("m", true, 2, 3);
@@ -596,7 +736,7 @@ mod tests {
     #[test]
     fn bad_keys_are_refused() {
         let k = Keys::in_memory();
-        assert!(k.create("  ", Quotas::default(), vec![]).is_err());
+        assert!(k.create("  ", Quotas::default(), vec![], "hub").is_err());
         assert!(k
             .create(
                 "x",
@@ -604,7 +744,8 @@ mod tests {
                     concurrent: Some(0),
                     ..Default::default()
                 },
-                vec![]
+                vec![],
+                "hub"
             )
             .is_err());
     }
@@ -618,5 +759,93 @@ mod tests {
         assert!(check_bind(any, false, 3).unwrap_err().contains("allow_network"));
         assert!(check_bind(any, true, 0).unwrap_err().contains("keys create"));
         assert!(check_bind(any, true, 1).is_ok());
+    }
+
+    fn peers(k: &Arc<Keys>) -> Vec<String> {
+        k.list()
+            .iter()
+            .map(|v| v["peer"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_key_change_is_recorded_with_who_made_it() {
+        let home = crate::testing::TestDir::lazy("mm-keys-log");
+        let hub = Keys::open(&home);
+        let (info, secret) = hub.create("henry", Quotas::default(), vec![], "hub").unwrap();
+        assert_eq!(Keys::open(&home).revoke("henry", "offline").unwrap(), 1);
+        let log = Keys::open(&home).log().unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            (log[0]["event"].as_str(), log[0]["via"].as_str()),
+            (Some("created"), Some("hub"))
+        );
+        assert_eq!(
+            (log[1]["event"].as_str(), log[1]["via"].as_str()),
+            (Some("revoked"), Some("offline"))
+        );
+        assert_eq!(log[0]["key"], info["id"]);
+        assert_eq!(log[1]["peer"], "henry");
+        let file = std::fs::read_to_string(home.join("keys.json")).unwrap();
+        assert!(!file.contains(&secret), "the log never holds a secret");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_hub_write_keeps_a_change_made_offline() {
+        let home = crate::testing::TestDir::lazy("mm-keys-offline");
+        let hub = Keys::open(&home);
+        hub.create("ivy", Quotas::default(), vec![], "hub").unwrap();
+        Keys::open(&home)
+            .create("jack", Quotas::default(), vec![], "offline")
+            .unwrap();
+        // The hub writes a key of its own. It reads the file first, so the offline key is still there.
+        hub.create("kim", Quotas::default(), vec![], "hub").unwrap();
+        assert_eq!(peers(&hub), ["ivy", "jack", "kim"]);
+        assert_eq!(peers(&Keys::open(&home)), ["ivy", "jack", "kim"]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_offline_revoke_is_not_undone_by_a_hub_write() {
+        let home = crate::testing::TestDir::lazy("mm-keys-revoke");
+        let hub = Keys::open(&home);
+        let (_, gone) = hub.create("lena", Quotas::default(), vec![], "hub").unwrap();
+        assert_eq!(Keys::open(&home).revoke("lena", "offline").unwrap(), 1);
+        // The hub still held the key as active. Its next write reads the file, so the revoke comes with it.
+        hub.create("mo", Quotas::default(), vec![], "hub").unwrap();
+        assert!(matches!(hub.check(&gone), Verdict::Revoked));
+        assert!(matches!(Keys::open(&home).check(&gone), Verdict::Revoked));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_hub_takes_in_a_key_written_while_it_was_starting() {
+        let home = crate::testing::TestDir::lazy("mm-keys-start");
+        let hub = Keys::open(&home);
+        let (_, secret) = Keys::open(&home)
+            .create("nina", Quotas::default(), vec![], "offline")
+            .unwrap();
+        assert!(matches!(hub.check(&secret), Verdict::Unknown));
+        hub.refresh();
+        assert!(matches!(hub.check(&secret), Verdict::Admitted(_)));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_unreadable_keys_file_refuses_key_changes_and_is_not_overwritten() {
+        let home = crate::testing::TestDir::lazy("mm-keys-broken");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("keys.json"), b"{ not json").unwrap();
+        let k = Keys::open(&home);
+        assert!(k.unreadable().unwrap().contains("does not parse"));
+        assert!(k
+            .create("oscar", Quotas::default(), vec![], "hub")
+            .unwrap_err()
+            .contains("no key was changed"));
+        assert!(k.revoke("oscar", "hub").unwrap_err().contains("no key was changed"));
+        assert!(k.log().is_err());
+        assert_eq!(std::fs::read(home.join("keys.json")).unwrap(), b"{ not json".to_vec());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

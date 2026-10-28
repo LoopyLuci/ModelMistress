@@ -1031,7 +1031,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         }
         id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
-        "key.create" | "key.list" | "key.revoke" | "usage.get" => key_call(&hub.keys, id, a).map_err(ApiError::from)?,
+        "key.create" | "key.list" | "key.revoke" | "usage.get" => {
+            key_call(&hub.keys, id, a, "hub").map_err(ApiError::from)?
+        }
         "config.get" => shown_settings(&e.settings()),
         "config.set" => {
             let patch = a
@@ -1069,8 +1071,9 @@ fn text<'a>(v: &'a Value, k: &str) -> Result<&'a str, Fail> {
         .ok_or_else(|| Fail::invalid(format!("{k} is required")))
 }
 
-/// The key operations, on any key store (the CLI also runs them without a hub, on the files in the home folder).
-pub fn key_call(keys: &Keys, id: &str, a: &Value) -> Result<Value, Fail> {
+/// The key operations, on any key store (the CLI also runs them without a hub, on the files in the home folder). `via`
+/// names who makes a change in the key log: `hub`, or `offline`.
+pub fn key_call(keys: &Keys, id: &str, a: &Value, via: &str) -> Result<Value, Fail> {
     Ok(match id {
         "key.create" => {
             let n = |k: &str| a.get(k).and_then(Value::as_u64);
@@ -1088,14 +1091,16 @@ pub fn key_call(keys: &Keys, id: &str, a: &Value) -> Result<Value, Fail> {
                     .ok_or_else(|| Fail::invalid("models must be a list of strings"))?,
                 Some(_) => return Err(Fail::invalid("models must be a list of strings")),
             };
-            let (mut info, secret) = keys.create(text(a, "peer")?, quotas, models).map_err(Fail::invalid)?;
+            let (mut info, secret) = keys
+                .create(text(a, "peer")?, quotas, models, via)
+                .map_err(Fail::invalid)?;
             info["key"] = json!(secret);
             info["note"] = json!("this is the only time the key is shown");
             info
         }
         "key.list" => json!(keys.list()),
         "key.revoke" => {
-            let n = keys.revoke(text(a, "key")?).map_err(Fail::invalid)?;
+            let n = keys.revoke(text(a, "key")?, via).map_err(Fail::invalid)?;
             if n == 0 && keys.usage(Some(text(a, "key")?)).is_empty() {
                 return Err(Fail::not_found("no such key or peer (key.list shows them)"));
             }
@@ -2061,6 +2066,11 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     } else {
         addr
     };
+    // A key written while this hub was starting (after it read keys.json, before it announced itself) is taken in here.
+    hub.keys.refresh();
+    if let Some(problem) = hub.keys.unreadable() {
+        eprintln!("model-mistress: {problem}; key changes are refused until it can be read");
+    }
     let control = o.home.join("control.json");
     let doc = json!({"url": format!("http://{shown}"), "token": hub.token.as_str(), "pid": std::process::id(),
                      "version": VERSION, "api": 1});

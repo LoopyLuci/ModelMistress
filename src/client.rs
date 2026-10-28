@@ -619,7 +619,7 @@ mod tests {
         let hub = crate::testing::hub(&home, &["alpha", "beta"]);
         let (_info, secret) = hub
             .keys
-            .create("agent", Default::default(), vec!["alpha".into()])
+            .create("agent", Default::default(), vec!["alpha".into()], "hub")
             .unwrap();
         let (addr, _task) = crate::testing::serve(hub).await;
         let peer = Client::new(&format!("http://{addr}"), &secret);

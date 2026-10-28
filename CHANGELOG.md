@@ -14,6 +14,10 @@
 - **Peer keys**: `keys create` and `keys revoke` refuse to write `keys.json` while a hub runs in that home but does not
   answer. The running hub reads the file only at start, so such a write would not reach it (and a revoke would not stop
   its keys), and the command used to report success.
+- **Key audit trail**: every peer key created or revoked is recorded in `keys.json` with its time, key, peer and who
+  made it (`hub`, or `offline` for a command with no hub answering). `keys log` shows the record. A key change reads
+  `keys.json` first, so a hub never undoes a change made by another process, and a damaged `keys.json` refuses key
+  changes instead of being replaced. See [docs/hosting.md](docs/hosting.md).
 - **Error codes**: chat, completions, embeddings and rerank answer llama-server's own errors under stable codes. A prompt
   over the context window is `context_exceeded` (400, with `n_prompt_tokens` and `n_ctx`); a server still loading is
   `loading`, and one that reports itself unavailable is `busy` (503, with `retry_after_s` and a `Retry-After` header).

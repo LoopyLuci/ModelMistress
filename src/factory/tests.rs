@@ -1471,7 +1471,7 @@ async fn the_rest_routes_mirror_the_operations_and_peers_are_kept_out() {
     let (_, secret) = r
         .hub
         .keys
-        .create("friend", crate::hosting::Quotas::default(), vec![])
+        .create("friend", crate::hosting::Quotas::default(), vec![], "hub")
         .unwrap();
     for (m, p) in [
         ("GET", "/v1/factory/task/list"),

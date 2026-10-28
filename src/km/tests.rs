@@ -1000,7 +1000,7 @@ async fn the_rest_routes_mirror_the_operations_and_peers_are_kept_out() {
     assert!(v["error"]["message"].as_str().unwrap().contains("nope"));
     let (_, secret) = hub
         .keys
-        .create("friend", crate::hosting::Quotas::default(), vec![])
+        .create("friend", crate::hosting::Quotas::default(), vec![], "hub")
         .unwrap();
     for (m, p) in [
         ("GET", "/v1/km/list"),

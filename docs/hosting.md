@@ -22,12 +22,19 @@ model-mistress keys create alice --requests-per-min 60 --tokens-per-day 200000 -
     --model llama3.2:1b --model "qwen3*"
 model-mistress keys list
 model-mistress keys revoke alice          # a key id, or a peer name (all of that peer's keys)
+model-mistress keys log                   # every change, and whether the hub or an offline command made it
 model-mistress usage                      # or: usage alice
 ```
 
 `keys create` prints the key (`mmk_...`) once. `<home>/keys.json` keeps only its SHA-256 hash, the peer's name,
 the quotas and the allow-list; `<home>/usage.json` keeps the usage. With no hub running the commands work on those
 files directly (the next `serve` reads them), so a first key can exist before the hub listens beyond loopback.
+
+Each change is also recorded in `keys.json`, beside the keys: when it was made, the key id, the peer, and `via`, which
+is `hub` for a running hub and `offline` for a command that found no hub answering. `keys log` shows them. The log
+never holds a secret. A change reads `keys.json` first, so a running hub keeps a change made offline when it next
+writes a key, and a `keys.json` that cannot be read refuses key changes until it is fixed. A hub also reads
+`keys.json` as it starts serving, so a key written while it was starting counts.
 
 The same through the hub's operations: `key.create`, `key.list`, `key.revoke`, `usage.get`.
 
