@@ -21,7 +21,8 @@
 - **Error codes**: chat, completions, embeddings and rerank answer llama-server's own errors under stable codes. A prompt
   over the context window is `context_exceeded` (400, with `n_prompt_tokens` and `n_ctx`); a server still loading is
   `loading`, and one that reports itself unavailable is `busy` (503, with `retry_after_s` and a `Retry-After` header).
-  See [docs/agents.md](docs/agents.md).
+  The `embeddings.create` and `rerank.run` operations and the Ollama shim's chat, generate and embed routes answer the
+  same codes; the shim's `{"error"}` body gains a `code` field. See [docs/agents.md](docs/agents.md).
 - **Fix**: a hub started from `mcp --start` no longer keeps the MCP client's stdio pipes open (Windows passed them on).
 - **A Python desktop window** (`gui/`, PySide6 6.12.0): Status, Models, Chat and Settings. It is a client of the hub's
   HTTP API (standard library only on the Python side), so the hub keeps no Python dependency. Run `python -m mm_gui`

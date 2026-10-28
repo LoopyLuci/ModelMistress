@@ -86,12 +86,46 @@ pub async fn stand_in(tag: &str, delay_ms: u64) -> StandIn {
         .route("/v1/chat/completions", post(fake_chat))
         .route("/v1/completions", post(fake_chat))
         .with_state(fake);
+    serve_app(app, seen).await
+}
+
+/// A stand-in `llama-server` that answers every chat, completion, embedding and rerank request with `status` and `body`.
+pub async fn failing_stand_in(status: u16, body: Value) -> StandIn {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let failing = Failing {
+        status,
+        body,
+        seen: seen.clone(),
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(fake_failure))
+        .route("/v1/completions", post(fake_failure))
+        .route("/v1/embeddings", post(fake_failure))
+        .route("/v1/rerank", post(fake_failure))
+        .with_state(failing);
+    serve_app(app, seen).await
+}
+
+async fn serve_app(app: Router, seen: Arc<AtomicUsize>) -> StandIn {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a free port");
     let port = listener.local_addr().expect("an address").port();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     StandIn { port, seen, task }
+}
+
+#[derive(Clone)]
+struct Failing {
+    status: u16,
+    body: Value,
+    seen: Arc<AtomicUsize>,
+}
+
+async fn fake_failure(State(f): State<Failing>) -> Response {
+    f.seen.fetch_add(1, Ordering::SeqCst);
+    let status = axum::http::StatusCode::from_u16(f.status).expect("a status");
+    (status, Json(f.body.clone())).into_response()
 }
 
 /// A hub in `home` that knows `models` (tiny GGUF files, so they are in the catalog and can be named in requests),

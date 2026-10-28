@@ -30,6 +30,8 @@ pub mod vision;
 mod ollama_tests;
 #[cfg(test)]
 mod tests_hosting;
+#[cfg(test)]
+mod tests_upstream;
 
 // ---- legacy -----------------------------------------------------------------------------------------------------
 // The first design's scaffolding, kept until it is either rebuilt on the core above or removed. Its CPU engine

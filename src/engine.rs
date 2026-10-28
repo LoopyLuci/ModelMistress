@@ -26,6 +26,10 @@ pub struct Fail {
     pub status: u16,
     pub code: &'static str,
     pub message: String,
+    /// Seconds to wait before trying again: sent as `Retry-After` and as `retry_after_s`.
+    pub retry_after: Option<u64>,
+    /// Fields the error carries besides its code and message, such as a context size (an object, or Null).
+    pub fields: Value,
 }
 
 impl Fail {
@@ -34,6 +38,27 @@ impl Fail {
             status,
             code,
             message: message.into(),
+            retry_after: None,
+            fields: Value::Null,
+        }
+    }
+
+    /// The error object of the hub's error shape: `code`, `message` and `type`, then the fields and `retry_after_s`.
+    pub fn error_object(&self) -> Value {
+        let mut e = json!({"code": self.code, "message": self.message, "type": self.code});
+        self.add_fields(&mut e);
+        e
+    }
+
+    /// Adds this error's fields and `retry_after_s` to a JSON object.
+    pub fn add_fields(&self, obj: &mut Value) {
+        if let Some(extra) = self.fields.as_object() {
+            for (k, v) in extra {
+                obj[k.as_str()] = v.clone();
+            }
+        }
+        if let Some(wait) = self.retry_after {
+            obj["retry_after_s"] = json!(wait);
         }
     }
     pub fn invalid(message: impl Into<String>) -> Self {

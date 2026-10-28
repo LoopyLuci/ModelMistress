@@ -22,7 +22,7 @@ a live hub, except where the window was launched on the owner's hub.
 | **No thread cap and no hardware-error gate.** Threads are set per load only. | `threads` in the load options; no global check | Open |
 | **No approval queue for loads.** Peer keys cannot load, but nothing lets the owner approve a request. | `peer_route` in `src/hub.rs` | Open |
 | **Named key scopes.** A key reaches every model route or none. | `peer_route` | Open |
-| **Error codes do not cover every path.** Chat, completions, embeddings and rerank map llama-server's errors now. The Ollama shim and `forward_json` do not, and about 57 sites still return a generic `500 io`. | `src/ollama_api.rs`, `forward_json` in `src/hub.rs` | Open (mapping for the other paths) |
+| **Error codes do not cover every path.** Chat, completions, embeddings and rerank map llama-server's errors, and so do the Ollama shim and the `embeddings.create` and `rerank.run` operations now. About 57 sites still return a generic `500 io` (storage, model files and the like). | `src/ollama_api.rs`, `forward_json` in `src/hub.rs` | **Done for llama-server's errors.** The `500 io` sites are open. |
 | **MCP exposes every operation as a tool** (about 94), which costs context on every turn. | `hub.rs` operations; `docs/claude.md` | Open (tool profile) |
 
 ## Dashboard (`frontend/`)

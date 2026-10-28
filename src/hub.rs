@@ -98,12 +98,14 @@ impl From<ApiError> for Fail {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (
-            status,
-            Json(json!({"error": {"code": self.0.code, "message": self.0.message, "type": self.0.code}})),
-        )
-            .into_response()
+        let f = self.0;
+        let status = StatusCode::from_u16(f.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut resp = (status, Json(json!({"error": f.error_object()}))).into_response();
+        if let Some(wait) = f.retry_after {
+            resp.headers_mut()
+                .insert("retry-after", wait.to_string().parse().unwrap());
+        }
+        resp
     }
 }
 
@@ -1119,12 +1121,14 @@ sentencepiece gguf numpy`, then `python convert_hf_to_gguf.py <model folder> --o
 (the script is in the llama.cpp sources, engines/llama.cpp in this repository), then `model-mistress quantize` \
 for a smaller file. Or download a model that is already in GGUF format with model.pull.";
 
-/// Sends a body to a model's llama-server and returns its JSON answer.
+/// Sends a body to a model's llama-server and returns its JSON answer. A failed answer is named as the chat routes name
+/// theirs (see [`upstream_error`]); any other failure is `backend_error`, a 502.
 async fn forward_json(hub: &Hub, path: &'static str, body: Value) -> ApiResult<Value> {
     let t0 = Instant::now();
     let (model, resp, _lease) = hub.engine.forward(path, body).await?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    let text = resp.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     hub.engine.record(
         &model,
         status.is_success(),
@@ -1132,12 +1136,14 @@ async fn forward_json(hub: &Hub, path: &'static str, body: Value) -> ApiResult<V
         v.get("usage"),
     );
     if !status.is_success() {
-        return Err(Fail::new(
-            502,
-            "backend_error",
-            format!("{model}: {}", v["error"]["message"].as_str().unwrap_or(&v.to_string())),
-        )
-        .into());
+        let fail = upstream_failure(status.as_u16(), &text).unwrap_or_else(|| {
+            Fail::new(
+                502,
+                "backend_error",
+                format!("{model}: {}", upstream_message(status.as_u16(), &text)),
+            )
+        });
+        return Err(fail.into());
     }
     Ok(v)
 }
@@ -1648,20 +1654,20 @@ impl Drop for Tracker {
     }
 }
 
-/// llama-server's own error answers under the hub's stable codes, in the hub's `{"error": {code, message, type}}`
-/// shape. A prompt over the context window is `context_exceeded` (400, with both token counts). A server that is still
-/// loading is `loading`, and one with no free slot is `busy` (503, with a retry-after in seconds). Any other answer is
-/// `None` and passes through unchanged.
-fn upstream_error(status: StatusCode, body: &Value) -> Option<(StatusCode, Value, Option<u64>)> {
+/// llama-server's own error answer under the hub's stable codes. A prompt over the context window is `context_exceeded`
+/// (400, with both token counts). A server that is still loading is `loading`, and one with no free slot is `busy` (503,
+/// with a retry-after in seconds). Any other answer is `None`: it keeps its own status and body.
+pub fn upstream_error(status: StatusCode, body: &Value) -> Option<Fail> {
     let message = body["error"]["message"].as_str()?.to_string();
     let ty = body["error"]["type"].as_str()?;
     if status == StatusCode::BAD_REQUEST && ty == "exceed_context_size_error" {
-        return Some((
-            StatusCode::BAD_REQUEST,
-            json!({"error": {"code": "context_exceeded", "type": "context_exceeded", "message": message,
-                             "n_prompt_tokens": &body["n_prompt_tokens"], "n_ctx": &body["n_ctx"]}}),
-            None,
-        ));
+        return Some(Fail {
+            status: 400,
+            code: "context_exceeded",
+            message,
+            retry_after: None,
+            fields: json!({"n_prompt_tokens": &body["n_prompt_tokens"], "n_ctx": &body["n_ctx"]}),
+        });
     }
     if status == StatusCode::SERVICE_UNAVAILABLE && ty == "unavailable_error" {
         let (code, wait) = if message.to_ascii_lowercase().contains("loading") {
@@ -1669,13 +1675,36 @@ fn upstream_error(status: StatusCode, body: &Value) -> Option<(StatusCode, Value
         } else {
             ("busy", 1)
         };
-        return Some((
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"error": {"code": code, "type": code, "message": message, "retry_after_s": wait}}),
-            Some(wait),
-        ));
+        return Some(Fail {
+            status: 503,
+            code,
+            message,
+            retry_after: Some(wait),
+            fields: Value::Null,
+        });
     }
     None
+}
+
+/// The stable-code failure for a llama-server answer with this status and body text, when it has one.
+pub fn upstream_failure(status: u16, text: &str) -> Option<Fail> {
+    let body: Value = serde_json::from_str(text).ok()?;
+    upstream_error(StatusCode::from_u16(status).ok()?, &body)
+}
+
+/// The message of a llama-server error answer: `error.message`, or `error` when it is text, else the body as it is.
+pub fn upstream_message(status: u16, text: &str) -> String {
+    if text.trim().is_empty() {
+        return format!("llama-server answered {status} with no message");
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => v["error"]["message"]
+            .as_str()
+            .or(v["error"].as_str())
+            .map(String::from)
+            .unwrap_or_else(|| text.to_string()),
+        Err(_) => text.to_string(),
+    }
 }
 
 async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> ApiResult<Response> {
@@ -1726,10 +1755,10 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
         );
         tracker.observe(&bytes);
         match parsed.as_ref().and_then(|v| upstream_error(status, v)) {
-            Some((mapped, body, wait)) => {
-                status = mapped;
-                retry = wait;
-                Response::new(Body::from(body.to_string()))
+            Some(fail) => {
+                status = StatusCode::from_u16(fail.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                retry = fail.retry_after;
+                Response::new(Body::from(json!({"error": fail.error_object()}).to_string()))
             }
             None => Response::new(Body::from(bytes)),
         }
@@ -2150,29 +2179,22 @@ unrelated line
         let overflow = json!({"error": {"code": 400, "type": "exceed_context_size_error",
             "message": "request (9000 tokens) exceeds the available context size (4096 tokens), try increasing it"},
             "n_prompt_tokens": 9000, "n_ctx": 4096});
-        let (s, body, wait) = upstream_error(StatusCode::BAD_REQUEST, &overflow).unwrap();
+        let f = upstream_error(StatusCode::BAD_REQUEST, &overflow).unwrap();
+        assert_eq!((f.status, f.code, f.retry_after), (400, "context_exceeded", None));
+        let body = f.error_object();
         assert_eq!(
-            (s, body["error"]["code"].as_str(), wait),
-            (StatusCode::BAD_REQUEST, Some("context_exceeded"), None)
-        );
-        assert_eq!(
-            (
-                body["error"]["n_prompt_tokens"].as_u64(),
-                body["error"]["n_ctx"].as_u64()
-            ),
+            (body["n_prompt_tokens"].as_u64(), body["n_ctx"].as_u64()),
             (Some(9000), Some(4096))
         );
 
         let busy = json!({"error": {"code": 503, "type": "unavailable_error", "message": "no slot available"}});
-        let (s, body, wait) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &busy).unwrap();
-        assert_eq!(
-            (s, body["error"]["code"].as_str(), wait),
-            (StatusCode::SERVICE_UNAVAILABLE, Some("busy"), Some(1))
-        );
+        let f = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &busy).unwrap();
+        assert_eq!((f.status, f.code, f.retry_after), (503, "busy", Some(1)));
 
         let loading = json!({"error": {"code": 503, "type": "unavailable_error", "message": "Loading model"}});
-        let (_, body, wait) = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &loading).unwrap();
-        assert_eq!((body["error"]["code"].as_str(), wait), (Some("loading"), Some(2)));
+        let f = upstream_error(StatusCode::SERVICE_UNAVAILABLE, &loading).unwrap();
+        assert_eq!((f.code, f.retry_after), ("loading", Some(2)));
+        assert_eq!(f.error_object()["retry_after_s"], 2);
 
         // any other error keeps its own body: a bad request is not a context overflow
         let bad = json!({"error": {"code": 400, "type": "invalid_request_error", "message": "bad"}});

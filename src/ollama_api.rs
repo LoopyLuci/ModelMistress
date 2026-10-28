@@ -892,7 +892,15 @@ pub fn copy(hub: &Hub, source: &str, destination: &str) -> Result<Value, Fail> {
 
 // ---- the routes -----------------------------------------------------------------------------------------------
 
-/// Ollama's errors are {"error": "message"}.
+/// A failed llama-server answer as the shim's error: its stable code when it has one (see `hub::upstream_error`), else
+/// its own status and message as `backend_error`.
+fn upstream_fail(status: u16, text: &str) -> Fail {
+    hub::upstream_failure(status, text)
+        .unwrap_or_else(|| Fail::new(status, "backend_error", hub::upstream_message(status, text)))
+}
+
+/// Ollama's errors are {"error": "message"}; the shim adds the hub's `code`, and the fields and `retry_after_s` of a
+/// stable code.
 pub struct OErr(Fail);
 
 impl From<Fail> for OErr {
@@ -909,8 +917,16 @@ impl From<ApiError> for OErr {
 
 impl IntoResponse for OErr {
     fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(json!({"error": self.0.message}))).into_response()
+        let f = self.0;
+        let status = StatusCode::from_u16(f.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut body = json!({"error": f.message, "code": f.code});
+        f.add_fields(&mut body);
+        let mut resp = (status, Json(body)).into_response();
+        if let Some(wait) = f.retry_after {
+            resp.headers_mut()
+                .insert("retry-after", wait.to_string().parse().unwrap());
+        }
+        resp
     }
 }
 
@@ -999,16 +1015,7 @@ async fn run(hub: Hub, req: &Value, path: &'static str, body: Value, kind: Kind,
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v["error"]["message"]
-                    .as_str()
-                    .or_else(|| v["error"].as_str())
-                    .map(String::from)
-            })
-            .unwrap_or(text);
-        return Err(Fail::new(status.as_u16(), "backend_error", msg).into());
+        return Err(upstream_fail(status.as_u16(), &text).into());
     }
     if !stream {
         let v: Value = resp.json().await.map_err(|e| Fail::unavailable(e.to_string()))?;
@@ -1115,7 +1122,8 @@ async fn embeddings_call(hub: &Hub, req: &Value, legacy: bool) -> R<Json<Value>>
     let t0 = Instant::now();
     let (model, resp, lease) = hub.engine.forward("/v1/embeddings", body).await?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    let text = resp.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     drop(lease);
     hub.engine
         .set_keep_alive(&model, req.get("keep_alive").and_then(keep_alive_s));
@@ -1126,11 +1134,7 @@ async fn embeddings_call(hub: &Hub, req: &Value, legacy: bool) -> R<Json<Value>>
         v.get("usage"),
     );
     if !status.is_success() {
-        let msg = v["error"]["message"]
-            .as_str()
-            .unwrap_or("the embeddings request failed")
-            .to_string();
-        return Err(Fail::new(status.as_u16(), "backend_error", msg).into());
+        return Err(upstream_fail(status.as_u16(), &text).into());
     }
     Ok(Json(embed_answer(legacy, &asked, &v, t0.elapsed())))
 }
