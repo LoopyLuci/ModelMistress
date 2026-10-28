@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -47,6 +47,7 @@ struct Fake {
     tag: String,
     delay: Duration,
     seen: Arc<AtomicUsize>,
+    slots_full: bool,
 }
 
 async fn fake_chat(State(f): State<Fake>, Json(body): Json<Value>) -> Response {
@@ -76,17 +77,37 @@ async fn fake_chat(State(f): State<Fake>, Json(body): Json<Value>) -> Response {
 }
 
 pub async fn stand_in(tag: &str, delay_ms: u64) -> StandIn {
+    serve_fake(tag, delay_ms, false).await
+}
+
+/// A stand-in whose every slot is taken: `GET /slots?fail_on_no_slot=1` answers 503, as llama-server does. The chat
+/// route still answers and counts requests, so a test can see whether a request was sent.
+pub async fn full_stand_in(tag: &str) -> StandIn {
+    serve_fake(tag, 0, true).await
+}
+
+async fn serve_fake(tag: &str, delay_ms: u64, slots_full: bool) -> StandIn {
     let seen = Arc::new(AtomicUsize::new(0));
     let fake = Fake {
         tag: tag.to_string(),
         delay: Duration::from_millis(delay_ms),
         seen: seen.clone(),
+        slots_full,
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(fake_chat))
         .route("/v1/completions", post(fake_chat))
+        .route("/slots", get(fake_slots))
         .with_state(fake);
     serve_app(app, seen).await
+}
+
+async fn fake_slots(State(f): State<Fake>) -> Response {
+    if f.slots_full {
+        let body = json!({"error": {"code": 503, "message": "no slot available", "type": "unavailable_error"}});
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    Json(json!([{"id": 0, "is_processing": false}])).into_response()
 }
 
 /// A stand-in `llama-server` that answers every chat, completion, embedding and rerank request with `status` and `body`.

@@ -122,6 +122,10 @@ pub struct Settings {
     /// Models loaded for embeddings or reranking that may stay up next to the `max_loaded` chat models (they are
     /// counted apart, so an embeddings request does not evict a chat model that fits).
     pub max_loaded_embedding: usize,
+    /// Answer `busy` at once (503, Retry-After 1) when a model's llama-server has no idle slot, instead of letting the
+    /// request wait in the server's queue. Off by default: the request waits, as it always did. The slot is checked with
+    /// `GET /slots?fail_on_no_slot=1`, so a slot that frees up between that check and the request is still queued.
+    pub fail_fast_busy: bool,
     /// Let requests from this machine (the peer address is 127.0.0.1 or ::1) call the hub without a token, so
     /// Ollama clients that send no Authorization header work. Off by default; see the README.
     pub allow_loopback_no_token: bool,
@@ -181,6 +185,7 @@ impl Default for Settings {
             load_timeout_s: 300,
             idle_unload_s: 0,
             max_loaded_embedding: 1,
+            fail_fast_busy: false,
             allow_loopback_no_token: false,
             default_model: None,
             extra_args: vec![],
@@ -1606,6 +1611,23 @@ impl Engine {
     /// Send an OpenAI-style request (`path` like "/v1/chat/completions") to where `body.model` lives.
     /// The [`Lease`] (for a model of ours) must be held until the answer has been read to its end: until then the
     /// model is not stopped by a hot swap or an eviction.
+    /// Does this instance's llama-server have an idle slot? `GET /slots?fail_on_no_slot=1` answers 503 when none is idle.
+    /// Any other answer, and no answer at all, counts as free: the server then queues the request as it always did.
+    async fn has_free_slot(&self, inst: &Instance) -> bool {
+        let url = format!("http://127.0.0.1:{}/slots?fail_on_no_slot=1", inst.port);
+        match self
+            .http
+            .get(url)
+            .bearer_auth(&inst.key)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(r) => r.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Err(_) => true,
+        }
+    }
+
     pub async fn forward(&self, path: &str, mut body: Value) -> Result<(String, reqwest::Response, Option<Lease>)> {
         let name = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
         let target = self.resolve(&name)?;
@@ -1644,6 +1666,17 @@ impl Engine {
                             entry.id
                         ),
                     ));
+                }
+                let fail_fast = self.settings.read().fail_fast_busy;
+                if fail_fast && path.starts_with("/v1/") && !self.has_free_slot(&inst).await {
+                    return Err(Fail {
+                        retry_after: Some(1),
+                        ..Fail::new(
+                            503,
+                            "busy",
+                            format!("{} has no free slot; try again in a moment", entry.id),
+                        )
+                    });
                 }
                 inst.touch();
                 body["model"] = json!(entry.id);

@@ -231,7 +231,7 @@ a desktop; use `model.plan` first), the tool-call check on the GPU, and the plan
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training: LoRA and QLoRA fine-tuning, merge and GGUF export are in the Forge (QLoRA needs bitsandbytes, Linux/CUDA only in practice; untested on a real GPU run). Not yet: expert training, distillation, DPO.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
-- The open items with the code that shows each one (fail-fast `busy`, queue depth, approval queue, named key scopes,
+- The open items with the code that shows each one (queue depth, approval queue, named key scopes,
   a default embedding model, aliases, batch jobs, the generic `500 io` sites, a dashboard page for keys and usage, a
   smaller MCP tool profile) are in [gap-analysis.md](gap-analysis.md).
 

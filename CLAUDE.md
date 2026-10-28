@@ -68,7 +68,6 @@ change in the same commit.
 ## Open decisions (owner)
 
 - Thread cap and hardware-error gate: the owner must say what counts as a hardware error.
-- Fail-fast `busy`: a full set of slots answers `busy` instead of queueing the request.
 - Approval queue for loads that a peer asks for, named key scopes, and a default embedding model.
 
 `docs/gap-analysis.md` has the full list, with the evidence for each item.

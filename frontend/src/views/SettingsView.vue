@@ -64,6 +64,7 @@ const GROUPS: { title: string; help?: string; fields: Field[] }[] = [
       { key: 'ctx_size', label: 'Default context size', kind: 'int', help: '0 uses the model\'s own.' },
       { key: 'gpu_layers', label: 'Default GPU layers', kind: 'int', min: 0, help: '999 puts every layer that fits on the GPU; 0 runs on the CPU.' },
       { key: 'parallel', label: 'Parallel requests per model', kind: 'int', min: 1 },
+      { key: 'fail_fast_busy', label: 'Answer busy when every slot is taken', kind: 'bool', help: 'On: a request that finds no free slot gets busy (503, Retry-After 1) at once, instead of waiting in the queue. Off by default.' },
       { key: 'autoload', label: 'Load a model on its first request', kind: 'bool' },
       { key: 'load_timeout_s', label: 'Load timeout (seconds)', kind: 'int', min: 10 },
       { key: 'default_model', label: 'Model used when a request names none', kind: 'model', nullable: true },

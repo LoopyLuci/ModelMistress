@@ -2,12 +2,14 @@
 //! `rerank.run` operations, and the Ollama shim's chat, generate and embed routes. Each one reaches a stand-in that
 //! answers with the error, so the status, code, Retry-After and fields a client sees are the ones the hub promises.
 
+use std::sync::atomic::Ordering;
+
 use axum::http::{HeaderMap, Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::hub::{self, Hub};
-use crate::testing::{self, failing_stand_in, StandIn, TOKEN};
+use crate::testing::{self, failing_stand_in, full_stand_in, stand_in, StandIn, TOKEN};
 
 const FULL: &str = "request (9000 tokens) exceeds the available context size (4096 tokens), try increasing it";
 
@@ -182,4 +184,88 @@ fn an_answer_that_is_not_an_error_object_has_no_stable_code() {
         "llama-server answered 502 with no message"
     );
     assert_eq!(hub::upstream_message(500, "plain text"), "plain text");
+}
+
+/// A hub that knows `tiny`, served by `s`. With `fail_fast`, the setting is saved with `config.set`, as the owner would.
+async fn serving(home: &std::path::Path, s: &StandIn, fail_fast: bool) -> Hub {
+    let h = testing::hub(home, &["tiny"]);
+    h.engine.adopt("tiny", s.port, "k", Some(s.on_stop()));
+    if fail_fast {
+        let set = json!({"settings": {"fail_fast_busy": true}});
+        let (st, _, v) = call(&h, "POST", "/v1/call/config.set", set).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+    h
+}
+
+fn chat() -> Value {
+    json!({"model": "tiny", "messages": [{"role": "user", "content": "hi"}], "stream": false})
+}
+
+#[tokio::test]
+async fn fail_fast_busy_answers_busy_at_once_when_every_slot_is_taken() {
+    let home = testing::temp_home();
+    let s = full_stand_in("pong").await;
+    let h = serving(&home, &s, true).await;
+    let (st, headers, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"]["code"], "busy");
+    assert_eq!(headers["retry-after"].to_str().unwrap(), "1");
+    assert_eq!(
+        s.seen.load(Ordering::SeqCst),
+        0,
+        "the request must not reach llama-server"
+    );
+}
+
+#[tokio::test]
+async fn fail_fast_busy_is_also_answered_by_the_ollama_shim() {
+    let home = testing::temp_home();
+    let s = full_stand_in("pong").await;
+    let h = serving(&home, &s, true).await;
+    let (st, headers, v) = call(&h, "POST", "/api/chat", chat()).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(
+        (v["code"].as_str(), headers["retry-after"].to_str().unwrap()),
+        (Some("busy"), "1")
+    );
+    assert_eq!(s.seen.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn without_the_setting_a_full_server_still_queues_the_request() {
+    let home = testing::temp_home();
+    let s = full_stand_in("pong").await;
+    let h = serving(&home, &s, false).await;
+    let (st, _, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(s.seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fail_fast_busy_sends_the_request_when_a_slot_is_free() {
+    let home = testing::temp_home();
+    let s = stand_in("pong", 0).await;
+    let h = serving(&home, &s, true).await;
+    let (st, _, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(s.seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fail_fast_busy_is_off_by_default_and_config_set_turns_it_on() {
+    let home = testing::temp_home();
+    let h = testing::hub(&home, &["tiny"]);
+    let (_, _, before) = call(&h, "POST", "/v1/call/config.get", json!({})).await;
+    assert_eq!(before["result"]["fail_fast_busy"], false, "{before}");
+    let (st, _, v) = call(
+        &h,
+        "POST",
+        "/v1/call/config.set",
+        json!({"settings": {"fail_fast_busy": true}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, after) = call(&h, "POST", "/v1/call/config.get", json!({})).await;
+    assert_eq!(after["result"]["fail_fast_busy"], true, "{after}");
 }

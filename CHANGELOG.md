@@ -23,6 +23,10 @@
   `loading`, and one that reports itself unavailable is `busy` (503, with `retry_after_s` and a `Retry-After` header).
   The `embeddings.create` and `rerank.run` operations and the Ollama shim's chat, generate and embed routes answer the
   same codes; the shim's `{"error"}` body gains a `code` field. See [docs/agents.md](docs/agents.md).
+- **Fail-fast `busy`** (`fail_fast_busy`, off by default): with it on, a request that finds no idle slot in a model's
+  llama-server gets `busy` (503, `Retry-After: 1`) at once, instead of waiting in the server's queue. The slot is checked
+  with llama-server's `GET /slots?fail_on_no_slot=1` before each request on `/v1`. The dashboard's Settings page has the
+  switch; `config.set` takes `{"settings": {"fail_fast_busy": true}}`.
 - **Fix**: a hub started from `mcp --start` no longer keeps the MCP client's stdio pipes open (Windows passed them on).
 - **A Python desktop window** (`gui/`, PySide6 6.12.0): Status, Models, Chat and Settings. It is a client of the hub's
   HTTP API (standard library only on the Python side), so the hub keeps no Python dependency. Run `python -m mm_gui`
