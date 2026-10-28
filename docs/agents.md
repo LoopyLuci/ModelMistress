@@ -6,7 +6,8 @@ stands now. "Done" means it works and was checked on this machine; "partly" name
 | # | Suggestion | Status |
 |---|---|---|
 | 1 | Find the hub somewhere Windows does not redirect; say which URL and file were checked | **Done.** `MODELMISTRESS_URL` with `MODELMISTRESS_TOKEN` names the hub directly, with no file needed. `MM_HOME` (or `--home`) moves the control file to any folder, for example one on another drive. Every error names the URL, the file and the variable that would fix it. A fixed port is `serve --port N`, used with `MODELMISTRESS_URL`. |
-| 2 | Scoped agent tokens: chat and models, no load, unload, pull or settings; revocable; usage counted | **Partly.** Peer keys already exist (`keys create`): they reach the model routes only (`/v1/models`, chat, completions, embeddings, rerank, audio) and every other route answers `403 forbidden`. Revocation (`keys revoke`) and usage (`usage`) exist. **Done now:** an MCP server that uses a peer key, `mcp --peer` with the key in `MODELMISTRESS_KEY`, which exposes `models_list` and `chat_complete` only. **Missing:** named scopes (`--scope chat,models`) and a `token` alias; today a key is all model routes. |
+| 2 | Scoped agent tokens: chat and models, no load, unload, pull or settings; revocable; usage counted | **Partly.** Peer keys already exist (`keys create`): they reach the model routes only (`/v1/models`, chat, completions, embeddings, rerank, audio) and every other route answers `403 forbidden`. Revocation (`keys revoke`) and usage (`usage`) exist, and the key log (`keys log`) records every key change with
+whether the hub or an offline command made it. **Done now:** an MCP server that uses a peer key, `mcp --peer` with the key in `MODELMISTRESS_KEY`, which exposes `models_list` and `chat_complete` only. **Missing:** named scopes (`--scope chat,models`) and a `token` alias; today a key is all model routes. |
 | 3 | Work without ABP; ABP's relay as an optional extra | **Done, checked.** The hub ran with a minimal environment (no PATH, no Python, no ABP or MM variables). ABP's own client found the hub through `MM_HOME` and authenticated. ABP's relay lives in ABP's repository, not here. |
 | 4 | Batch jobs: submit prompts, get a job ID, run in order at a set concurrency, survive disconnects and crashes, check progress and fetch results | **Not done.** The hub has jobs for downloads and quantization (`job.get`, `job.cancel`), but no batch of prompts. Next step: a `batch.submit` operation whose per-item results are written to disk as they finish, so a crash loses only the item in progress. |
 | 5 | A status call that shows loaded models, context size, GPU memory, queue depth and uptime | **Partly.** `service.status` (MCP `service_status`, CLI `status`) reports uptime, memory and loaded models; `model.loaded` reports context, slots, KV cache, VRAM and uptime per model. **Missing:** queue depth and aliases in that report. |
@@ -45,3 +46,6 @@ model-mistress mcp --peer
 ```
 
 To reach a hub that is not in this machine's home folder, also set `MODELMISTRESS_URL` to its address.
+
+To see who changed the keys and when, run `model-mistress keys log`. Each line gives the time, the change, the key id,
+the peer, and `hub` or `offline`.

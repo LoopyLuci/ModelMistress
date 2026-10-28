@@ -2,7 +2,8 @@
 
 What is missing or rough in the hub, the dashboard (`frontend/`) and the Python window (`gui/`), with the code
 that shows each one. "Open" means nothing has been built yet; "in progress" means this change addresses it. The
-agent-facing list is in [agents.md](agents.md); this page covers the whole application.
+agent-facing list is in [agents.md](agents.md); this page covers the whole application. Last reviewed 2026-10-28 at
+commit 3cf92e5; the rows marked Done were changed by the commits 0dfe330, 67f7479 and 3cf92e5.
 
 How it was checked: the operations the hub serves, the routes and views of the dashboard, the pages and calls of
 the Python window, and the code paths named below. The dashboard and the Python window were read, not run against

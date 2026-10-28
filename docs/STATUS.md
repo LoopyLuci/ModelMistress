@@ -1,13 +1,17 @@
 # Status
 
-Last checked 2026-10-07 on Windows 10 with an RX 7900 XTX, with the built-in llama.cpp (commit 7fee178, Vulkan).
+Updated 2026-10-28 at repository commit 3cf92e5. The measurements below were taken on 2026-10-07 on Windows 10 with an
+RX 7900 XTX and the built-in llama.cpp (commit 7fee178, Vulkan), unless a section says otherwise. On 2026-10-28 the
+pipeline's test stage passed (398 tests), and the pipeline's smoke test passed against the built binary.
 
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):
 `version`, `tags`, `show`, `chat`, `generate`, `embed`, `embeddings`, `ps`, `pull`, `delete`, `create`, `copy`.
 Tested over a hub with stand-ins for llama-server (no real model): shapes, NDJSON streaming however the bytes are
-cut, presets end to end, token required. Not yet run against a real Ollama client.
+cut, presets end to end, token required. Not yet run against a real Ollama client. Errors carry the hub's stable codes (`context_exceeded`, `loading`, `busy`
+with `Retry-After`, `not_found`, `backend_error`), and the body adds `code` to Ollama's `{"error"}` shape; the tests are
+in `src/tests_upstream.rs`.
 
 - Same token as `/v1`, loopback only for the owner's token; a tokenless Ollama client needs a header-adding proxy
   (decision for the owner: an opt-in tokenless-loopback setting).
@@ -78,6 +82,13 @@ swap (`model.load` with `reload`, LoRA or draft changes, unload, eviction) that 
 included, finish on the old model ([hosting.md](hosting.md)). Listening beyond loopback needs `allow_network` and a key.
 Tested over HTTP with stand-ins for `llama-server`: quotas, revocation, allow-lists, and a hot swap under concurrent
 requests and a stream that drops nothing. Not tested: a hot swap of a real model under load.
+
+Every key change is recorded in `keys.json` (`events`: time, key id, peer, and `via`, which is `hub` or `offline`), and
+`model-mistress keys log` shows them. A key change reads `keys.json` first, so a change made by another process is not
+undone by the hub; a `keys.json` that cannot be read refuses key changes. A running hub re-reads `keys.json` only when
+it starts serving and when it writes a key, so an offline revoke reaches it at its next key change or restart. The
+offline commands still refuse to write while a hub that does not answer is running. Tested with unit tests on the file
+and with an offline run of the built binary.
 
 ## The desktop app
 
@@ -220,6 +231,9 @@ a desktop; use `model.plan` first), the tool-call check on the GPU, and the plan
 - Text to speech output other than WAV and raw PCM; converting Hugging Face weights (a Python tool).
 - Training: LoRA and QLoRA fine-tuning, merge and GGUF export are in the Forge (QLoRA needs bitsandbytes, Linux/CUDA only in practice; untested on a real GPU run). Not yet: expert training, distillation, DPO.
 - Hosting: TLS (use a reverse proxy), per-key rate limits by tokens per minute.
+- The open items with the code that shows each one (fail-fast `busy`, queue depth, approval queue, named key scopes,
+  a default embedding model, aliases, batch jobs, the generic `500 io` sites, a dashboard page for keys and usage, a
+  smaller MCP tool profile) are in [gap-analysis.md](gap-analysis.md).
 
 ## Legacy code
 
