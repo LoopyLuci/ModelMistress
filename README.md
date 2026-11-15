@@ -55,6 +55,9 @@ runs on its own.
   well into the weights, and gated self-training ([docs/native/architecture.md](docs/native/architecture.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
+- **All-in-one item listing & sales platform** — **ItemForge** (`itemforge/`): auto-organize photos into item folders,
+  AI research, markdown documentation, and multi-platform listing generation (Facebook, Instagram, eBay, Etsy), all running locally via ModelMistress.
+  See `itemforge/README.md`, `itemforge/docs/api.md`, and `itemforge/docs/acp.md`.
 
 ## Quick start
 
