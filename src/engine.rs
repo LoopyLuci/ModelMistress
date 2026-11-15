@@ -82,7 +82,7 @@ pub struct Settings {
     /// `<home>/engines/llama.cpp/`, then PATH.
     pub llama_server: Option<PathBuf>,
     /// Path to `rigel-server`, which serves the models whose serving profile says `engine = "rigel"` (Rigel: a build
-    /// of the Betelgeuse llama.cpp fork for Windows and AMD GPUs). Unset: MM_RIGEL_SERVER, then the one built into
+    /// of a llama.cpp fork with paged MoE, for Windows and AMD GPUs). Unset: MM_RIGEL_SERVER, then the one built into
     /// this binary (feature `rigel-engine`), then `<home>/engines/rigel/`, then PATH.
     pub rigel_server: Option<PathBuf>,
     /// Extra folders of .gguf files.
@@ -1978,7 +1978,7 @@ pub mod bundled {
     #[cfg(feature = "rigel-engine")]
     const RIGEL: &[u8] = include_bytes!(env!("MM_BUNDLED_RIGEL"));
 
-    /// The Betelgeuse commit and GPU targets of the built-in Rigel, or None.
+    /// The source commit and GPU targets of the built-in Rigel, or None.
     pub fn rigel_version() -> Option<&'static str> {
         #[cfg(feature = "rigel-engine")]
         return Some(env!("MM_BUNDLED_RIGEL_VERSION"));

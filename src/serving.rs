@@ -61,7 +61,7 @@ pub struct ServeFlags {
     /// A Jinja chat template file to use instead of the one in the GGUF (`--chat-template-file`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_file: Option<PathBuf>,
-    /// The engine that serves the model: "llama.cpp" (the default) or "rigel" (Rigel, a build of the Betelgeuse
+    /// The engine that serves the model: "llama.cpp" (the default) or "rigel" (Rigel, a build of a
     /// llama.cpp fork for Windows and AMD GPUs, which can page a mixture-of-experts model's experts from disk).
     /// Rigel serves one request at a time: its loads always get one slot.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -4,6 +4,6 @@
 [submodule "engines/stable-diffusion.cpp"]
 	path = engines/stable-diffusion.cpp
 	url = https://github.com/leejet/stable-diffusion.cpp.git
-[submodule "engines/betelgeuse"]
-	path = engines/betelgeuse
+[submodule "engines/rigel"]
+	path = engines/rigel
 	url = https://github.com/Betelgeuse-AI/Betelgeuse.git

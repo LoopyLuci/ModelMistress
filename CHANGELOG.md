@@ -2,12 +2,12 @@
 
 ## Unreleased
 
-- **Rigel, a second engine**: a model's serving profile can say `engine = "rigel"`. Rigel is the Betelgeuse llama.cpp
+- **Rigel, a second engine**: a model's serving profile can say `engine = "rigel"`. Rigel is a llama.cpp
   fork ported to Windows and AMD HIP, and it can page a MoE model's experts from disk into VRAM slots. The new profile
   options are `moe_direct_io`, `moe_slots`, `moe_pack_dir`, `moe_profile` and `moe_cache_mib`.
   - A Rigel model always gets one slot.
   - `backend.list`, `hub.info` and `model.plan` show the engine.
-  - The new feature `rigel-engine` builds Rigel into the binary (from `engines/betelgeuse` plus
+  - The new feature `rigel-engine` builds Rigel into the binary (from `engines/rigel` plus
     `engines/patches/rigel.patch`; GPUs from `MM_RIGEL_GPU_TARGETS`).
   - Paged decoding is slow until the VRAM slots warm up. This is still open; see the measurements in the doc.
 

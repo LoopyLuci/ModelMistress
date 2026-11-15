@@ -165,7 +165,7 @@ fn rigel_gpu_targets(var: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// With the `rigel-engine` feature: builds Rigel (engines/betelgeuse with engines/patches/rigel.patch) with the HIP
+/// With the `rigel-engine` feature: builds Rigel (engines/rigel with engines/patches/rigel.patch) with the HIP
 /// SDK's clang and embeds its `rigel-server` (MM_BUNDLED_RIGEL). Needs HIP_PATH, CMake, Ninja and Visual Studio's
 /// libraries; MM_RIGEL_GPU_TARGETS picks the GPUs.
 fn build_rigel() {
@@ -174,9 +174,9 @@ fn build_rigel() {
     }
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let engines = manifest.parent().unwrap().join("engines");
-    let src = engines.join("betelgeuse");
+    let src = engines.join("rigel");
     if !src.join("CMakeLists.txt").is_file() {
-        panic!("rigel-engine: engines/betelgeuse is empty; run `git submodule update --init --recursive engines/betelgeuse`");
+        panic!("rigel-engine: engines/rigel is empty; run `git submodule update --init --recursive engines/rigel`");
     }
     let patch = engines.join("patches").join("rigel.patch");
     println!("cargo:rerun-if-changed={}", patch.display());

@@ -806,7 +806,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 {"id": "rigel", "available": e.rigel_server().is_some(), "path": e.rigel_server(),
                  "built_in": crate::engine::bundled::rigel_version(),
                  "loaded": e.loaded().iter().filter(|m| m.serving().engine == "rigel").count(),
-                 "note": "a build of the Betelgeuse llama.cpp fork for Windows and AMD GPUs; serves the models \
+                 "note": "a llama.cpp fork with paged MoE, for Windows and AMD GPUs; serves the models \
                           whose serving profile says engine = \"rigel\""},
                 ollama
             ])

@@ -1,7 +1,6 @@
 # Rigel: a second engine for AMD GPUs on Windows
 
-Rigel is a build of the [Betelgeuse](https://github.com/Betelgeuse-AI/Betelgeuse) llama.cpp fork, ported to Windows
-and AMD HIP. Its main addition is **paged mixture-of-experts**: the routed experts of a MoE model stay off the GPU and
+Rigel is a llama.cpp fork ported to Windows and AMD HIP. Its main addition is **paged mixture-of-experts**: the routed experts of a MoE model stay off the GPU and
 stream from disk (the GGUF or an expert pack) into a pool of VRAM slots as the router asks for them. That lets a MoE
 model that does not fit in VRAM run on the GPU.
 
@@ -48,7 +47,7 @@ set MM_RIGEL_GPU_TARGETS=gfx1100          # default; a list such as gfx1100,gfx1
 cargo build --release -p model-mistress --features rigel-engine
 ```
 
-`build.rs` applies `engines/patches/rigel.patch` to the `engines/betelgeuse` submodule (the submodule stays pinned; the
+`build.rs` applies `engines/patches/rigel.patch` to the `engines/rigel` submodule (the submodule stays pinned; the
 patch is skipped when it is already applied), configures it with the HIP SDK's clang, Ninja and Visual Studio's
 libraries, and builds `rigel-server`. The build needs the HIP SDK, CMake, Ninja and Visual Studio's C++ tools. It can
 be combined with `bundled-engine`.
