@@ -81,6 +81,10 @@ pub struct Settings {
     /// Path to `llama-server`. Unset: MM_LLAMA_SERVER, then the one built into this binary, then
     /// `<home>/engines/llama.cpp/`, then PATH.
     pub llama_server: Option<PathBuf>,
+    /// Path to `rigel-server`, which serves the models whose serving profile says `engine = "rigel"` (Rigel: a build
+    /// of the Betelgeuse llama.cpp fork for Windows and AMD GPUs). Unset: MM_RIGEL_SERVER, then the one built into
+    /// this binary (feature `rigel-engine`), then `<home>/engines/rigel/`, then PATH.
+    pub rigel_server: Option<PathBuf>,
     /// Extra folders of .gguf files.
     pub model_dirs: Vec<PathBuf>,
     /// Extra Ollama stores (the folder that holds `manifests` and `blobs`).
@@ -167,6 +171,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             llama_server: None,
+            rigel_server: None,
             model_dirs: vec![],
             ollama_dirs: vec![],
             ollama_discovery: true,
@@ -523,6 +528,8 @@ pub struct Engine {
     llama_version: Mutex<Option<(PathBuf, String)>>,
     /// The llama-server built into this binary (feature `bundled-engine`), once written to disk.
     bundled: Option<PathBuf>,
+    /// The rigel-server built into this binary (feature `rigel-engine`), once written to disk.
+    bundled_rigel: Option<PathBuf>,
     /// LoRA adapters and draft models per model id (see [`Extras`]).
     extras: Mutex<HashMap<String, Extras>>,
     /// The llama.cpp tools (llama-tts, llama-quantize) that take the machine's memory run one at a time per kind.
@@ -561,6 +568,7 @@ impl Engine {
                 .unwrap_or_default(),
             llama_version: Mutex::new(None),
             bundled: bundled::install(&home),
+            bundled_rigel: bundled::install_rigel(&home),
             extras: Mutex::new(load_extras(&home)),
             tool_lock: tokio::sync::Mutex::new(()),
             home,
@@ -703,6 +711,29 @@ impl Engine {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|d| d.join(exe("llama-server")))
+            .find(|p| p.is_file())
+    }
+
+    /// `rigel-server`: the `rigel_server` setting, MM_RIGEL_SERVER, the built-in one, `<home>/engines/rigel/`, PATH.
+    pub fn rigel_server(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.settings.read().rigel_server {
+            return p.is_file().then(|| p.clone());
+        }
+        if let Some(p) = std::env::var_os("MM_RIGEL_SERVER").map(PathBuf::from) {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        if let Some(p) = self.bundled_rigel.as_ref().filter(|p| p.is_file()) {
+            return Some(p.clone());
+        }
+        let own = self.home.join("engines").join("rigel").join(exe("rigel-server"));
+        if own.is_file() {
+            return Some(own);
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|d| d.join(exe("rigel-server")))
             .find(|p| p.is_file())
     }
 
@@ -1182,7 +1213,11 @@ impl Engine {
             .map(|m| m.len())
             .unwrap_or(0);
         let native_moe = entry.native.is_some() && entry.experts().is_some();
+        // Rigel with paging keeps the routed experts out of the model's VRAM (they stream into a slot pool that
+        // `moe_slots` sizes), so the estimate leaves them out as it does for --cpu-moe.
+        let paged = r.flags.is_rigel() && r.flags.moe_direct_io == Some(true);
         let cpu_moe = match (opts.n_cpu_moe, opts.cpu_moe) {
+            _ if paged => true,
             (Some(n), _) if n > 0 => false,
             (_, Some(c)) => c,
             _ => native_moe,
@@ -1390,12 +1425,23 @@ impl Engine {
         resolved
             .validate()
             .map_err(|e| Fail::invalid(format!("{}: {e}", entry.id)))?;
-        let exe = self.llama_server().ok_or_else(|| {
-            Fail::unavailable(
-                "llama-server was not found: set llama_server with config.set, put it in <home>/engines/llama.cpp, \
-                 or on PATH",
-            )
-        })?;
+        let rigel = resolved.flags.is_rigel();
+        let exe = if rigel {
+            self.rigel_server().ok_or_else(|| {
+                Fail::unavailable(format!(
+                    "{}: its profile says engine = \"rigel\", but rigel-server was not found: set rigel_server with \
+                     config.set, put it in <home>/engines/rigel, or build ModelMistress with the rigel-engine feature",
+                    entry.id
+                ))
+            })?
+        } else {
+            self.llama_server().ok_or_else(|| {
+                Fail::unavailable(
+                    "llama-server was not found: set llama_server with config.set, put it in <home>/engines/llama.cpp, \
+                     or on PATH",
+                )
+            })?
+        };
         let s = self.settings();
         let port = free_port().map_err(|e| Fail::new(500, "io", format!("no free port: {e}")))?;
         let key = crate::hub::new_token();
@@ -1441,12 +1487,18 @@ impl Engine {
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(&args)
             .env("LLAMA_API_KEY", &key)
+            .envs(resolved.env())
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(err)
             .kill_on_drop(true);
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
+        }
+        if rigel {
+            if let Some(path) = hip_runtime_path(std::env::var_os("HIP_PATH"), std::env::var_os("PATH")) {
+                cmd.env("PATH", path);
+            }
         }
         no_window(&mut cmd);
         #[cfg(target_os = "linux")]
@@ -1855,6 +1907,21 @@ pub(crate) fn no_window(cmd: &mut tokio::process::Command) {
     let _ = cmd;
 }
 
+/// The PATH a Rigel server starts with: the HIP runtime's `bin` folder first (amdhip64, hipBLAS, rocBLAS and its
+/// kernel library, which a HIP build loads at run time), then the hub's own PATH. None when HIP_PATH is unset: the
+/// runtime must then be on PATH already.
+pub fn hip_runtime_path(
+    hip_path: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    let hip = PathBuf::from(hip_path.filter(|p| !p.is_empty())?);
+    let mut dirs = vec![hip.join("bin")];
+    if let Some(p) = path {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    std::env::join_paths(dirs).ok()
+}
+
 /// The llama.cpp programs built into this binary (feature `bundled-engine`; see build.rs). They are written to
 /// `<home>/engines/bundled/<hash>/` the first time they are needed, so a new ModelMistress brings its own build
 /// and an old one keeps working with its own; folders of other builds are removed.
@@ -1906,6 +1973,43 @@ pub mod bundled {
             }
         }
         Some(dir.join(super::exe("llama-server")))
+    }
+
+    #[cfg(feature = "rigel-engine")]
+    const RIGEL: &[u8] = include_bytes!(env!("MM_BUNDLED_RIGEL"));
+
+    /// The Betelgeuse commit and GPU targets of the built-in Rigel, or None.
+    pub fn rigel_version() -> Option<&'static str> {
+        #[cfg(feature = "rigel-engine")]
+        return Some(env!("MM_BUNDLED_RIGEL_VERSION"));
+        #[cfg(not(feature = "rigel-engine"))]
+        None
+    }
+
+    /// Writes the built-in rigel-server (feature `rigel-engine`) to `<home>/engines/rigel-bundled/<hash>/` if it is
+    /// not there yet, and removes other builds' folders; returns its path.
+    pub fn install_rigel(home: &Path) -> Option<PathBuf> {
+        #[cfg(not(feature = "rigel-engine"))]
+        {
+            let _ = home;
+            None
+        }
+        #[cfg(feature = "rigel-engine")]
+        {
+            let tag = blake3::hash(RIGEL).to_hex()[..16].to_string();
+            let root = home.join("engines").join("rigel-bundled");
+            let path = root.join(&tag).join(super::exe("rigel-server"));
+            if let Err(e) = write_once(&path, RIGEL) {
+                eprintln!("model-mistress: could not write the built-in rigel-server: {e}");
+                return None;
+            }
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for old in rd.flatten().filter(|d| d.file_name() != tag.as_str()) {
+                    let _ = std::fs::remove_dir_all(old.path());
+                }
+            }
+            Some(path)
+        }
     }
 
     fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -2432,6 +2536,50 @@ parallel = 1
                 "0"
             ]
         );
+    }
+
+    #[test]
+    fn rigel_starts_with_the_hip_runtime_first_on_path() {
+        let hub_path = std::env::join_paths([PathBuf::from("first"), PathBuf::from("second")]).unwrap();
+        let p = hip_runtime_path(Some("hip".into()), Some(hub_path)).unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&p).collect();
+        assert_eq!(
+            dirs,
+            [PathBuf::from("hip").join("bin"), "first".into(), "second".into()]
+        );
+        assert_eq!(hip_runtime_path(None, Some("x".into())), None);
+        assert_eq!(hip_runtime_path(Some("".into()), Some("x".into())), None);
+    }
+
+    #[test]
+    fn rigel_server_is_found_in_the_setting_then_the_home_folder() {
+        let d = crate::testing::TestDir::new("mm-rigel");
+        let e = Engine::new(
+            d.clone(),
+            Settings {
+                rigel_server: Some(d.join("no-such-rigel-server")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.rigel_server(),
+            None,
+            "a setting that names a missing file finds nothing"
+        );
+        let own = d.join("engines").join("rigel").join(exe("rigel-server"));
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, b"").unwrap();
+        assert_eq!(
+            e.rigel_server(),
+            None,
+            "the setting wins even when it names a missing file"
+        );
+        let mut s = e.settings();
+        s.rigel_server = None;
+        e.set_settings(s).unwrap();
+        if std::env::var_os("MM_RIGEL_SERVER").is_none() {
+            assert_eq!(e.rigel_server(), Some(own));
+        }
     }
 
     #[tokio::test]

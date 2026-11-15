@@ -777,6 +777,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             json!({"version": VERSION, "pid": std::process::id(), "uptime_s": hub.started.elapsed().as_secs(),
                    "system": system_report(),
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
+                   "rigel_server": e.rigel_server(),
                    "llama_built_in": crate::engine::bundled::version(),
                    "models_known": e.catalog().len(), "loaded": loaded,
                    "config_warnings": e.settings().warnings})
@@ -802,6 +803,11 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 {"id": "llama.cpp", "available": e.llama_server().is_some(), "path": e.llama_server(),
                  "version": e.llama_version().await, "built_in": crate::engine::bundled::version(),
                  "models": e.catalog().len(), "loaded": e.loaded().len()},
+                {"id": "rigel", "available": e.rigel_server().is_some(), "path": e.rigel_server(),
+                 "built_in": crate::engine::bundled::rigel_version(),
+                 "loaded": e.loaded().iter().filter(|m| m.serving().engine == "rigel").count(),
+                 "note": "a build of the Betelgeuse llama.cpp fork for Windows and AMD GPUs; serves the models \
+                          whose serving profile says engine = \"rigel\""},
                 ollama
             ])
         }
@@ -2452,6 +2458,70 @@ unrelated line
         let (_, v) = json_post(&h, "/v1/call/config.get", json!({})).await;
         assert_eq!(v["result"]["config_warnings"].as_array().unwrap().len(), 3, "{v}");
         assert_eq!(v["result"]["profiles"]["tiny"]["ctx_per_slot"], 2048);
+    }
+
+    #[tokio::test]
+    async fn a_rigel_profile_picks_rigel_with_one_slot_and_says_when_it_is_missing() {
+        let home = temp_home();
+        let h = hub_without_tools(&home, &["tiny"]);
+        let mut st = h.engine.settings();
+        st.rigel_server = Some(home.join("no-such-rigel-server"));
+        st.profiles.insert(
+            "tiny".into(),
+            crate::serving::ServeProfile {
+                parallel: Some(4),
+                flags: crate::serving::ServeFlags {
+                    engine: Some("rigel".into()),
+                    moe_direct_io: Some(true),
+                    moe_slots: Some(5000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        h.engine.set_settings(st).unwrap();
+
+        // the engine list names Rigel, and that it is not there
+        let (code, v) = json_post(&h, "/v1/call/backend.list", json!({})).await;
+        assert_eq!(code, 200, "{v}");
+        let rigel = v["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "rigel")
+            .cloned();
+        let rigel = rigel.expect("rigel is listed");
+        assert_eq!(rigel["available"], false, "{v}");
+
+        // what a load would use: Rigel, one slot whatever `parallel` says
+        let (code, v) = json_post(&h, "/v1/call/model.plan", json!({"model": "tiny"})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["result"]["serving"]["engine"], "rigel", "{v}");
+        assert_eq!(v["result"]["serving"]["slots"], 1, "{v}");
+        let args: Vec<&str> = v["result"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["-np", "1"]), "{args:?}");
+        assert!(args.contains(&"--moe-direct-io"), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--moe-slots", "5000"]), "{args:?}");
+
+        // a load says what is missing, and does not fall back to llama.cpp
+        let (code, v) = json_post(&h, "/v1/call/model.load", json!({"model": "tiny"})).await;
+        assert_eq!(code, 503, "{v}");
+        let msg = v.to_string();
+        assert!(msg.contains("rigel-server was not found"), "{v}");
+        assert!(!msg.contains("llama-server was not found"), "{v}");
+
+        // a Rigel option without engine = "rigel" is refused when a load would use it
+        let mut st = h.engine.settings();
+        st.profiles.get_mut("tiny").unwrap().flags.engine = None;
+        h.engine.set_settings(st).unwrap();
+        let (code, v) = json_post(&h, "/v1/call/model.load", json!({"model": "tiny"})).await;
+        assert_eq!(code, 400, "{v}");
+        assert!(v.to_string().contains("is a Rigel option"), "{v}");
     }
 
     #[tokio::test]

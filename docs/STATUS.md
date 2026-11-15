@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-28 at repository commit 3cf92e5. The measurements below were taken on 2026-10-07 on Windows 10 with an
+Updated 2026-10-28 at repository commit 8409cd6. The measurements below were taken on 2026-10-07 on Windows 10 with an
 RX 7900 XTX and the built-in llama.cpp (commit 7fee178, Vulkan), unless a section says otherwise. On 2026-10-28 the
 pipeline's test stage passed (398 tests), and the pipeline's smoke test passed against the built binary.
 
@@ -222,6 +222,17 @@ both and refuses a model that fills the card (unload first).
 Not measured: 32,768 tokens **per slot** (131,072 in all: the estimate is 23.9 GB, over what the card has free next to
 a desktop; use `model.plan` first), the tool-call check on the GPU, and the planner's unload path against real servers
 (it is unit-tested with stand-ins). The tool-call checks ran on the CPU; the chat template is the same on the GPU.
+
+## Rigel (feature `rigel-engine`, engine = "rigel")
+
+Tested on 2026-11-15 on Windows 10 with an RX 7900 XTX and HIP SDK 7.2, using Qwen3-Coder-30B-A3B UD-Q4_K_XL with
+paged experts (`--moe-direct-io --moe-slots 1536`). The library tests cover choosing the engine, the one-slot rule,
+the flags and the PATH. End to end on the same day, a hub built with `--features rigel-engine` did the following:
+- `backend.list` showed the built-in Rigel (`a6b46ade3 (hip gfx1100)`);
+- `model.plan` showed `engine: rigel` with one slot and the `--moe-*` flags;
+- a chat answered correctly, with the 17.7 GB model using 6.1 GB of VRAM (3.5 tok/s on a cold start).
+
+The speed measurements are in [rigel.md](rigel.md).
 
 ## Not done yet
 

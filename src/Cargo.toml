@@ -86,6 +86,9 @@ path = "bin/model-mistress/main.rs"
 default = ["cpu-backend"]
 # Build llama.cpp (engines/llama.cpp) and embed llama-server and llama-bench in the binary (see build.rs).
 bundled-engine = []
+# Build Rigel (engines/betelgeuse with engines/patches/rigel.patch: the Betelgeuse llama.cpp fork for Windows and AMD
+# HIP) and embed rigel-server (see build.rs). Needs the HIP SDK (HIP_PATH) and GPU targets in MM_RIGEL_GPU_TARGETS.
+rigel-engine = []
 cpu-backend = []
 gpu-backend = []
 cuda = []

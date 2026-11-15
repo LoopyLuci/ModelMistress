@@ -61,6 +61,58 @@ pub struct ServeFlags {
     /// A Jinja chat template file to use instead of the one in the GGUF (`--chat-template-file`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_file: Option<PathBuf>,
+    /// The engine that serves the model: "llama.cpp" (the default) or "rigel" (Rigel, a build of the Betelgeuse
+    /// llama.cpp fork for Windows and AMD GPUs, which can page a mixture-of-experts model's experts from disk).
+    /// Rigel serves one request at a time: its loads always get one slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Rigel: keep the routed experts off the GPU and stream them on demand from the GGUF or the expert pack into a
+    /// pool of VRAM slots (`--moe-direct-io`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_direct_io: Option<bool>,
+    /// Rigel: VRAM expert slots in all, shared by the layers (`--moe-slots`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_slots: Option<u32>,
+    /// Rigel: the expert pack folder, with `experts.bin` (`--moe-pack-dir`); stripped bundles need it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_pack_dir: Option<PathBuf>,
+    /// Rigel: a hot-expert profile that seeds the VRAM slots (`--moe-profile`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_profile: Option<PathBuf>,
+    /// Rigel: pinned host memory (MiB) that keeps evicted experts (the `MOE_CACHE_MIB` variable); 0 = off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_cache_mib: Option<u32>,
+}
+
+/// The engines a model can be served by (`engine` in a serving profile).
+pub const ENGINES: [&str; 2] = ["llama.cpp", "rigel"];
+
+impl ServeFlags {
+    /// Serve with Rigel (`engine = "rigel"`).
+    pub fn is_rigel(&self) -> bool {
+        self.engine.as_deref() == Some("rigel")
+    }
+
+    /// The Rigel-only options that are set, by name.
+    pub fn rigel_options_set(&self) -> Vec<&'static str> {
+        let mut v = vec![];
+        if self.moe_direct_io.is_some() {
+            v.push("moe_direct_io");
+        }
+        if self.moe_slots.is_some() {
+            v.push("moe_slots");
+        }
+        if self.moe_pack_dir.is_some() {
+            v.push("moe_pack_dir");
+        }
+        if self.moe_profile.is_some() {
+            v.push("moe_profile");
+        }
+        if self.moe_cache_mib.is_some() {
+            v.push("moe_cache_mib");
+        }
+        v
+    }
 }
 
 impl ServeFlags {
@@ -82,6 +134,12 @@ impl ServeFlags {
                 .chat_template_file
                 .clone()
                 .or_else(|| base.chat_template_file.clone()),
+            engine: self.engine.clone().or_else(|| base.engine.clone()),
+            moe_direct_io: self.moe_direct_io.or(base.moe_direct_io),
+            moe_slots: self.moe_slots.or(base.moe_slots),
+            moe_pack_dir: self.moe_pack_dir.clone().or_else(|| base.moe_pack_dir.clone()),
+            moe_profile: self.moe_profile.clone().or_else(|| base.moe_profile.clone()),
+            moe_cache_mib: self.moe_cache_mib.or(base.moe_cache_mib),
         }
     }
 }
@@ -177,6 +235,14 @@ impl ServeProfile {
                 );
             }
         }
+        if f.engine.as_deref().is_some_and(|e| !ENGINES.contains(&e)) {
+            let e = f.engine.take().unwrap_or_default();
+            drop("engine", format!("\"{e}\" is not one of {}", ENGINES.join(", ")));
+        }
+        if f.moe_slots == Some(0) {
+            f.moe_slots = None;
+            drop("moe_slots", "must be at least 1".into());
+        }
         if self.parallel == Some(0) {
             self.parallel = None;
             drop("parallel", "must be at least 1".into());
@@ -241,6 +307,14 @@ pub fn validate_flags(f: &ServeFlags, parallel: Option<u32>) -> Result<(), Strin
             return Err(format!("flash_attn \"{fa}\" must be \"on\", \"off\" or \"auto\""));
         }
     }
+    if let Some(e) = &f.engine {
+        if !ENGINES.contains(&e.as_str()) {
+            return Err(format!("engine \"{e}\" is not one of {}", ENGINES.join(", ")));
+        }
+    }
+    if f.moe_slots == Some(0) {
+        return Err("moe_slots must be at least 1".into());
+    }
     if parallel == Some(0) {
         return Err("parallel must be at least 1".into());
     }
@@ -291,7 +365,6 @@ impl Resolved {
         let pick = |a: Option<u32>, f: fn(&ServeProfile) -> Option<u32>, d: u32| {
             a.or_else(|| model.and_then(f)).or_else(|| f(all)).unwrap_or(d)
         };
-        let slots = pick(par, |p| p.parallel, legacy.2).max(1);
         let gpu_layers = ngl
             .or_else(|| model.and_then(|p| p.gpu_layers))
             .or(all.gpu_layers)
@@ -301,6 +374,12 @@ impl Resolved {
             merged = merged.over(&m.flags);
         }
         merged = merged.over(&all.flags);
+        // Rigel has one paged context per process: one slot, whatever `parallel` says.
+        let slots = if merged.is_rigel() {
+            1
+        } else {
+            pick(par, |p| p.parallel, legacy.2).max(1)
+        };
         // The strongest layer that sets a context decides; within a layer a per-slot size wins over a total.
         let layers = [
             (ctx, flags.ctx_per_slot),
@@ -338,7 +417,22 @@ impl Resolved {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        validate_flags(&self.flags, Some(self.slots))
+        validate_flags(&self.flags, Some(self.slots))?;
+        // Checked on the merged result: the engine and the Rigel options may come from different layers.
+        if !self.flags.is_rigel() {
+            if let Some(k) = self.flags.rigel_options_set().first() {
+                return Err(format!("{k} is a Rigel option: it needs engine = \"rigel\""));
+            }
+        }
+        Ok(())
+    }
+
+    /// Environment variables for the server process (Rigel's host cache size).
+    pub fn env(&self) -> Vec<(String, String)> {
+        match self.flags.moe_cache_mib {
+            Some(n) if self.flags.is_rigel() => vec![("MOE_CACHE_MIB".into(), n.to_string())],
+            _ => vec![],
+        }
     }
 
     /// The llama-server arguments. `-c`, `-ngl` and `-np` always; the rest only for what is set.
@@ -384,6 +478,20 @@ impl Resolved {
         if let Some(p) = &f.chat_template_file {
             a.extend(["--chat-template-file".into(), p.display().to_string()]);
         }
+        if f.is_rigel() {
+            if f.moe_direct_io == Some(true) {
+                a.push("--moe-direct-io".into());
+            }
+            if let Some(n) = f.moe_slots {
+                a.extend(["--moe-slots".into(), n.to_string()]);
+            }
+            if let Some(p) = &f.moe_pack_dir {
+                a.extend(["--moe-pack-dir".into(), p.display().to_string()]);
+            }
+            if let Some(p) = &f.moe_profile {
+                a.extend(["--moe-profile".into(), p.display().to_string()]);
+            }
+        }
         a
     }
 }
@@ -391,6 +499,8 @@ impl Resolved {
 /// What a loaded model reports about how it is served (`model.loaded`, `/v1/models`).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Serving {
+    /// The engine serving the model: "llama.cpp" or "rigel".
+    pub engine: &'static str,
     /// Context tokens in all, as the server says (`/props`), else as asked.
     pub n_ctx: u64,
     /// What one slot can hold: `n_ctx / slots`, or all of `n_ctx` when the slots share one KV buffer.
@@ -415,6 +525,7 @@ impl Serving {
     pub fn from_resolved(r: &Resolved) -> Serving {
         let unified = r.flags.kv_unified.unwrap_or(false);
         Serving {
+            engine: if r.flags.is_rigel() { "rigel" } else { "llama.cpp" },
             n_ctx: r.ctx_total as u64,
             n_ctx_per_slot: if unified {
                 r.ctx_total as u64
@@ -1035,6 +1146,95 @@ Exiting, please wait...
     }
 
     #[test]
+    fn rigel_gets_one_slot_its_flags_and_its_cache_variable() {
+        let rigel = ServeFlags {
+            engine: Some("rigel".into()),
+            moe_direct_io: Some(true),
+            moe_slots: Some(5000),
+            moe_pack_dir: Some(PathBuf::from("bundle")),
+            moe_profile: Some(PathBuf::from("bundle/profile.bin")),
+            moe_cache_mib: Some(4096),
+            ..Default::default()
+        };
+        // the engine in [serving], the options in the model's profile: they still meet
+        let all = ServeProfile {
+            flags: ServeFlags {
+                engine: Some("rigel".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let model = ServeProfile {
+            parallel: Some(4),
+            ctx_size: Some(8192),
+            flags: ServeFlags {
+                engine: None,
+                ..rigel.clone()
+            },
+            ..Default::default()
+        };
+        let r = Resolved::new(
+            (None, None, None, &ServeFlags::default()),
+            Some(&model),
+            &all,
+            (0, 999, 2),
+        );
+        assert_eq!(r.slots, 1, "Rigel serves one request at a time");
+        r.validate().unwrap();
+        assert_eq!(
+            r.args().join(" "),
+            "-c 8192 -ngl 999 -np 1 --moe-direct-io --moe-slots 5000 --moe-pack-dir bundle --moe-profile bundle/profile.bin"
+        );
+        assert_eq!(r.env(), [("MOE_CACHE_MIB".to_string(), "4096".to_string())]);
+        assert_eq!(Serving::from_resolved(&r).engine, "rigel");
+
+        // llama.cpp: no Rigel flag, no variable, and a Rigel option is an error
+        let plain = Resolved::new(
+            (None, None, Some(3), &ServeFlags::default()),
+            None,
+            &ServeProfile::default(),
+            (0, 999, 2),
+        );
+        assert_eq!(plain.slots, 3);
+        assert!(plain.env().is_empty());
+        assert_eq!(Serving::from_resolved(&plain).engine, "llama.cpp");
+        let stray = ServeFlags {
+            moe_slots: Some(10),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &stray), None, &ServeProfile::default(), (0, 999, 1));
+        let e = r.validate().unwrap_err();
+        assert!(e.contains("moe_slots is a Rigel option"), "{e}");
+        assert!(!r.args().iter().any(|a| a.starts_with("--moe")));
+    }
+
+    #[test]
+    fn an_unknown_engine_is_refused_and_dropped_with_a_warning() {
+        let f = ServeFlags {
+            engine: Some("vllm".into()),
+            ..Default::default()
+        };
+        assert!(validate_flags(&f, None).unwrap_err().contains("engine \"vllm\""));
+        let zero = ServeFlags {
+            engine: Some("rigel".into()),
+            moe_slots: Some(0),
+            ..Default::default()
+        };
+        assert!(validate_flags(&zero, None).unwrap_err().contains("moe_slots"));
+        let table: toml::Table = toml::from_str("engine = \"vllm\"\nmoe_slots = 0\nctx_size = 4096").unwrap();
+        let (p, w) = ServeProfile::lenient(&table, "[profiles.x]");
+        assert_eq!(p.flags.engine, None);
+        assert_eq!(p.flags.moe_slots, None);
+        assert_eq!(p.ctx_size, Some(4096));
+        assert_eq!(w.len(), 2, "{w:?}");
+        let table: toml::Table = toml::from_str("engine = \"rigel\"\nmoe_direct_io = true").unwrap();
+        let (p, w) = ServeProfile::lenient(&table, "[profiles.x]");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(p.flags.is_rigel());
+        assert_eq!(p.flags.moe_direct_io, Some(true));
+    }
+
+    #[test]
     fn every_flag_is_built() {
         let f = ServeFlags {
             ctx_per_slot: None,
@@ -1049,6 +1249,12 @@ Exiting, please wait...
             ubatch_size: Some(1024),
             jinja: Some(true),
             chat_template_file: None,
+            engine: None,
+            moe_direct_io: None,
+            moe_slots: None,
+            moe_pack_dir: None,
+            moe_profile: None,
+            moe_cache_mib: None,
         };
         let r = Resolved::new(
             (Some(65536), Some(20), Some(3), &f),

@@ -22,6 +22,9 @@ fn main() {
             "cargo:warning=frontend/dist is missing: /ui will say the dashboard is not built (npm ci && npm run build)"
         );
     }
+    if std::env::var_os("CARGO_FEATURE_RIGEL_ENGINE").is_some() {
+        build_rigel();
+    }
     if std::env::var_os("CARGO_FEATURE_BUNDLED_ENGINE").is_none() {
         return;
     }
@@ -144,6 +147,123 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=MM_BUNDLED_SD_VERSION={sd_version}");
+}
+
+/// The GPU targets Rigel is built for: MM_RIGEL_GPU_TARGETS (comma or semicolon separated, e.g. `gfx1100,gfx1201`),
+/// default gfx1100 (RX 7900 series). Each must look like an AMD target name.
+fn rigel_gpu_targets(var: Option<&str>) -> Result<String, String> {
+    let raw = var.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("gfx1100");
+    let list: Vec<&str> = raw.split([',', ';']).map(str::trim).filter(|t| !t.is_empty()).collect();
+    match list
+        .iter()
+        .find(|t| !(t.starts_with("gfx") && t[3..].chars().all(|c| c.is_ascii_alphanumeric())))
+    {
+        Some(bad) => Err(format!(
+            "MM_RIGEL_GPU_TARGETS: `{bad}` is not an AMD GPU target (like gfx1100)"
+        )),
+        None => Ok(list.join(";")),
+    }
+}
+
+/// With the `rigel-engine` feature: builds Rigel (engines/betelgeuse with engines/patches/rigel.patch) with the HIP
+/// SDK's clang and embeds its `rigel-server` (MM_BUNDLED_RIGEL). Needs HIP_PATH, CMake, Ninja and Visual Studio's
+/// libraries; MM_RIGEL_GPU_TARGETS picks the GPUs.
+fn build_rigel() {
+    for v in ["HIP_PATH", "MM_RIGEL_GPU_TARGETS", "MM_CMAKE_ARGS"] {
+        println!("cargo:rerun-if-env-changed={v}");
+    }
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let engines = manifest.parent().unwrap().join("engines");
+    let src = engines.join("betelgeuse");
+    if !src.join("CMakeLists.txt").is_file() {
+        panic!("rigel-engine: engines/betelgeuse is empty; run `git submodule update --init --recursive engines/betelgeuse`");
+    }
+    let patch = engines.join("patches").join("rigel.patch");
+    println!("cargo:rerun-if-changed={}", patch.display());
+    apply_patch(&src, &patch);
+    let hip = std::env::var("HIP_PATH")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("rigel-engine: HIP_PATH is not set; install the AMD HIP SDK"));
+    let clang = |n: &str| {
+        hip.join("bin").join(if cfg!(windows) {
+            format!("{n}.exe")
+        } else {
+            n.to_string()
+        })
+    };
+    let targets =
+        rigel_gpu_targets(std::env::var("MM_RIGEL_GPU_TARGETS").ok().as_deref()).unwrap_or_else(|e| panic!("{e}"));
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let build = out.join("rigel-build");
+    let mut cfg: Vec<String> = vec![
+        "-S".into(),
+        src.display().to_string(),
+        "-B".into(),
+        build.display().to_string(),
+        "-G".into(),
+        "Ninja".into(),
+        "-DCMAKE_BUILD_TYPE=Release".into(),
+        "-DBUILD_SHARED_LIBS=OFF".into(),
+        format!(
+            "-DCMAKE_C_COMPILER={}",
+            clang("clang").display().to_string().replace('\\', "/")
+        ),
+        format!(
+            "-DCMAKE_CXX_COMPILER={}",
+            clang("clang++").display().to_string().replace('\\', "/")
+        ),
+        "-DGGML_HIP=ON".into(),
+        format!("-DCMAKE_PREFIX_PATH={}", hip.display().to_string().replace('\\', "/")),
+        format!("-DGPU_TARGETS={targets}"),
+        "-DGGML_NATIVE=OFF".into(),
+        "-DGGML_OPENMP=OFF".into(),
+        "-DLLAMA_BUILD_TESTS=OFF".into(),
+        "-DLLAMA_BUILD_EXAMPLES=OFF".into(),
+        "-DLLAMA_BUILD_TOOLS=ON".into(),
+        "-DLLAMA_BUILD_SERVER=ON".into(),
+        "-DLLAMA_OPENSSL=OFF".into(),
+        "-DLLAMA_CURL=OFF".into(),
+        "-DLLAMA_USE_PREBUILT_UI=OFF".into(),
+        "-DLLAMA_BUILD_UI=OFF".into(),
+    ];
+    if let Ok(extra) = std::env::var("MM_CMAKE_ARGS") {
+        cfg.extend(extra.split_whitespace().map(String::from));
+    }
+    // clang on Windows links against Visual Studio's libraries: use its environment (the newest Visual Studio).
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![];
+    let target = std::env::var("TARGET").unwrap();
+    if target.contains("msvc") {
+        let cl = cc::windows_registry::find_tool(&target, "cl.exe")
+            .unwrap_or_else(|| panic!("rigel-engine: Visual Studio's C++ tools were not found"));
+        env.extend(cl.env().iter().cloned());
+    }
+    run(
+        Command::new("cmake").args(&cfg).envs(env.iter().cloned()),
+        "configure Rigel",
+    );
+    run(
+        Command::new("cmake").envs(env.iter().cloned()).args([
+            "--build",
+            &build.display().to_string(),
+            "--config",
+            "Release",
+            "--target",
+            "llama-server",
+        ]),
+        "build Rigel",
+    );
+    let exe = find_exe(&build, "rigel-server").unwrap_or_else(|| panic!("rigel-engine: rigel-server was not built"));
+    println!("cargo:rustc-env=MM_BUNDLED_RIGEL={}", exe.display());
+    let commit = Command::new("git")
+        .args(["-C", &src.display().to_string(), "rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=MM_BUNDLED_RIGEL_VERSION={commit} (hip {targets})");
 }
 
 /// The deepest file stable-diffusion.cpp's nested vulkan-shaders-gen sub-build writes, below OUT_DIR (the part of
