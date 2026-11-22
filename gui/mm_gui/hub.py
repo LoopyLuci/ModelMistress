@@ -150,6 +150,42 @@ class Hub:
                     on_text(text)
         return "".join(pieces)
 
+    # ---- Misty, the agent inside the hub (misty.* operations; docs/misty/DESIGN.md) ----------------------------------
+
+    def misty_status(self) -> dict:
+        return self.call("misty.status")
+
+    def misty_start(self, args: dict) -> dict:
+        """Start a run and return at once: {"run": id, "session": id}."""
+        return self.call("misty.run.start", args)
+
+    def misty_page(self, run: str, start: int = 0, wait_ms: int = 0) -> dict:
+        """The events of a run after the first `start`, waiting up to `wait_ms` for new ones."""
+        return self.call("misty.run.get", {"run": run, "from": start, "wait_ms": wait_ms}, timeout=wait_ms / 1000 + 15)
+
+    def misty_cancel(self, run: str) -> Any:
+        return self.call("misty.run.cancel", {"run": run})
+
+    def misty_approve(self, approval: str, allow: bool) -> Any:
+        return self.call("misty.approve", {"approval": approval, "allow": allow})
+
+    def misty_run(self, args: dict, on_page: Callable[[dict], None], cancel: threading.Event | None = None) -> dict:
+        """Start a run and follow it to its end. `on_page` gets {"start": the start reply} first, then each page of
+        events ({"events", "pending", "done", ...}). Setting `cancel` asks the hub to stop the run; the last events
+        (the stop itself) still arrive. Returns the last page."""
+        started = self.misty_start(args)
+        on_page({"start": started})
+        run, start, stopped, page = started["run"], 0, False, {}
+        while True:
+            if cancel is not None and cancel.is_set() and not stopped:
+                stopped = True
+                self.misty_cancel(run)
+            page = self.misty_page(run, start, 500 if stopped else 2000)  # short waits keep Stop quick to act on
+            start = page.get("next", start)
+            on_page(page)
+            if page.get("done"):
+                return page
+
     def _open(self, method: str, path: str, body: Any = None, timeout: float | None = None):
         headers = {"Accept": "application/json"}
         data = None

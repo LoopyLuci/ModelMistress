@@ -64,7 +64,8 @@ whisper-rs = { version = "0.16", optional = true }
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3"] }
 # Image recognition (feature `vision`): ONNX Runtime for the models, the image crate for PNG and JPEG.
 ort = { version = "=2.0.0-rc.13", optional = true }
-image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+# Decodes the pictures Misty hands to Mirage (always built) and the vision feature's inputs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [build-dependencies]
 cc = "1"    # finds MSVC for the bundled llama.cpp build (build.rs)
@@ -99,5 +100,5 @@ rocm = ["gpu-backend"]
 whisper = ["whisper-rs", "symphonia"]
 # Built-in image recognition: POST /v1/vision/classify, /detect and /embed through ONNX Runtime (downloads or finds its
 # runtime library at build time; see docs/vision.md).
-vision = ["ort", "image"]
+vision = ["ort"]
 otel = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry"]

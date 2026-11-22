@@ -85,6 +85,11 @@ pub struct Settings {
     /// of a llama.cpp fork with paged MoE, for Windows and AMD GPUs). Unset: MM_RIGEL_SERVER, then the one built into
     /// this binary (feature `rigel-engine`), then `<home>/engines/rigel/`, then PATH.
     pub rigel_server: Option<PathBuf>,
+    /// Path to the Prism `llama-server` (PrismML's llama.cpp fork), which serves the models whose serving profile says
+    /// `engine = "prism"`: it runs every ternary Bonsai packing (PTQ1_0, PQ2_0, Q2_0). Unset: MM_PRISM_SERVER, then
+    /// `<home>/engines/prism/` (where `model-mistress misty setup` puts it), then PATH is not searched (the name would
+    /// be the stock server's).
+    pub prism_server: Option<PathBuf>,
     /// Extra folders of .gguf files.
     pub model_dirs: Vec<PathBuf>,
     /// Extra Ollama stores (the folder that holds `manifests` and `blobs`).
@@ -130,6 +135,10 @@ pub struct Settings {
     /// request wait in the server's queue. Off by default: the request waits, as it always did. The slot is checked with
     /// `GET /slots?fail_on_no_slot=1`, so a slot that frees up between that check and the request is still queued.
     pub fail_fast_busy: bool,
+    /// Windows only: a hub that was started at below-normal or idle priority (a Scheduled Task's default is below
+    /// normal) raises itself to normal priority, so the model servers it starts after that inherit normal priority
+    /// too. Off by default: a hub started low stays low. It never goes above normal and never lowers a priority.
+    pub raise_priority: bool,
     /// Let requests from this machine (the peer address is 127.0.0.1 or ::1) call the hub without a token, so
     /// Ollama clients that send no Authorization header work. Off by default; see the README.
     pub allow_loopback_no_token: bool,
@@ -172,6 +181,7 @@ impl Default for Settings {
         Self {
             llama_server: None,
             rigel_server: None,
+            prism_server: None,
             model_dirs: vec![],
             ollama_dirs: vec![],
             ollama_discovery: true,
@@ -191,6 +201,7 @@ impl Default for Settings {
             idle_unload_s: 0,
             max_loaded_embedding: 1,
             fail_fast_busy: false,
+            raise_priority: false,
             allow_loopback_no_token: false,
             default_model: None,
             extra_args: vec![],
@@ -555,6 +566,9 @@ fn exe(name: &str) -> String {
 
 impl Engine {
     pub fn new(home: PathBuf, settings: Settings) -> Arc<Self> {
+        if settings.raise_priority {
+            raise_to_normal_priority();
+        }
         let e = Arc::new(Self {
             settings: RwLock::new(settings),
             catalog: RwLock::new(vec![]),
@@ -588,6 +602,9 @@ impl Engine {
         let mut s = s;
         s.warnings.clear(); // what was saved is valid
         s.save(&self.home)?;
+        if s.raise_priority {
+            raise_to_normal_priority(); // turned on while the hub runs: the next model server starts at normal
+        }
         *self.settings.write() = s;
         *self.llama_version.lock() = None;
         self.refresh();
@@ -734,6 +751,29 @@ impl Engine {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|d| d.join(exe("rigel-server")))
+            .find(|p| p.is_file())
+    }
+
+    /// The Prism `llama-server`: the `prism_server` setting, MM_PRISM_SERVER, then `<home>/engines/prism/` (the zip's
+    /// files may sit in that folder or one level down).
+    pub fn prism_server(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.settings.read().prism_server {
+            return p.is_file().then(|| p.clone());
+        }
+        if let Some(p) = std::env::var_os("MM_PRISM_SERVER").map(PathBuf::from) {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let base = self.home.join("engines").join("prism");
+        let direct = base.join(exe("llama-server"));
+        if direct.is_file() {
+            return Some(direct);
+        }
+        std::fs::read_dir(&base)
+            .ok()?
+            .flatten()
+            .map(|e| e.path().join(exe("llama-server")))
             .find(|p| p.is_file())
     }
 
@@ -1174,12 +1214,18 @@ impl Engine {
 
     /// The options a load of `entry` with `opts` ends up with (see [`serving`]).
     pub fn resolve_serving(&self, s: &Settings, entry: &ModelEntry, opts: &LoadOpts) -> Resolved {
-        Resolved::new(
+        let mut r = Resolved::new(
             (opts.ctx_size, opts.gpu_layers, opts.parallel, &opts.serve),
             s.profile_for(&entry.id),
             &s.serving,
             (s.ctx_size, s.gpu_layers, s.parallel),
-        )
+        );
+        // A ternary Bonsai file is served by the Prism build when it is installed, unless the profile names an engine:
+        // that build runs every packing, and the pinned llama.cpp may not run any correctly.
+        if r.flags.engine.is_none() && crate::misty::roster::pack_of(entry).is_some() && self.prism_server().is_some() {
+            r.flags.engine = Some("prism".into());
+        }
+        r
     }
 
     /// What a model would be served with if autoload loaded it now, for `/v1/models`: the profile's context window
@@ -1426,7 +1472,35 @@ impl Engine {
             .validate()
             .map_err(|e| Fail::invalid(format!("{}: {e}", entry.id)))?;
         let rigel = resolved.flags.is_rigel();
-        let exe = if rigel {
+        if !resolved.flags.is_prism() && !rigel {
+            // ternary weights on a llama.cpp that predates their kernels load without an error and answer wrongly
+            if let Some(pack) = crate::misty::roster::pack_of(entry) {
+                let stock_ok = pack == "Q2_0"
+                    && self
+                        .llama_version()
+                        .await
+                        .and_then(|v| crate::misty::parse_build(&v))
+                        .is_some_and(|b| b >= crate::misty::STOCK_Q2_BUILD);
+                if !stock_ok {
+                    return Err(Fail::new(
+                        409,
+                        "engine_cannot_run",
+                        format!(
+                            "{}: this {pack} file needs the PrismML llama.cpp build; the llama.cpp ModelMistress uses is older than                              the kernels these weights need and would answer wrongly without any warning. Install it with                              `model-mistress misty setup --install prism`",
+                            entry.id
+                        ),
+                    ));
+                }
+            }
+        }
+        let exe = if resolved.flags.is_prism() {
+            self.prism_server().ok_or_else(|| {
+                Fail::unavailable(format!(
+                    "{}: its profile says engine = \"prism\", but the Prism llama-server was not found: run                      `model-mistress misty setup`, or set prism_server with config.set",
+                    entry.id
+                ))
+            })?
+        } else if rigel {
             self.rigel_server().ok_or_else(|| {
                 Fail::unavailable(format!(
                     "{}: its profile says engine = \"rigel\", but rigel-server was not found: set rigel_server with \
@@ -1898,6 +1972,35 @@ pub fn tail(path: &Path, lines: usize) -> String {
     v[v.len().saturating_sub(lines)..].join("\n")
 }
 
+/// Whether a Windows priority class is one the `raise_priority` setting lifts to normal: idle and below normal only.
+/// Normal, above normal, high and real-time are left alone, and so is a class this does not know.
+#[cfg(windows)]
+fn priority_class_is_low(class: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS};
+    class == IDLE_PRIORITY_CLASS || class == BELOW_NORMAL_PRIORITY_CLASS
+}
+
+/// Lift this process from idle or below-normal priority to normal, so the model servers it starts next inherit
+/// normal priority (a Windows child process takes the low class of its parent). Returns true when it changed the
+/// class. It does nothing on other systems, where a process may not raise its own priority without extra rights.
+pub(crate) fn raise_to_normal_priority() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, SetPriorityClass, NORMAL_PRIORITY_CLASS,
+        };
+        // SAFETY: GetCurrentProcess returns a pseudo handle for this process that needs no closing; GetPriorityClass
+        // and SetPriorityClass only read and set this process's own priority class.
+        unsafe {
+            let me = GetCurrentProcess();
+            if priority_class_is_low(GetPriorityClass(me)) && SetPriorityClass(me, NORMAL_PRIORITY_CLASS) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn no_window(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
@@ -2070,6 +2173,47 @@ mod job {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raise_priority_is_off_by_default_and_read_from_config_toml() {
+        assert!(!Settings::default().raise_priority);
+        let d = crate::testing::temp_home();
+        std::fs::write(d.join("config.toml"), "raise_priority = true\n").unwrap();
+        assert!(Settings::load(&d).unwrap().raise_priority);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_idle_and_below_normal_are_raised() {
+        use windows_sys::Win32::System::Threading::*;
+        assert!(priority_class_is_low(IDLE_PRIORITY_CLASS));
+        assert!(priority_class_is_low(BELOW_NORMAL_PRIORITY_CLASS));
+        for class in [
+            NORMAL_PRIORITY_CLASS,
+            ABOVE_NORMAL_PRIORITY_CLASS,
+            HIGH_PRIORITY_CLASS,
+            REALTIME_PRIORITY_CLASS,
+            0,
+        ] {
+            assert!(!priority_class_is_low(class), "{class:#x}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raising_a_below_normal_process_makes_it_normal_and_a_second_call_does_nothing() {
+        use windows_sys::Win32::System::Threading::*;
+        // SAFETY: only this process's own priority class is read and set, and it is put back at the end.
+        unsafe {
+            let me = GetCurrentProcess();
+            let before = GetPriorityClass(me);
+            SetPriorityClass(me, BELOW_NORMAL_PRIORITY_CLASS);
+            assert!(raise_to_normal_priority());
+            assert_eq!(GetPriorityClass(me), NORMAL_PRIORITY_CLASS);
+            assert!(!raise_to_normal_priority(), "already normal: nothing to change");
+            SetPriorityClass(me, before);
+        }
+    }
+
     #[tokio::test]
     async fn an_embedding_model_does_not_evict_the_chat_model() {
         let home = crate::testing::temp_home();

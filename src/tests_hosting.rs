@@ -281,7 +281,19 @@ async fn the_allow_list_limits_the_models_a_key_can_use_and_see() {
         .send()
         .await
         .unwrap();
-    assert_eq!(ids(all.json().await.unwrap()), ["alpha", "beta", "gamma"]);
+    // the owner also sees Misty, the agent, under her four names
+    assert_eq!(
+        ids(all.json().await.unwrap()),
+        [
+            "alpha",
+            "beta",
+            "gamma",
+            "misty",
+            "misty-deep",
+            "misty-fast",
+            "misty-main"
+        ]
+    );
     // the owner may use any
     assert_eq!(text_of(r.chat(TOKEN, "beta").send().await.unwrap()).await, "B");
 }
@@ -454,4 +466,76 @@ async fn over_the_network_only_peer_keys_work() {
     assert_eq!(ask(TOKEN.into(), "127.0.0.1:4000").await, 200);
     assert_eq!(ask(TOKEN.into(), "10.1.2.3:4000").await, 403);
     assert_eq!(ask(key, "10.1.2.3:4000").await, 200);
+}
+
+#[tokio::test]
+async fn misty_reaches_a_peer_only_when_its_key_names_her_and_then_without_tools() {
+    use crate::misty::agent::tests::Scripted;
+    let r = rig(&["qwen3.5-2b-test"]).await;
+    let misty = crate::misty::Misty::get(&r.hub).unwrap();
+    let llm = Arc::new(Scripted::default());
+    misty.set_llm(llm.clone());
+    let ids = |v: Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let models = |key: String| {
+        let (http, url) = (r.http.clone(), r.url.clone());
+        async move {
+            ids(http
+                .get(format!("{url}/v1/models"))
+                .bearer_auth(key)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap())
+        }
+    };
+
+    // a key with no list reaches every model, but not the agent
+    let open = r.key(json!({"peer": "open"})).await;
+    assert!(!models(open.clone()).await.iter().any(|m| m.starts_with("misty")));
+    let refused = r.chat(&open, "misty").send().await.unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"]["code"],
+        "model_not_allowed"
+    );
+
+    // a key that names her sees her and gets an answer, with no tools offered
+    let named = r.key(json!({"peer": "named", "models": ["misty"]})).await;
+    assert_eq!(models(named.clone()).await, ["misty"]);
+    llm.say("Hello from Misty.");
+    assert_eq!(
+        text_of(r.chat(&named, "misty").send().await.unwrap()).await,
+        "Hello from Misty."
+    );
+    {
+        let seen = llm.seen.lock();
+        assert!(
+            seen[0].1.get("tools").is_none(),
+            "a peer's request carries no tools: {}",
+            seen[0].1
+        );
+        assert!(!seen[0].1["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Retrieved documents"));
+    }
+    // the owner's control API stays out of reach
+    let denied = r
+        .http
+        .post(format!("{}/v1/misty/ask", r.url))
+        .bearer_auth(&named)
+        .json(&json!({"input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
 }

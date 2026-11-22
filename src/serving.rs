@@ -85,12 +85,17 @@ pub struct ServeFlags {
 }
 
 /// The engines a model can be served by (`engine` in a serving profile).
-pub const ENGINES: [&str; 2] = ["llama.cpp", "rigel"];
+pub const ENGINES: [&str; 3] = ["llama.cpp", "rigel", "prism"];
 
 impl ServeFlags {
     /// Serve with Rigel (`engine = "rigel"`).
     pub fn is_rigel(&self) -> bool {
         self.engine.as_deref() == Some("rigel")
+    }
+
+    /// Serve with the Prism llama-server (`engine = "prism"`).
+    pub fn is_prism(&self) -> bool {
+        self.engine.as_deref() == Some("prism")
     }
 
     /// The Rigel-only options that are set, by name.
@@ -525,7 +530,13 @@ impl Serving {
     pub fn from_resolved(r: &Resolved) -> Serving {
         let unified = r.flags.kv_unified.unwrap_or(false);
         Serving {
-            engine: if r.flags.is_rigel() { "rigel" } else { "llama.cpp" },
+            engine: if r.flags.is_rigel() {
+                "rigel"
+            } else if r.flags.is_prism() {
+                "prism"
+            } else {
+                "llama.cpp"
+            },
             n_ctx: r.ctx_total as u64,
             n_ctx_per_slot: if unified {
                 r.ctx_total as u64

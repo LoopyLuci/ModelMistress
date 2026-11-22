@@ -53,6 +53,12 @@ runs on its own.
 - **Its own models, in progress.** Dusty (Qwen3.5-4B turned into a mixture of experts whose experts come from Knowledge
   Modules) and Misty (trained from scratch), with a training system ("the Forge"), consolidation of what a KM does
   well into the weights, and gated self-training ([docs/native/architecture.md](docs/native/architecture.md)).
+- **Misty, an agent that runs on a CPU.** She routes each request to the smallest model that can answer it (Ternary Bonsai 2
+  2B, 9B and 27B, or any chat model you have), searches your documents and cites them, uses tools under a policy you set
+  (reading is automatic, writing asks, commands and the network are off), and can listen (Whistle) and look (Mirage)
+  through the Cactus runtime. Use her from the CLI (`model-mistress misty`), the dashboard and desktop app, the Qt window, an
+  OpenAI client (model `misty`), MCP and ABP. See [docs/misty/USER_GUIDE.md](docs/misty/USER_GUIDE.md); the first step
+  is `model-mistress misty setup`. Not yet run against real Bonsai or Cactus files: the guide says what is tested.
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 - **All-in-one item listing & sales platform** — **ItemForge** (`itemforge/`): auto-organize photos into item folders,

@@ -234,6 +234,49 @@ the flags and the PATH. End to end on the same day, a hub built with `--features
 
 The speed measurements are in [rigel.md](rigel.md).
 
+## Misty (`src/misty`, `engine = "prism"`)
+
+Written and first run on 2026-11-21. Two kinds of evidence.
+
+Unit and integration tests with scripted stand-ins for the language models and the Cactus runtime:
+`cargo test --lib -p model-mistress misty::` (95 tests; the whole library suite, 502 tests, passes), clippy with
+warnings denied and `cargo fmt --check`. They cover the router, the agent loop (tools, approvals, retries, citations, cancellation),
+retrieval, the file, secret and web guards, pipelines, the operations, the REST, SSE and OpenAI surfaces, the peer rules,
+the setup planner, the ternary-engine guard and the CLI. The ABP client has 17 tests in its own repository.
+
+A real run on Windows 10 x64, Ryzen 9 5900X, with a scratch home and a second hub on its own port (the owner's running hub
+was not touched): `misty setup --install default` downloaded the Prism engine (build 12128), the Cactus library, Needle3,
+Whistle, Mirage and Bonsai 2 2B and 9B (`PQ2_0`), each checked against its pinned size and SHA-256; `misty doctor` passed;
+`misty bench`, retrieval with a correct citation, tool calls (Needle chose, the policy held, a write was refused),
+a spoken question (Whistle), a question about a picture (Mirage), the `voice-note` pipeline, the OpenAI route (plain and
+streamed, `tools` refused) and ABP's client module all worked against that hub. The 4B file was downloaded and measured
+(and answered one question as `main`). Speeds are in the user guide. That run found eleven defects, all fixed and covered
+by tests (listed in the changelog).
+
+A second client, NLP-CLI (2026-11-21, same machine, scratch hub on its own port): its command line, shell, service
+protocol and conversation fallback called `misty.status` and `misty.ask` through `model-mistress call`, with
+`approvals: deny`. A write attempted through her was refused and created no file. That run found a twelfth defect, in
+the router: sums were not offered the calculator (see the changelog). It is fixed and tested; the whole library suite
+passes (502 tests, run with `--test-threads=6` and no hub running; under a running hub the timing-sensitive factory
+tests fail from CPU contention, as before).
+
+Not done or not verified:
+- Bonsai `Q2_0` and `PTQ1_0` packings and other platforms' Cactus libraries. The 27B file (`deep`) was only partly
+  downloaded (19%, resumable) and never run, so the `deep` role, its thinking mode and the escalation up to it have been
+  tested with stand-ins only. No other CPU has been tried; `misty bench` measures yours.
+- Needle's accuracy is moderate: with fifteen tools it picked the right one for 15 of 21 test requests, and never called a
+  tool for the six that needed none. It is a shortcut, not the decider, and only tools that read run on its word.
+- Mirage returned a degenerate description of a plain grey square (repeated words); on a picture of shapes and a word it
+  was right. Whistle misspelled one name ("Valdes" for "Valdez") in synthesized speech. Real recordings were not tried.
+- The Vue pages (`frontend/src/views/Misty*.vue`) pass `npm run check` (vue-tsc, 26 Vitest tests, build; 2026-11-22), the
+  hub serves them at `/ui`, and the desktop app starts and attaches to a running hub. Nobody has opened the Misty page
+  itself in either (the dashboard asks for the owner token). The Qt page's tests are written but PySide6 is not installed
+  here. The ABP dashboard and CLI were not
+  run (the CLI needs the dashboard); only the client module under them was. The full `cargo test` suite passes with
+  `--test-threads=4`; the factory tests are timing-sensitive under full parallelism on this machine (unchanged by this work).
+- The bundled llama.cpp is still b11272. Updating it to b11556 or later would let stock llama.cpp run `Q2_0` Bonsai files
+  without Prism; that changes the engine for every model and needs `mm-routing.patch` re-checked, so it is separate.
+
 ## Not done yet
 
 - A single model file is loaded for one use at a time (llama.cpp serves chat, embeddings or reranking per server); a chat model and a separate embedding model do load together (`max_loaded` / `max_loaded_embedding`).

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mm_gui.app import Window  # noqa: E402
 from mm_gui.hub import Hub, HubError  # noqa: E402
-from mm_gui.pages import ChatPage, ModelsPage, SettingsPage, StatusPage  # noqa: E402
+from mm_gui.pages import ChatPage, MistyPage, ModelsPage, SettingsPage, StatusPage  # noqa: E402
 from mm_gui.prefs import Appearance, Preferences  # noqa: E402
 
 
@@ -133,6 +133,150 @@ def test_chat_shows_a_model_s_markup_as_text(app):
     page.send()
 
     wait_for(app, lambda: page._cancel is None and page.messages[-1]["content"])
+    assert "<img" in page.transcript.toPlainText()
+
+
+class MistyFake(FakeHub):
+    """A hub whose Misty answers from a script: `pages` are the pages misty.run.get returns, in order."""
+
+    def __init__(self, pages: list[dict], status: dict | None = None):
+        super().__init__()
+        self.pages = list(pages)
+        self.misty_calls: list[tuple] = []
+        self.status_reply = status or {
+            "ready": True,
+            "roster": [{"role": "fast", "model": "bonsai-2b", "status": "ready"},
+                       {"role": "main", "model": "bonsai-9b", "status": "ready"},
+                       {"role": "deep", "model": None, "status": "missing"}],
+            "next": [],
+        }
+
+    def misty_status(self):
+        return self.status_reply
+
+    def misty_start(self, args):
+        self.misty_calls.append(("start", dict(args)))
+        return {"run": "r1", "session": "s1"}
+
+    def misty_page(self, run, start=0, wait_ms=0):
+        self.misty_calls.append(("page", run, start))
+        return self.pages.pop(0) if self.pages else {"events": [], "next": start, "done": True, "pending": []}
+
+    def misty_cancel(self, run):
+        self.misty_calls.append(("cancel", run))
+        return {"run": run, "cancelled": True}
+
+    def misty_approve(self, approval, allow):
+        self.misty_calls.append(("approve", approval, allow))
+        return {"approval": approval, "allowed": allow}
+
+
+def test_misty_page_says_who_is_ready(app):
+    page = MistyPage()
+    page.attach(MistyFake([]))
+
+    wait_for(app, lambda: page.ready.text().startswith("Ready"))
+    assert "fast = bonsai-2b" in page.ready.text() and "main = bonsai-9b" in page.ready.text()
+    assert "deep" not in page.ready.text()
+
+
+def test_misty_page_says_what_to_do_when_nothing_is_ready(app):
+    page = MistyPage()
+    page.attach(MistyFake([], {"ready": False, "roster": [], "next": ["no language model is ready: run `model-mistress misty setup`"]}))
+
+    wait_for(app, lambda: page.ready.text().startswith("Not ready"))
+    assert "misty setup" in page.ready.text()
+
+
+def test_misty_answers_in_the_conversation_and_keeps_the_session(app):
+    hub = MistyFake([
+        {"events": [{"type": "route", "role": "fast"}, {"type": "model", "role": "fast", "model": "bonsai-2b"},
+                    {"type": "token", "text": "Hel"}, {"type": "token", "text": "lo"}], "next": 4, "done": False, "pending": []},
+        {"events": [{"type": "final", "status": "done", "text": "Hello", "role": "fast", "citations": [{"n": 1, "source": "notes/a.md"}]}],
+         "next": 5, "done": True, "pending": []},
+    ])
+    page = MistyPage()
+    page.attach(hub)
+    page.role.setCurrentIndex(1)  # fast
+    page.input.setPlainText("Hi")
+    page.send()
+
+    wait_for(app, lambda: page._cancel is None and page.turns and page.turns[-1]["text"] == "Hello")
+    assert page.session == "s1"
+    assert page.turns[-1]["cites"] == [{"n": 1, "source": "notes/a.md"}]
+    start = [c for c in hub.misty_calls if c[0] == "start"][0][1]
+    assert start == {"input": "Hi", "approvals": "ask", "new_session": True, "role": "fast"}
+    assert "Hello" in page.transcript.toPlainText() and "notes/a.md" in page.transcript.toPlainText()
+
+    page.input.setPlainText("again")
+    hub.pages = [{"events": [{"type": "final", "text": "Again", "status": "done"}], "next": 1, "done": True, "pending": []}]
+    page.send()
+    wait_for(app, lambda: page._cancel is None and len(page.turns) == 2 and page.turns[-1]["text"] == "Again")
+    second = [c for c in hub.misty_calls if c[0] == "start"][1][1]
+    assert second["session"] == "s1" and "new_session" not in second
+
+
+def test_misty_waits_for_the_owner_before_a_tool_that_changes_something(app, monkeypatch):
+    approval = {"approval": "ap1", "run": "r1", "tool": "fs_write", "class": "write", "args": {"path": "a.txt"}}
+    hub = MistyFake([
+        {"events": [], "next": 0, "done": False, "pending": [approval]},
+        {"events": [{"type": "final", "text": "Written.", "status": "done"}], "next": 1, "done": True, "pending": []},
+    ])
+    page = MistyPage()
+    asked = []
+    monkeypatch.setattr(page, "_confirm", lambda a: asked.append(a["tool"]) or True)
+    page.attach(hub)
+    page.input.setPlainText("write a.txt")
+    page.send()
+
+    wait_for(app, lambda: page._cancel is None and page.turns[-1]["text"] == "Written.")
+    wait_for(app, lambda: ("approve", "ap1", True) in hub.misty_calls)
+    assert asked == ["fs_write"]
+
+
+def test_misty_refusal_reaches_the_hub(app, monkeypatch):
+    approval = {"approval": "ap2", "run": "r1", "tool": "fs_write", "class": "write", "args": {}}
+    hub = MistyFake([
+        {"events": [], "next": 0, "done": False, "pending": [approval]},
+        {"events": [], "next": 0, "done": False, "pending": [approval]},  # still listed: asked once
+        {"events": [{"type": "final", "text": "I did not write it.", "status": "done"}], "next": 1, "done": True, "pending": []},
+    ])
+    page = MistyPage()
+    asked = []
+    monkeypatch.setattr(page, "_confirm", lambda a: asked.append(1) or False)
+    page.attach(hub)
+    page.input.setPlainText("write")
+    page.send()
+
+    wait_for(app, lambda: page._cancel is None and page.turns[-1]["text"].startswith("I did not"))
+    wait_for(app, lambda: ("approve", "ap2", False) in hub.misty_calls)
+    assert len(asked) == 1
+
+
+def test_misty_stop_cancels_the_run(app):
+    hub = MistyFake([{"events": [{"type": "token", "text": "wor"}], "next": 1, "done": False, "pending": []}] * 3
+                    + [{"events": [{"type": "final", "text": "", "status": "cancelled"}], "next": 2, "done": True, "pending": []}])
+    page = MistyPage()
+    page.attach(hub)
+    page.input.setPlainText("long task")
+    page.send()
+    wait_for(app, lambda: page.turns and page.turns[-1]["text"] == "wor")
+    page.stop()
+
+    wait_for(app, lambda: page._cancel is None)
+    assert ("cancel", "r1") in hub.misty_calls
+    assert page.status.text() == "Stopped."
+
+
+def test_misty_shows_a_model_s_markup_as_text(app):
+    hub = MistyFake([{"events": [{"type": "final", "text": '<img src="http://example.invalid/x.png">', "status": "done"}],
+                      "next": 1, "done": True, "pending": []}])
+    page = MistyPage()
+    page.attach(hub)
+    page.input.setPlainText("show me")
+    page.send()
+
+    wait_for(app, lambda: page._cancel is None and page.turns[-1]["text"])
     assert "<img" in page.transcript.toPlainText()
 
 

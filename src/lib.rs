@@ -16,6 +16,7 @@ pub mod hosting;
 pub mod hub;
 pub mod image;
 pub mod km;
+pub mod misty;
 pub mod ollama_api;
 pub mod pull;
 pub mod serving;

@@ -226,6 +226,12 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Misty, the built-in agent: `misty setup`, `misty chat`, `misty ask <text>`, `misty rag add <folder>`, `misty status`
+    /// (`misty help` lists them).
+    Misty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// The Knowledge Module factory: `factory create <goal> --author M --source dir:docs`, `factory list`,
     /// `factory get <task>`, `factory resume <task>`, `factory review` (`factory help` lists them).
     Factory {
@@ -901,6 +907,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         }
         Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
         Cmd::Factory { args } => model_mistress::factory::cli::run(&home, args).await?,
+        Cmd::Misty { args } => model_mistress::misty::cli::run(&home, args).await?,
         Cmd::Forge { cmd } => {
             let c = client().await?;
             match cmd {

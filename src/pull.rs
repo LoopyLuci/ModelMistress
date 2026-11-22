@@ -627,7 +627,9 @@ fn part_of(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
-async fn fetch(engine: &Engine, f: &PlanFile, job: &Job) -> Result<()> {
+/// Downloads one file (resuming a `.part`, checking size and SHA-256, moving it into place when whole). `misty setup`
+/// uses it for the engine and the Cactus files, which are not models in the catalog.
+pub(crate) async fn fetch(engine: &Engine, f: &PlanFile, job: &Job) -> Result<()> {
     let io = |e: std::io::Error| Fail::new(500, "io", format!("{}: {e}", f.dest.display()));
     let dir = f.dest.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(io)?;

@@ -32,6 +32,18 @@ ABP's client uses these endpoints, all of which the hub serves:
 | chats | `POST /v1/chat/completions` |
 | MCP tools for ABP's own agents | `model-mistress --home <home> mcp` (stdio) |
 
+### Misty from ABP
+
+ABP is a thin client of Misty: everything she needs lives in this hub. ABP's `bot/modelmistress/misty.py` calls the
+`misty.*` operations; ABP's agents get the tools `misty_status`, `misty_ask`, `misty_search` and `misty_ingest`; the
+dashboard API has `/api/modelmistress/misty/*`; and `abp misty status|ask|search|ingest|setup|doctor` is the CLI. ABP's
+`ask` is read-only on purpose (a tool of hers that needs approval is refused), since ABP has its own approvals. By ABP's module contract
+(`GET /v1/operations`, with `panel = "operations"` in the manifest) its generic module panel and its `module_call` tool should
+also list the `misty.*` operations; that was not opened in a running ABP.
+Through the OpenAI routes she is the model `modelmistress/misty`, but ABP's model picker builds its list from
+`model.list`, which does not include her, so she is not in that picker. The ABP side was tested against a stand-in hub;
+the pieces that need her models running have not been run end to end. See [misty/USER_GUIDE.md](misty/USER_GUIDE.md).
+
 Checked against a live hub: ABP's client found the hub through `MM_HOME`, authenticated, and read the hub's status.
 ABP's own provider registry (which marks ModelMistress as the provider to prefer) exists only while ABP runs, so that
 check needs ABP running.

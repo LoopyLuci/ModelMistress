@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Misty, a CPU-first agent** (`src/misty`, [docs/misty](docs/misty/USER_GUIDE.md)). One request goes through a router
+  to a role (fast, main or deep, filled by your models; Ternary Bonsai 2 2B, 9B and 27B are preferred), with retrieval
+  from her own index (keyword search, plus vectors when an embedding model is installed), tools under a class policy
+  (read auto, write ask, exec deny, net deny, hub ask), one retry a role up when an answer looks weak, sessions, pipelines
+  (TOML recipes; four built in) and Needle3, Whistle and Mirage through the Cactus runtime.
+  - Surfaces: 29 `misty.*` operations (also MCP tools) with REST routes and an SSE run stream; the OpenAI models `misty`,
+    `misty-fast`, `misty-main` and `misty-deep` (a peer key needs her named in its allow-list, and gets no tools, files or
+    index); `model-mistress misty ...`; a Misty page and a setup page in the dashboard and desktop app; a Misty page in the
+    Qt window.
+  - New engine `engine = "prism"` runs ternary Bonsai files that the bundled llama.cpp (b11272) cannot; a ternary file with
+    no engine able to run it is refused with `engine_cannot_run` (409) instead of loading and answering wrongly. Setting
+    `prism_server` / `MM_PRISM_SERVER`; `misty setup` installs the engine, the Cactus runtime, the Cactus models and the
+    Bonsai GGUFs (pinned sizes and SHA-256).
+  - Her file tools reach only the folders you list; web and shell tools are off until you allow them; what a tool returns is
+    marked as data; secret-looking files are never read or indexed.
+  - Run on real artifacts (Windows 10, Ryzen 9 5900X, 2026-11-21): the Prism engine build 12128 with the `PQ2_0` Bonsai
+    2B, 4B (speed only) and 9B, the Cactus runtime with Needle3, Whistle and Mirage, `misty doctor`, `misty bench`,
+    retrieval with citations, tool calls, a spoken question, a picture question, the `voice-note` pipeline and the OpenAI
+    route. That run found and fixed eleven defects: the Windows Cactus library (`libcactus.dll`) was not found; Needle was
+    given its tools in an order that halved its accuracy; its reflex threshold (0.85) could never be reached (now 0.10,
+    and only tools that read run on its word); every request was offered every tool, and the 9B reads about 30 tokens a
+    second, so a file listing took 63 s (now only the tools a request is about, and the `fast` role words the result:
+    10 s); the base prompt's "cite as [1]" made the small model write `[1]` with nothing retrieved; sources were listed
+    that the answer never cited; `rag add` of a path that is not there reported success with zero files; Mirage's masks
+    and boxes filled the prompt (picture question 50 s, now 26 s); picture input needed `--features vision` and its ONNX
+    download (it now needs nothing); "the workspace" was taken as a folder name; a role override could not be removed
+    (`config set` now follows JSON Merge Patch: `null` removes a key). Speeds are in the user guide. Not run: the
+    Misty page of the dashboard and desktop app (type-checked, tested and built, not opened) and of the Qt window, other
+    platforms' Cactus libraries, the `Q2_0` and `PTQ1_0` packings and the 27B file.
+  - A twelfth defect, found when NLP-CLI was joined to her: the router did not cue arithmetic, so "what is 17 times 23"
+    was offered no calculator and the 4B answered 411, 451 or 491 on three tries. `router::tool_hint` and the agent's
+    tool focus now share `agent::is_arithmetic` (cue words, `%`, "square root", and number-operator-number sums,
+    including "times", "x" and "over"); a sentence such as "how many times did we meet over 3 days" is not taken for a
+    sum. Now 391 on three tries, and 36 for "15% of 240".
+  - Found when her index was built over the docs of three projects (3,503 passages): an embedding failure was thrown away
+    (`embed_pending` ended in `unwrap_or(0)`), so a model that rejected every call left `embedded: 0` with no reason.
+    `rag.add` now reports `embed_error`, and a passage the embedder calls too large (longer than its batch) is cut in
+    half and retried, up to four times. The bundled llama-server (0.5.0-dev) crashes (exit `0xC0000409`) on
+    `nomic-embed-text` when it offloads to the Vulkan GPU, and on CPU with a batch above 512; a profile with
+    `engine = "prism"`, `gpu_layers = 0` and larger `ctx_size`, `batch_size` and `ubatch_size` runs it (user guide).
+- **`raise_priority`** (Windows, off by default): a hub started at below-normal or idle priority, as a Scheduled Task is
+  by default, lifts itself to normal, and the model servers it starts after that inherit it. Without it, CPU work in the
+  hub (embedding, Bonsai on the Prism engine) ran four to five times slower than in a hub started by hand while other
+  programs used the CPU. It never goes above normal and never lowers a priority. `config.set` takes
+  `{"settings": {"raise_priority": true}}`, and the dashboard's Settings page has the switch. An older hub
+  ignores the line, and drops it the next time it saves its settings.
 - **Rigel, a second engine**: a model's serving profile can say `engine = "rigel"`. Rigel is a llama.cpp
   fork ported to Windows and AMD HIP, and it can page a MoE model's experts from disk into VRAM slots. The new profile
   options are `moe_direct_io`, `moe_slots`, `moe_pack_dir`, `moe_profile` and `moe_cache_mib`.

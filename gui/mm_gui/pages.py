@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QStyleFactory,
@@ -370,6 +371,228 @@ class ChatPage(Page):
             # A backslash before < keeps a model's markup as plain text instead of letting the viewer render it.
             body = (m["content"] or "...").replace("<", "\\<")
             parts.append(f"**{who}**\n\n{body}")
+        self.transcript.setMarkdown("\n\n---\n\n".join(parts))
+        bar = self.transcript.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+
+class _MistyBridge(QObject):
+    """Carries each page of a run's events from the worker thread to the window."""
+
+    page = Signal(dict)
+
+
+class MistyPage(Page):
+    """Chat with Misty, the agent inside the hub: she picks a model, searches your documents and uses tools. A tool that
+    changes something waits for your answer in a dialog."""
+
+    ROLES = [("Chosen by the router", ""), ("Fast", "fast"), ("Main", "main"), ("Deep", "deep")]
+    DOCS = [("Router decides", None), ("Always search my documents", True), ("Never search", False)]
+
+    def __init__(self):
+        super().__init__("Misty")
+        self.ready = QLabel("Checking...")
+        self.ready.setWordWrap(True)
+        self.ready.setAccessibleName("Misty readiness")
+        self.role = QComboBox()
+        self.role.setAccessibleName("Model")
+        for label, value in self.ROLES:
+            self.role.addItem(label, value)
+        self.docs = QComboBox()
+        self.docs.setAccessibleName("Documents")
+        for label, value in self.DOCS:
+            self.docs.addItem(label, value)
+        self.transcript = QTextBrowser()
+        self.transcript.setOpenExternalLinks(False)
+        self.transcript.setAccessibleName("Conversation with Misty")
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("Ask Misty (Ctrl+Enter sends)")
+        self.input.setAccessibleName("Message")
+        self.input.setMaximumHeight(110)
+        self.send_button = QPushButton("Send")
+        self.send_button.clicked.connect(self.send)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.clicked.connect(self.stop)
+        self.stop_button.setEnabled(False)
+        new_chat = QPushButton("New chat")
+        new_chat.clicked.connect(self.new_chat)
+        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(sequence), self.input).activated.connect(self.send)
+
+        self.session: str | None = None
+        self.turns: list[dict] = []  # {"you", "text", "notes", "role", "cites", "error"}; the last one may be running
+        self._cancel: threading.Event | None = None
+        self._asked: set[str] = set()
+        self._bridge = _MistyBridge()
+        self._bridge.page.connect(self._on_page)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(80)
+        self._render_timer.timeout.connect(self._render)
+
+        top = QHBoxLayout()
+        top.addWidget(self.role, 1)
+        top.addWidget(self.docs, 1)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.input, 1)
+        buttons = QVBoxLayout()
+        for button in (self.send_button, self.stop_button, new_chat):
+            buttons.addWidget(button)
+        bottom.addLayout(buttons)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.ready)
+        layout.addLayout(top)
+        layout.addWidget(self.transcript, 1)
+        layout.addLayout(bottom)
+        layout.addWidget(self.status)
+
+    def refresh(self) -> None:
+        self.ask("Checking Misty", lambda hub: hub.misty_status(), self._status)
+
+    def shown(self) -> None:
+        if self.hub is not None and self._cancel is None:
+            self.refresh()
+
+    def _status(self, st: dict) -> None:
+        roster = {r.get("role"): r for r in st.get("roster") or []}
+        names = [f"{role} = {roster[role].get('model')}" for role in ("fast", "main", "deep") if roster.get(role, {}).get("status") == "ready"]
+        if st.get("ready"):
+            self.ready.setText("Ready: " + ", ".join(names))
+        else:
+            hint = (st.get("next") or ["No language model is ready."])[0]
+            self.ready.setText(f"Not ready. {hint}")
+
+    def send(self) -> None:
+        text = self.input.toPlainText().strip()
+        if self.hub is None or self._cancel is not None or not text:
+            return
+        hub = self.hub
+        args: dict = {"input": text, "approvals": "ask"}
+        if self.session:
+            args["session"] = self.session
+        else:
+            args["new_session"] = True
+        if self.role.currentData():
+            args["role"] = self.role.currentData()
+        if self.docs.currentData() is not None:
+            args["rag"] = self.docs.currentData()
+        self.turns.append({"you": text, "text": "", "notes": [], "role": "", "cites": [], "error": ""})
+        self.input.clear()
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._asked = set()
+        self._busy(True)
+        self.status.setText("Working...")
+        self._render()
+        run_task(
+            lambda: hub.misty_run(args, self._bridge.page.emit, cancel),
+            lambda _page: self._finished(cancel),
+            self._failed,
+        )
+
+    def stop(self) -> None:
+        if self._cancel is not None:
+            self._cancel.set()
+            self.status.setText("Stopping...")
+
+    def new_chat(self) -> None:
+        if self._cancel is None:
+            self.session = None
+            self.turns = []
+            self._render()
+            self.status.setText("")
+
+    def _confirm(self, approval: dict) -> bool:
+        """Ask the owner about one tool call. A separate method so a test can answer without a dialog."""
+        args = json.dumps(approval.get("args"), indent=2, ensure_ascii=False)[:1500]
+        box = QMessageBox(self)
+        box.setWindowTitle("Misty asks")
+        box.setText(f"Misty wants to use {approval.get('tool')} ({approval.get('class')}).")
+        box.setInformativeText("Allow it?")
+        box.setDetailedText(args)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_page(self, page: dict) -> None:
+        if not self.turns:
+            return
+        turn = self.turns[-1]
+        if "start" in page:
+            self.session = page["start"].get("session") or self.session
+            return
+        for e in page.get("events") or []:
+            kind = e.get("type")
+            if kind == "token":
+                turn["text"] += e.get("text") or ""
+            elif kind == "model":
+                turn["role"] = e.get("role") or turn["role"]
+            elif kind == "tool":
+                turn["notes"].append(f"{e.get('name')}: {e.get('status')}")
+            elif kind == "escalate":
+                turn["text"] = ""
+                turn["notes"].append(f"moved up from {e.get('from')} to {e.get('to')}: {e.get('why')}")
+            elif kind == "retrieve":
+                turn["notes"].append(f"searched your documents: {e.get('used')} of {e.get('hits')} passages used")
+            elif kind == "transcript":
+                turn["notes"].append(f"heard: {e.get('text')}")
+            elif kind == "error":
+                turn["error"] = e.get("message") or "the run failed"
+            elif kind == "final":
+                turn["text"] = e.get("text") if e.get("text") is not None else turn["text"]
+                turn["cites"] = e.get("citations") or []
+                turn["role"] = e.get("role") or turn["role"]
+                if e.get("error") and not turn["error"]:
+                    turn["error"] = e["error"]
+        if not self._render_timer.isActive():
+            self._render_timer.start()
+        for approval in page.get("pending") or []:
+            key = approval.get("approval")
+            if key and key not in self._asked and self.hub is not None:
+                self._asked.add(key)
+                allow = self._confirm(approval)
+                hub = self.hub
+                run_task(lambda hub=hub, key=key, allow=allow: hub.misty_approve(key, allow), lambda _r: None, self._approval_failed)
+
+    def _approval_failed(self, message: str) -> None:
+        self.status.setText(f"Your answer did not reach Misty: {message}")
+
+    def _finished(self, cancel: threading.Event) -> None:
+        self.status.setText("Stopped." if cancel.is_set() else "")
+        self._end()
+
+    def _failed(self, message: str) -> None:
+        if self.turns and not self.turns[-1]["text"]:
+            self.turns[-1]["error"] = message
+        self.status.setText(f"Misty could not answer: {message}")
+        self._end()
+
+    def _end(self) -> None:
+        self._cancel = None
+        self._busy(False)
+        self._render()
+
+    def _busy(self, busy: bool) -> None:
+        self.send_button.setEnabled(not busy)
+        self.stop_button.setEnabled(busy)
+        self.role.setEnabled(not busy)
+        self.docs.setEnabled(not busy)
+
+    def _render(self) -> None:
+        self._render_timer.stop()
+        # A backslash before < keeps a model's markup as plain text instead of letting the viewer render it.
+        safe = lambda s: str(s).replace("<", "\\<")  # noqa: E731
+        parts = []
+        for t in self.turns:
+            who = f"Misty ({t['role']})" if t["role"] else "Misty"
+            lines = [f"**You**\n\n{safe(t['you'])}", f"**{who}**"]
+            lines += [f"*{safe(n)}*" for n in t["notes"]]
+            lines.append(safe(t["text"] or "..."))
+            if t["error"]:
+                lines.append(f"**Error:** {safe(t['error'])}")
+            if t["cites"]:
+                lines.append("Sources: " + "; ".join(safe(c.get("source", "?")) for c in t["cites"]))
+            parts.append("\n\n".join(lines))
         self.transcript.setMarkdown("\n\n---\n\n".join(parts))
         bar = self.transcript.verticalScrollBar()
         bar.setValue(bar.maximum())

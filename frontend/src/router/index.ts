@@ -18,9 +18,13 @@ import VocabularyView from '../views/VocabularyView.vue'
 import FactoryView from '../views/FactoryView.vue'
 import FactoryTaskView from '../views/FactoryTaskView.vue'
 import FactoryReviewView from '../views/FactoryReviewView.vue'
+import MistyView from '../views/MistyView.vue'
+import MistySystemView from '../views/MistySystemView.vue'
 
 const routes = [
   { path: '/', name: 'Chat', component: ChatView },
+  { path: '/misty', name: 'Misty', component: MistyView },
+  { path: '/misty/system', name: 'MistySystem', component: MistySystemView },
   { path: '/thoughts', name: 'Thoughts', component: ThoughtsView },
   { path: '/traces', name: 'Traces', component: TracesView },
   { path: '/traces/:id', name: 'Trace', component: TraceDetailView, props: true },

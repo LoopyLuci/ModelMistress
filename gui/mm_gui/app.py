@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from mm_gui.hub import Hub, default_home
-from mm_gui.pages import ChatPage, ModelsPage, SettingsPage, StatusPage
+from mm_gui.pages import ChatPage, MistyPage, ModelsPage, SettingsPage, StatusPage
 from mm_gui.prefs import Appearance, Preferences
 from mm_gui.tasks import run_task
 
@@ -48,7 +48,7 @@ class Window(QMainWindow):
             heading_font.setPointSizeF(heading_font.pointSizeF() * 1.3)
         self.heading.setFont(heading_font)
         self.heading.setAccessibleName("Page")
-        self.pages = [StatusPage(), ModelsPage(), ChatPage(), SettingsPage(appearance)]
+        self.pages = [StatusPage(), ModelsPage(), ChatPage(), MistyPage(), SettingsPage(appearance)]
         self.stack = QStackedWidget()
         self.nav = QListWidget()
         self.nav.setFixedWidth(150)

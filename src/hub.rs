@@ -62,6 +62,8 @@ pub struct Hub {
     pub stop: Arc<tokio::sync::Notify>,
     /// The peer keys (see `hosting`).
     pub keys: Arc<Keys>,
+    /// Misty, the agent (src/misty), opened on first use.
+    pub misty: Arc<parking_lot::Mutex<Option<Arc<crate::misty::Misty>>>>,
 }
 
 impl Hub {
@@ -74,6 +76,7 @@ impl Hub {
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys,
+            misty: Default::default(),
         }
     }
 }
@@ -233,6 +236,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::trace::api::operations());
     all.extend(crate::km::ops::operations());
     all.extend(crate::factory::ops::operations());
+    all.extend(crate::misty::ops::operations());
     all.extend(crate::forge::operations());
     all
 }
@@ -769,6 +773,12 @@ fn llama_entry(hub: &Hub, name: &str) -> ApiResult<crate::catalog::ModelEntry> {
     }
 }
 
+/// [`call`] as a boxed future. Misty's tools call back into the hub (`hub_status`, `model_load`), and the hub calls
+/// Misty's operations: a boxed `Send` future cuts that cycle, which the compiler cannot prove `Send` through.
+pub fn call_boxed<'a>(hub: &'a Hub, id: &'a str, a: &'a Value) -> futures::future::BoxFuture<'a, ApiResult<Value>> {
+    Box::pin(call(hub, id, a))
+}
+
 pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
     let e = &hub.engine;
     Ok(match id {
@@ -777,7 +787,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             json!({"version": VERSION, "pid": std::process::id(), "uptime_s": hub.started.elapsed().as_secs(),
                    "system": system_report(),
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
-                   "rigel_server": e.rigel_server(),
+                   "rigel_server": e.rigel_server(), "prism_server": e.prism_server(),
                    "llama_built_in": crate::engine::bundled::version(),
                    "models_known": e.catalog().len(), "loaded": loaded,
                    "config_warnings": e.settings().warnings})
@@ -808,6 +818,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                  "loaded": e.loaded().iter().filter(|m| m.serving().engine == "rigel").count(),
                  "note": "a llama.cpp fork with paged MoE, for Windows and AMD GPUs; serves the models \
                           whose serving profile says engine = \"rigel\""},
+                {"id": "prism", "available": e.prism_server().is_some(), "path": e.prism_server(),
+                 "loaded": e.loaded().iter().filter(|m| m.serving().engine == "prism").count(),
+                 "note": "PrismML's llama.cpp fork: runs the ternary Bonsai packings (PTQ1_0, PQ2_0, Q2_0); serves the                           models whose serving profile says engine = \"prism\" (`model-mistress misty setup` installs it)"},
                 ollama
             ])
         }
@@ -1069,6 +1082,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("trace.") => crate::trace::api::call(hub, id, a).await?,
         id if id.starts_with("km.") => crate::km::ops::call(hub, id, a).await?,
         id if id.starts_with("factory.") => crate::factory::ops::call(hub, id, a).await?,
+        id if id.starts_with("misty.") => crate::misty::ops::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1579,6 +1593,12 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
                          "meta": m.summary(e.is_loaded(&m.id)), "serving": serving})
         })
         .collect();
+    // Misty, the agent, answers to these names (a catalog model of the same name wins)
+    data.extend(crate::misty::ops::virtual_models(&hub).into_iter().filter(|m| {
+        who.0
+            .as_ref()
+            .is_none_or(|p| crate::misty::ops::peer_may_use(p, m["id"].as_str().unwrap_or("")))
+    }));
     for m in e.ollama_models().await {
         if !allowed(&format!("ollama/{}", m["name"].as_str().unwrap_or(""))) {
             continue;
@@ -1786,6 +1806,26 @@ async fn chat(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> ApiResult<Response> {
+    // `misty`, `misty-fast`, `misty-main`, `misty-deep` are the agent, not a model file
+    let asked = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    if crate::misty::ops::is_virtual(&hub, &asked) {
+        if let Some(p) = &who.0 {
+            if !crate::misty::ops::peer_may_use(p, &asked) {
+                return Err(Fail::new(
+                    403,
+                    "model_not_allowed",
+                    format!(
+                        "this key may not use \"{asked}\": name it in the key's models (its models: {})",
+                        p.allow_list().join(", ")
+                    ),
+                )
+                .into());
+            }
+        }
+        return crate::misty::ops::openai_chat(hub, who.0.clone(), body)
+            .await
+            .map_err(ApiError::from);
+    }
     // the owner's requests can be traced (src/trace); a peer's never are
     let scope = crate::trace::capture::wants(&hub.engine.home, &headers, &mut body);
     if let (Some(scope), true) = (scope, who.0.is_none()) {
@@ -2077,6 +2117,7 @@ pub fn router(hub: Hub) -> Router {
         .merge(crate::trace::api::routes())
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())
+        .merge(crate::misty::ops::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))
@@ -2218,6 +2259,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            misty: Default::default(),
         }
     }
 
@@ -2425,6 +2467,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            misty: Default::default(),
         }
     }
 
@@ -3007,6 +3050,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            misty: Default::default(),
         };
         let id = std::path::Path::new(&model)
             .file_stem()
@@ -3062,6 +3106,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            misty: Default::default(),
         }
     }
 
