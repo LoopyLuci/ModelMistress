@@ -387,7 +387,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
     Ok(match id {
         "misty.status" => misty.report(hub).await,
         "misty.doctor" => setup::doctor(hub, &misty).await,
-        "misty.setup.plan" => setup::plan(hub, &misty),
+        "misty.setup.plan" => setup::plan(hub, &misty, setup::wants_gpu_build(hub).await),
         "misty.setup.run" => setup::run(hub, &misty, &strs(a, "install"), os(a, "pack")).await?,
         "misty.ask" => {
             let req = req_from(&misty, a, Approvals::Deny)?;

@@ -790,7 +790,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "home": e.home, "llama_server": e.llama_server(), "llama_version": e.llama_version().await,
                    "rigel_server": e.rigel_server(), "prism_server": e.prism_server(),
                    "llama_built_in": crate::engine::bundled::version(),
-                   "models_known": e.catalog().len(), "loaded": loaded,
+                   "models_known": e.catalog().len(), "loaded": loaded, "loading": e.loading(),
                    "config_warnings": e.settings().warnings})
         }
         "backend.list" => {

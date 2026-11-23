@@ -984,6 +984,64 @@ pub fn fit_target_for(free_mib: u64, budget_mib: u64, floor_mib: u64) -> u64 {
 /// each card's total less `reserve_mib` (kept for the system) and less what the hub's other models already hold. The
 /// margin is added back to the cap, because [`plan`] asks for the margin on top of a load's need: the reserve is a limit
 /// on what models use, and the margin is slack for the estimate.
+/// Threads (`-t`) for one llama-server that is about to start, so that a model on the CPU and a model on the GPU work
+/// at the same time without fighting for the cores. A server whose model sits wholly on the card only feeds the card
+/// from one thread: it gets a few (a third of the physical cores, between 2 and 4). A CPU-only server gets the cores
+/// the GPU servers leave, shared with the CPU servers already running. `None` leaves llama-server's own default (all
+/// physical cores): a machine with fewer than 4 cores, a model split between card and RAM, a CPU model with nothing
+/// else running.
+pub fn thread_budget(
+    cores: usize,
+    uses_gpu: bool,
+    wholly_on_gpu: bool,
+    gpu_servers: usize,
+    cpu_servers: usize,
+) -> Option<u32> {
+    if cores < 4 {
+        return None;
+    }
+    let host = (cores / 3).clamp(2, 4);
+    if uses_gpu {
+        return wholly_on_gpu.then_some(host as u32);
+    }
+    if gpu_servers == 0 && cpu_servers == 0 {
+        return None;
+    }
+    let free = cores.saturating_sub(host * gpu_servers);
+    Some((free / (cpu_servers + 1)).max(2) as u32)
+}
+
+/// How far a load has come, from what the server has read of its file: `stage` says what it is doing, and the rate and
+/// the time left are what it has read over the time it has had. A model on a hard drive takes minutes to load and
+/// shows nothing in that time otherwise.
+pub fn load_progress(size_mib: u64, read_mib: u64, elapsed_s: u64) -> serde_json::Value {
+    let read = read_mib.min(size_mib);
+    let percent = (read * 100).checked_div(size_mib).unwrap_or(0).min(100);
+    let rate = if elapsed_s == 0 {
+        0.0
+    } else {
+        read as f64 / elapsed_s as f64
+    };
+    let stage = if read * 100 < size_mib {
+        "starting"
+    } else if percent < 98 {
+        "reading from disk"
+    } else {
+        "preparing"
+    };
+    let eta = (rate >= 1.0 && percent < 100).then(|| ((size_mib - read) as f64 / rate).ceil() as u64);
+    serde_json::json!({
+        "stage": stage, "percent": percent, "read_mib": read, "size_mib": size_mib,
+        "rate_mib_s": (rate * 10.0).round() / 10.0, "eta_s": eta,
+    })
+}
+
+/// Whether these llama-server arguments already say how many threads to use.
+pub fn sets_threads(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| matches!(a.as_str(), "-t" | "--threads" | "-tb" | "--threads-batch") || a.starts_with("--threads="))
+}
+
 pub fn plannable_free_mib(devices: &[Device], reserve_mib: u64, held_by_others_mib: u64, margin_mib: u64) -> u64 {
     let free: u64 = devices.iter().map(|d| d.free_mib).sum();
     let cap: u64 = devices.iter().map(|d| d.total_mib.saturating_sub(reserve_mib)).sum();
@@ -1103,6 +1161,51 @@ pub fn estimate_json(e: &VramEstimate) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn threads_are_split_between_the_cpu_and_the_gpu_servers() {
+        use super::thread_budget as tb;
+        // a model wholly on the card needs a few threads to feed it, not every core
+        assert_eq!(tb(12, true, true, 0, 0), Some(4));
+        assert_eq!(tb(6, true, true, 0, 0), Some(2));
+        // a model split with RAM does its share of the work on the CPU: llama-server's default stands
+        assert_eq!(tb(12, true, false, 1, 0), None);
+        // a CPU model alone uses every core; next to a GPU server it gets what that leaves
+        assert_eq!(tb(12, false, false, 0, 0), None);
+        assert_eq!(tb(12, false, false, 1, 0), Some(8));
+        assert_eq!(tb(12, false, false, 1, 1), Some(4));
+        assert_eq!(tb(12, false, false, 0, 1), Some(6));
+        // never fewer than two, and small machines are left alone
+        assert_eq!(tb(8, false, false, 2, 3), Some(2));
+        assert_eq!(tb(2, true, true, 0, 0), None);
+    }
+
+    #[test]
+    fn a_load_reports_how_much_of_the_file_it_has_read() {
+        use super::load_progress as lp;
+        let p = lp(20_000, 0, 3);
+        assert_eq!(p["stage"], "starting");
+        assert!(p["eta_s"].is_null());
+        // 5,000 of 20,000 MiB in 50 s: 100 MiB/s, 150 s to go
+        let p = lp(20_000, 5_000, 50);
+        assert_eq!(p["stage"], "reading from disk");
+        assert_eq!(p["percent"], 25);
+        assert_eq!(p["rate_mib_s"], 100.0);
+        assert_eq!(p["eta_s"], 150);
+        // the working set can exceed the file (buffers): never above 100 %
+        let p = lp(1_000, 1_400, 10);
+        assert_eq!(p["percent"], 100);
+        assert_eq!(p["stage"], "preparing");
+        assert!(p["eta_s"].is_null());
+    }
+
+    #[test]
+    fn explicit_thread_arguments_are_noticed() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(super::sets_threads(&a(&["-t", "6"])));
+        assert!(super::sets_threads(&a(&["--threads=6"])));
+        assert!(super::sets_threads(&a(&["-ngl", "9", "-tb", "8"])));
+        assert!(!super::sets_threads(&a(&["-ngl", "9", "-c", "4096"])));
+    }
     use super::*;
 
     fn meta(pairs: &[(&str, Value)]) -> Map<String, Value> {

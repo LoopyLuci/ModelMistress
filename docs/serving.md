@@ -83,6 +83,18 @@ available the planner uses llama-server's figure.
 the card's total minus that (22 GB of a 24 GB card), and what other loaded models already hold counts against it. The
 planner, the first start of a load and the refusal messages all use this figure, not the card's raw free memory.
 
+**Threads for a CPU model and a GPU model together.** llama-server starts one thread per physical core. A model wholly on
+the card needs only a few threads to feed it, and a CPU model next to it fights those threads for the cores. With
+`thread_budget` on (the default) the hub gives a server wholly on the card a third of the physical cores (2 to 4), and a
+CPU-only server the cores the GPU servers leave, shared with the CPU servers already running (`-t`, see
+`serving::thread_budget`). A split load, a CPU model alone, a machine with fewer than 4 cores, and any `-t` or `--threads`
+in a profile, a load or `extra_args` are left as they are. A server that is already running keeps its count when another
+loads. `thread_budget = false` turns it off.
+
+**Load progress.** A load from a hard drive takes minutes. `service.status` lists `loading`: for each server that has
+started and is not ready, its `stage` (`starting`, `reading from disk`, `preparing`), `percent`, `read_mib` of `size_mib`,
+`rate_mib_s` and `eta_s`, taken from how much of the file the server holds in memory.
+
 **Windows commit.** On Windows the device memory of a GPU load is also charged against the system's *commit* (RAM plus
 page files, less what open programs have committed), about 1.2 times its size. When the commit has less headroom than
 that, the driver says `ErrorOutOfDeviceMemory` with gigabytes of VRAM still free. Measured on an RX 7900 XTX: 25 GB of

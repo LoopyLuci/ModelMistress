@@ -87,8 +87,8 @@ the owner saying yes to the exact file.
 
 ## State of the checks (update this when you run them)
 
-- Full library suite (`cargo test -p model-mistress --lib -- --test-threads=3`) on the finished tree: **574 passed,
-  0 failed, 6 ignored** (about 3 minutes). Send its output to a file: through a `grep` pipe it shows nothing until the end.
+- Full library suite (`cargo test -p model-mistress --lib -- --test-threads=3`) on the finished tree: **577 passed,
+  0 failed, 6 ignored** (about 4 minutes). Send its output to a file: through a `grep` pipe it shows nothing until the end.
 - `cargo clippy -p model-mistress --all-targets -- -D warnings` and `cargo fmt -p model-mistress`: clean.
 - Frontend: `npm run typecheck` and `npm run test` pass (127 tests). `npm run check` also runs `vite build`, which was
   not run.
@@ -109,10 +109,10 @@ the owner saying yes to the exact file.
    estimated VRAM and RAM, a `quant` read from the file name when `general.file_type` is missing, and a unique display
    `label` (name, quant, device). Show it as chips on the Models page (`frontend/src/views/ModelsView.vue`), in the
    Misty roster and in `model-mistress models`. Loaded models already carry `serving.placement`.
-3. **Load feedback.** A load from a slow disk shows "reading from disk" with the file size and the observed rate
+3. **Load feedback (done, unreleased: `service.status` `loading`; left: show it on the Models page and in `model-mistress status`).** Original spec: a load from a slow disk shows "reading from disk" with the file size and the observed rate
    instead of silence; `model.load` returns the stages (waited, read, ready). Consider a longer idle time for models
    that take over a minute to load.
-4. **Threads for CPU and GPU at once.** Each llama-server defaults to all physical cores, so a CPU model and a GPU model
+4. **Threads for CPU and GPU at once (done, unreleased; measured 2026-11-23).** `thread_budget` (default on) gives a server wholly on the card 2 to 4 threads and a CPU-only server the cores left. Measured with the 9B on the card and the 2B on the CPU (`-t 4` and `-t 8`), both generating at once: the card model 146 against 120 tokens/s, the CPU model 43.5 against 40.4; alone the card model is the same (166) and the CPU model is 8 % slower (43.7 against 47.7, 8 threads against 12). Kept on because the point is both at once. Left: re-count when a server stops (a running server keeps its `-t`). Original spec: each llama-server defaults to all physical cores, so a CPU model and a GPU model
    (whose host thread spins) fight for them. Give a fully offloaded GPU server few threads (about 4), and split the
    rest between CPU servers (`-t`, optionally `--cpu-range`), computed from `machine::physical_cores()` and what is
    loaded. Measure a CPU model's tokens per second while a GPU model generates, before and after; keep it only if it

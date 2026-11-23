@@ -26,7 +26,7 @@ on, where it runs or would go, VRAM and RAM); Misty's roster counts the card's r
 keeps the embedder and reranker on the CPU. See [serving.md](serving.md) and [HANDOVER.md](HANDOVER.md).
 
 Run: the 27B Q5_K_XL (20.2 GB) loaded on the RX 7900 XTX twice with the new build, and `--fit-target` held a load to
-free memory minus the target. 574 library tests, clippy and the frontend tests pass. Not run: the retry ladder on the
+free memory minus the target. 577 library tests, clippy and the frontend tests pass. Not run: the retry ladder on the
 real card (the failures did not come back), the Models page chips in a browser, and any measurement of a CPU model and a
 GPU model at the same time. Not built: load progress for slow disks, a thread budget for a CPU and a GPU model together,
 a CPU draft model, the PrismML GPU build on Linux (open items in [HANDOVER.md](HANDOVER.md)).

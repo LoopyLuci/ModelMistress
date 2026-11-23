@@ -23,7 +23,7 @@ model-mistress misty setup --install default
 ```
 
 The starter set is the Prism engine (a llama.cpp build that reads every ternary Bonsai packing; the ModelMistress build
-bundles a llama.cpp that cannot yet), the Cactus runtime, the Needle3, Whistle and Mirage models, and Bonsai 2B and 9B. You can name pieces instead: `--install prism,bonsai-4b`. Every
+bundles a llama.cpp that cannot yet; on a machine where a GPU is found, also its Vulkan build, `prism-gpu`), the Cactus runtime, the Needle3, Whistle and Mirage models, and Bonsai 2B and 9B. You can name pieces instead: `--install prism,bonsai-4b`. Every
 download is checked against a pinned size and SHA-256 before it is used, and runs as a job you can follow on the
 dashboard's Models and Misty setup pages.
 
@@ -232,7 +232,7 @@ ternary file with no engine that can run it is refused with a clear message (HTT
 failing during load. `misty status` shows which engines are present.
 
 The Prism engine installed by `--install prism` runs on the CPU. On a machine with a Vulkan GPU, `misty setup --install
-prism-gpu` adds the same build with the Vulkan backend (29 MB, pinned like the rest; it is not in the starter set).
+prism-gpu` adds the same build with the Vulkan backend (29 MB, pinned like the rest; the starter set takes it when a GPU is found).
 ModelMistress then runs the `main` and `deep` ternary models on the card, as far as the card has room for them (what is
 left after `vram_reserve_mib`), and keeps `fast`, the embedder and the reranker on the CPU, so that the two processors
 work at the same time. On an RX 7900 XTX a 2B `PQ2_0` file read a prompt 15 times faster and generated 2.2 times faster

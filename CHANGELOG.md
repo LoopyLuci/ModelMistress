@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **A CPU model and a GPU model work at once without fighting for cores; loads show their progress; the starter set
+  takes the GPU engine build** (`src/serving.rs`, `src/engine.rs`, `src/misty/setup.rs`; [serving](docs/serving.md)).
+  - *Thread budget.* New setting `thread_budget` (default on). A server wholly on the card gets 2 to 4 threads (a third of
+  the physical cores), a CPU-only server the cores the GPU servers leave, shared with the CPU servers running (`-t`).
+  Split loads, a lone CPU model, small machines and any thread setting of the owner are left alone.
+  - *Load progress.* `service.status` has `loading`: stage, percent, MiB read of the file, rate and time left for each
+  server that is starting.
+  - *Starter set.* `misty setup --install default` also installs `prism-gpu` when a GPU is found.
+
 ## 0.4.1 — 2026-11-23
 
 - **Model loading holds to the memory the machine really has, and models say where they run**

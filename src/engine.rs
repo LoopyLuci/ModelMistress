@@ -126,6 +126,10 @@ pub struct Settings {
     /// MiB of each GPU's memory that models never use, left for the system (the desktop, the driver): the models
     /// together hold at most the card's total minus this (24,560 MiB card, 2048 reserved: 22,512 MiB, about 22 GB).
     pub vram_reserve_mib: u64,
+    /// Give each llama-server a thread count (`-t`) that leaves the cores a CPU model and a GPU model both need (see
+    /// [`serving::thread_budget`]). A thread setting of a profile, a load or `extra_args` wins. Off: llama-server's own
+    /// default (all physical cores) for every server.
+    pub thread_budget: bool,
     /// Load a model on its first request.
     pub autoload: bool,
     pub load_timeout_s: u64,
@@ -208,6 +212,7 @@ impl Default for Settings {
             vram_guard: true,
             vram_margin_mib: 768,
             vram_reserve_mib: 2048,
+            thread_budget: true,
             autoload: true,
             load_timeout_s: 300,
             idle_unload_s: 0,
@@ -437,6 +442,26 @@ pub fn lora_scales(lora: &[Lora]) -> Value {
         .collect::<Vec<_>>())
 }
 
+/// A server that has started and is not ready: what [`Engine::loading`] reports on.
+struct Loading {
+    model: String,
+    pid: u32,
+    size_mib: u64,
+    started: Instant,
+}
+
+/// Takes a model off the list of loading servers when its load ends, whichever way.
+struct LoadingGuard<'a> {
+    list: &'a Mutex<Vec<Loading>>,
+    model: String,
+}
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        self.list.lock().retain(|l| l.model != self.model);
+    }
+}
+
 pub struct Instance {
     pub model: String,
     pub port: u16,
@@ -565,6 +590,8 @@ pub struct Engine {
     learned: Mutex<BTreeMap<String, Learned>>,
     /// What each GPU has shown it lets one process hold, by `device|server program` (`gpu_limits.json`).
     limits: Mutex<BTreeMap<String, serving::GpuLimit>>,
+    /// Servers that have started and are not ready yet, for [`Engine::loading`].
+    loading: Mutex<Vec<Loading>>,
     /// The cards as last probed, so that listing models does not start a process per request.
     device_cache: Mutex<Option<(Instant, Vec<serving::Device>)>>,
     /// Models Misty keeps on the CPU (the embedder, the reranker), so that the card is left to the language models. A
@@ -621,6 +648,7 @@ impl Engine {
             extras: Mutex::new(load_extras(&home)),
             learned: Mutex::new(load_learned(&home)),
             limits: Mutex::new(load_limits(&home)),
+            loading: Mutex::new(vec![]),
             device_cache: Mutex::new(None),
             cpu_hints: Mutex::new(Default::default()),
             #[cfg(test)]
@@ -1679,6 +1707,33 @@ impl Engine {
         }
     }
 
+    /// The servers that are loading now, with how much of the file each has read (its memory in use, which grows as the
+    /// file is read) and when it should be done (see [`serving::load_progress`]).
+    pub fn loading(&self) -> Vec<Value> {
+        use sysinfo::{Pid, System};
+        let list: Vec<(String, u32, u64, u64)> = self
+            .loading
+            .lock()
+            .iter()
+            .map(|l| (l.model.clone(), l.pid, l.size_mib, l.started.elapsed().as_secs()))
+            .collect();
+        if list.is_empty() {
+            return vec![];
+        }
+        let mut sys = System::new();
+        list.into_iter()
+            .map(|(model, pid, size_mib, elapsed_s)| {
+                let pid = Pid::from_u32(pid);
+                sys.refresh_process(pid);
+                let read_mib = sys.process(pid).map(|p| p.memory() / (1024 * 1024)).unwrap_or(0);
+                let mut v = serving::load_progress(size_mib, read_mib, elapsed_s);
+                v["model"] = json!(model);
+                v["elapsed_s"] = json!(elapsed_s);
+                v
+            })
+            .collect()
+    }
+
     /// The models that are loaded, as the planner sees them (the model being loaded is left out).
     fn residents(&self, except: &str) -> Vec<Resident> {
         self.loaded()
@@ -1757,6 +1812,24 @@ impl Engine {
                 ))
             }
         }
+    }
+
+    /// The `-t` for a server that is about to start (see [`serving::thread_budget`]), from what is loaded now.
+    async fn thread_share(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<u32> {
+        let (mut gpu, mut cpu) = (0, 0);
+        for i in self.loaded().iter().filter(|i| i.model != entry.id) {
+            match i.serving().placement {
+                "gpu" => gpu += 1,
+                "cpu" => cpu += 1,
+                _ => {}
+            }
+        }
+        let uses_gpu = r.gpu_layers != 0;
+        let wholly = uses_gpu && {
+            let devices = self.gpu_devices_recent().await;
+            matches!(self.placement_for(entry, opts, &devices), Some(serving::Fit::Gpu))
+        };
+        serving::thread_budget(crate::machine::physical_cores(), uses_gpu, wholly, gpu, cpu)
     }
 
     /// Whether llama-server can choose the GPU layers itself (`--fit`): the stock llama.cpp, in a build that has it.
@@ -2285,8 +2358,14 @@ impl Engine {
             args.extend(["-dev".into(), "none".into()]);
         }
         args.push("--metrics".into());
+        let user_threads =
+            opts.threads.is_some() || serving::sets_threads(&s.extra_args) || serving::sets_threads(&opts.extra_args);
         if let Some(t) = opts.threads {
             args.extend(["-t".into(), t.to_string()]);
+        } else if s.thread_budget && !user_threads {
+            if let Some(t) = self.thread_share(entry, opts, &resolved).await {
+                args.extend(["-t".into(), t.to_string()]);
+            }
         }
         args.extend(moe_args(entry, opts));
         if opts.reranking {
@@ -2343,6 +2422,16 @@ impl Engine {
         if let (Some(job), Some(h)) = (&self.job, child.raw_handle()) {
             job.assign(h);
         }
+        self.loading.lock().push(Loading {
+            model: entry.id.clone(),
+            pid,
+            size_mib: entry.size_bytes / (1024 * 1024),
+            started: Instant::now(),
+        });
+        let _loading = LoadingGuard {
+            list: &self.loading,
+            model: entry.id.clone(),
+        };
         let inst = Instance {
             model: entry.id.clone(),
             port,

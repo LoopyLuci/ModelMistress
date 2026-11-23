@@ -240,7 +240,14 @@ pub const DEFAULT_SET: [&str; 7] = [
     "bonsai-9b",
 ];
 
-pub fn components(hub: &Hub, misty: &Misty) -> Vec<Component> {
+/// Whether the starter set takes the GPU build of the Prism engine: this machine has a card the engine can use, and
+/// there is a build for the platform.
+pub async fn wants_gpu_build(hub: &Hub) -> bool {
+    prism_gpu_asset().is_some() && !hub.engine.gpu_devices_recent().await.is_empty()
+}
+
+/// `card`: see [`wants_gpu_build`].
+pub fn components(hub: &Hub, misty: &Misty, card: bool) -> Vec<Component> {
     let catalog = hub.engine.catalog();
     let cact_dir = archive_dir(&misty.home);
     let mut out = vec![];
@@ -258,11 +265,11 @@ pub fn components(hub: &Hub, misty: &Misty) -> Vec<Component> {
     let gpu = prism_gpu_asset();
     out.push(Component {
         id: "prism-gpu".into(),
-        what: "The PrismML build with the Vulkan backend: ternary Bonsai files run on the GPU (not in the starter set: it needs a Vulkan GPU)".into(),
+        what: "The PrismML build with the Vulkan backend: ternary Bonsai files run on the GPU (in the starter set when a GPU is found)".into(),
         kind: "engine",
         size: gpu.as_ref().map(|a| a.size).unwrap_or(0),
         installed: hub.engine.prism_gpu_server().is_some(),
-        default: false,
+        default: card && gpu.is_some(),
         from: format!("github.com/PrismML-Eng/llama.cpp {PRISM_TAG}"),
         note: gpu.is_none().then(|| "no GPU build of this engine has been tried on this platform".to_string()),
     });
@@ -323,11 +330,11 @@ pub fn components(hub: &Hub, misty: &Misty) -> Vec<Component> {
     out
 }
 
-pub fn plan(hub: &Hub, misty: &Misty) -> Value {
-    let c = components(hub, misty);
+pub fn plan(hub: &Hub, misty: &Misty, card: bool) -> Value {
+    let c = components(hub, misty, card);
     let todo: u64 = c.iter().filter(|c| c.default && !c.installed).map(|c| c.size).sum();
     json!({"components": c.iter().map(Component::to_json).collect::<Vec<_>>(),
-           "default": DEFAULT_SET, "default_download_bytes": todo,
+           "default": default_set(card), "default_download_bytes": todo,
            "how": "model-mistress misty setup --install default   (or --install prism,cactus,bonsai-4b ...)"})
 }
 
@@ -638,8 +645,17 @@ async fn install_cact(engine: &Engine, misty: &Arc<Misty>, job: &Job, id: &str) 
     })
 }
 
+/// The starter set: `DEFAULT_SET`, and the GPU build of the Prism engine when `card` (see [`wants_gpu_build`]).
+pub fn default_set(card: bool) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = DEFAULT_SET.to_vec();
+    if card {
+        v.insert(1, "prism-gpu");
+    }
+    v
+}
+
 /// Expands `default` and checks the names.
-pub fn expand(ids: &[String]) -> Result<Vec<String>, Fail> {
+pub fn expand(ids: &[String], card: bool) -> Result<Vec<String>, Fail> {
     let known = [
         "prism",
         "prism-gpu",
@@ -660,7 +676,7 @@ pub fn expand(ids: &[String]) -> Result<Vec<String>, Fail> {
         .filter(|s| !s.is_empty())
     {
         let list: Vec<String> = if id == "default" {
-            DEFAULT_SET.iter().map(|s| s.to_string()).collect()
+            default_set(card).iter().map(|s| s.to_string()).collect()
         } else {
             vec![id.clone()]
         };
@@ -686,7 +702,8 @@ pub fn expand(ids: &[String]) -> Result<Vec<String>, Fail> {
 
 /// Starts the installs as jobs (a GGUF is an ordinary pull job; the rest are one task job each). Returns the jobs.
 pub async fn run(hub: &Hub, misty: &Arc<Misty>, ids: &[String], pack: Option<&str>) -> Result<Value, Fail> {
-    let ids = expand(ids)?;
+    let card = wants_gpu_build(hub).await;
+    let ids = expand(ids, card)?;
     let pack = match pack.map(str::to_uppercase).as_deref() {
         None | Some("") => "PQ2_0".to_string(),
         Some(p @ ("PQ2_0" | "Q2_0" | "PTQ1_0")) => p.to_string(),
@@ -698,7 +715,7 @@ pub async fn run(hub: &Hub, misty: &Arc<Misty>, ids: &[String], pack: Option<&st
     };
     let mut jobs = vec![];
     let mut skipped = vec![];
-    let have: Vec<Component> = components(hub, misty);
+    let have: Vec<Component> = components(hub, misty, card);
     for id in ids {
         if have.iter().any(|c| c.id == id && c.installed) {
             skipped.push(json!({"id": id, "why": "already installed"}));
@@ -1014,16 +1031,20 @@ mod tests {
 
     #[test]
     fn components_are_named_and_the_default_set_is_checked() {
-        assert_eq!(expand(&["default".into()]).unwrap().len(), DEFAULT_SET.len());
+        assert_eq!(expand(&["default".into()], false).unwrap().len(), DEFAULT_SET.len());
+        // with a card, the starter set also takes the GPU build of the engine, right after the CPU build
+        let with_card = expand(&["default".into()], true).unwrap();
+        assert_eq!(with_card.len(), DEFAULT_SET.len() + 1);
+        assert_eq!(&with_card[..2], ["prism", "prism-gpu"]);
         assert_eq!(
-            expand(&["prism, bonsai-27b".into(), "prism".into()]).unwrap(),
+            expand(&["prism, bonsai-27b".into(), "prism".into()], false).unwrap(),
             vec!["prism", "bonsai-27b"]
         );
-        assert!(expand(&["bonsai-1b".into()])
+        assert!(expand(&["bonsai-1b".into()], false)
             .unwrap_err()
             .message
             .contains("no component"));
-        assert!(expand(&[]).is_err());
+        assert!(expand(&[], false).is_err());
         assert_eq!(bonsai_file("9B", "PQ2_0"), "Ternary-Bonsai-2-9B-PQ2_0.gguf");
         assert_eq!(bonsai_repo("27B"), "prism-ml/Ternary-Bonsai-2-27B-gguf");
         // every pinned GGUF size is listed for all three packings
@@ -1035,7 +1056,7 @@ mod tests {
         let dir = crate::testing::TestDir::new("misty-setup");
         let hub = crate::testing::hub(&dir, &["Ternary-Bonsai-2-4B-PQ2_0"]);
         let misty = Misty::open_with(&dir, std::sync::Arc::new(cactus::fake::Fake::with_models(0))).unwrap();
-        let p = plan(&hub, &misty);
+        let p = plan(&hub, &misty, false);
         let c = p["components"].as_array().unwrap();
         assert_eq!(c.len(), 10);
         let get = |id: &str| c.iter().find(|x| x["id"] == id).unwrap().clone();
@@ -1043,6 +1064,14 @@ mod tests {
         assert_eq!(get("bonsai-9b")["installed"], false);
         assert_eq!(get("prism")["installed"], false);
         assert_eq!(get("prism-gpu")["installed"], false);
+        // a machine with a card is offered the GPU build in the starter set
+        let with_card = plan(&hub, &misty, true);
+        assert!(with_card["default"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "prism-gpu"));
+        assert!(!p["default"].as_array().unwrap().iter().any(|x| x == "prism-gpu"));
         assert_eq!(
             get("cactus")["installed"],
             true,
