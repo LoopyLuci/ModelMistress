@@ -29,7 +29,7 @@ import { auth, inTauri, signOut } from '@/transport'
 // Pages grouped by what they are for; the group row is always shown, the pages of the current group under it.
 const groups = [
   { label: 'Chat', to: '/', pages: [{ label: 'Chat', to: '/' }] },
-  { label: 'Misty', to: '/misty', pages: [{ label: 'Chat', to: '/misty' }, { label: 'Setup and status', to: '/misty/system' }] },
+  { label: 'Misty', to: '/misty', pages: [{ label: 'Chat', to: '/misty' }, { label: 'Environments', to: '/misty/environments' }, { label: 'Setup and status', to: '/misty/system' }] },
   { label: 'Models', to: '/models', pages: [{ label: 'Models', to: '/models' }] },
   { label: 'Thoughts', to: '/thoughts', pages: [{ label: 'Thoughts', to: '/thoughts' }] },
   { label: 'Traces', to: '/traces', pages: [{ label: 'Traces', to: '/traces' }] },

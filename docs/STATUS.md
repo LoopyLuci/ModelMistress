@@ -61,7 +61,8 @@ in `src/tests_upstream.rs`.
 
 - **Chat** is the landing page: model picker with MM's own (Forge) models in a group at the top, streamed answers
   (`/v1/chat/completions`, `stream: true`), conversations kept in the browser (new, rename, delete), system prompt,
-  temperature, top-p, max tokens, Stop (button or Esc), Enter sends and Shift+Enter breaks a line, markdown with
+  temperature, top-p, max tokens, Stop (button or Esc), Enter sends and Shift+Enter breaks a line, Up and Down walk
+  through earlier messages, markdown with
   copyable code blocks (own renderer, everything escaped), reasoning (`reasoning_content` or `<think>`) collapsed
   apart from the answer, time to first token and tokens per second per reply, "trace replies" (sets `mm_trace` and
   links each reply to its trace), and a picture button for vision models. Stop cancels the task in llama-server.
@@ -289,6 +290,20 @@ Not done or not verified:
   `--test-threads=4`; the factory tests are timing-sensitive under full parallelism on this machine (unchanged by this work).
 - The bundled llama.cpp is still b11272. Updating it to b11556 or later would let stock llama.cpp run `Q2_0` Bonsai files
   without Prism; that changes the engine for every model and needs `mm-routing.patch` re-checked, so it is separate.
+
+### Environments and working folders (2026-11-23)
+
+Misty chats can have a working folder and an environment (folder, other folders, variables, a policy per class of
+tool): `src/misty/env.rs`, the `misty.env.*`, `misty.session.set` and `misty.browse` operations, the environment bar
+and the Environments page of the dashboard, and Up and Down through earlier messages in both message boxes. Described in
+the [user guide](misty/USER_GUIDE.md) and the [API](misty/API.md); the changelog lists what was checked.
+
+- Run: 125 Misty tests and the whole library suite (559 passed, 6 ignored, `--test-threads=3`), clippy with warnings
+  denied, `cargo fmt --check`, `npm run check` (127 tests); in a browser against a scratch debug hub: the environment bar,
+  the folder picker end to end (it found a real defect, fixed), the Environments page, and Up and Down on both pages.
+- Not run: the installed desktop app; a real model working in an environment (scripted models only); the CLI against a
+  live hub; the picker on a hub on another machine. The plain Chat page has no tools, so the folder and environment apply
+  to Misty chats only.
 
 ### The model router (`auto`) and the Models page (2026-11-22)
 

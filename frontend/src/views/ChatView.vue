@@ -91,7 +91,7 @@
           <span v-for="(u, i) in pending" :key="i" class="thumb"><img :src="u" alt="attached picture" /><button type="button" aria-label="Remove picture" @click="pending.splice(i, 1)">x</button></span>
         </div>
         <div class="row inrow">
-          <textarea ref="box" v-model="input" rows="2" class="grow" placeholder="Message (Enter sends, Shift+Enter for a new line)" aria-label="Message" @keydown="onKey" @paste="onPaste"></textarea>
+          <textarea ref="box" v-model="input" rows="2" class="grow" placeholder="Message (Enter sends, Shift+Enter for a new line, Up brings back an earlier message)" aria-label="Message" @keydown="onKey" @paste="onPaste"></textarea>
           <input v-if="canPicture" ref="file" type="file" accept="image/*" multiple hidden @change="onFiles" />
           <button v-if="canPicture" class="btn" type="button" :title="cur?.router ? 'Attach a picture (the router then needs a model that can see pictures)' : 'Attach a picture'" @click="file?.click()">Picture</button>
           <button v-if="busy" class="btn danger" type="button" @click="stop">Stop</button>
@@ -118,6 +118,7 @@ import { streamChat, type ChatMessage } from '@/chat/hub'
 import { chatChoices, groupModels, isChatModel, modelLabel, type HubModel } from '@/chat/models'
 import { AUTO, pickFor, withoutTagsInLastUserMessage, type RouteNote } from '@/chat/router'
 import { chats, flush, lastId, newConversation, removeConversation, sorted, type Conversation, type Msg } from '@/chat/store'
+import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
 
 const route = useRoute()
 const router = useRouter()
@@ -147,6 +148,15 @@ const replies = ref(0)
 let abort: AbortController | null = null
 let waitTimer: number | undefined
 let stick = true
+
+/** Up and Down in the message box: what was sent in other chats, then in this one (see chat/recall.ts). */
+const recall = createRecall(() =>
+  entriesFor(
+    (conv.value?.messages || []).filter((m) => m.role === 'user').map((m) => m.content),
+    loadSent(),
+  ),
+)
+watch(input, (t) => recall.edited(t))
 
 const list = computed(() => sorted())
 const chatModels = computed(() => allModels.value.filter(isChatModel))
@@ -192,6 +202,7 @@ function open(id: string) {
   if (!c) return
   conv.value = c
   lastId.set(id)
+  recall.reset()
   sideOpen.value = false
   error.value = ''
   pickDefault()
@@ -253,6 +264,7 @@ function onScroll() {
 }
 
 function onKey(e: KeyboardEvent) {
+  if (box.value && recallKey(e, box.value, recall, (t) => (input.value = t))) return
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
     if (canSend.value) send()
@@ -331,6 +343,8 @@ async function send() {
   const text = input.value.trim()
   c.messages.push({ role: 'user', content: text, ...(pending.value.length ? { images: [...pending.value] } : {}) })
   if (!c.renamed && c.messages.length === 1) c.title = (text || 'Picture').replace(/\s+/g, ' ').slice(0, 48)
+  remember(text)
+  recall.reset()
   input.value = ''
   pending.value = []
   await reply(c)

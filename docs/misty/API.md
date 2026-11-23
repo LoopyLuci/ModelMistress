@@ -26,7 +26,12 @@ schemas, so a client such as ABP's operations panel renders forms for them witho
 | `misty.run.list` | no | `{active, recent}` |
 | `misty.approvals` | no | `{pending: [{approval, run, tool, class, args}]}` |
 | `misty.approve` | yes | `{approval, allow}`; not found when it has already been answered or timed out |
-| `misty.session.list` / `.new` / `.get` / `.rename` / `.delete` | mixed | sessions and their messages |
+| `misty.session.list` / `.new` / `.get` / `.rename` / `.delete` | mixed | sessions and their messages; a listed session has `env`, `env_name` and `cwd`, and `.new` takes `{title, env, cwd}` |
+| `misty.session.set` | yes | `{session, env, cwd}`: the session's environment (an id or a name) and working folder (a full path that exists); `null` clears one, a key left out stays. Returns `{session, env, env_name, cwd, scope}`; an unknown session or environment is `not_found`, a folder that is not there or not a full path is `invalid` |
+| `misty.env.list` | no | `{environments: [{id, name, description, cwd, roots, vars, policy, created, updated}]}` |
+| `misty.env.save` | yes | creates an environment (no `id`) or changes one (`id`): `{name, description, cwd, roots, vars, policy}`. A field left out stays; `roots` and `vars` replace the whole list. Returns `{environment}`. A name already in use, a folder that is not there, a bad variable name and a policy that is not `auto`, `ask` or `deny` are `invalid` |
+| `misty.env.delete` | yes | `{id}` (an id or a name): `{deleted, id, name}`; sessions that used it keep their own folder and go back to her policy |
+| `misty.browse` | no | `{path, hidden}`: the folders inside `path`, or with no path the usual starting places: `{path, parent, dirs: [{name, path}], places: [{label, path}], truncated}`. This is what the dashboard's folder picker calls |
 | `misty.route` | no | `{input}`: features, a score per role, the winner and the reasons; nothing runs |
 | `misty.rag.ingest` | yes | `{path}` or `{uri, text}`, plus `collection`: `{collection, files_seen, new, updated, unchanged, skipped, chunks, embedded}`; a `path` that is not there is `not_found` |
 | `misty.rag.search` | no | `{query, k, collection}`: `{collection, hits: [{chunk, collection, source, start_line, end_line, text, score, coverage, via}]}` |
@@ -43,6 +48,7 @@ schemas, so a client such as ABP's operations panel renders forms for them witho
 | --- | --- |
 | `input` (required) | the request |
 | `session` / `new_session` | continue a session / start one (the id comes back) |
+| `env`, `cwd` | work in an environment (id or name) and a folder (a full path that exists). With `session` or `new_session` the session keeps them (a key left out keeps what the session has); with neither they apply to this request only. See below |
 | `role` | `fast`, `main` or `deep`: skip the router (`@fast`, `@main`, `@deep` in the text do the same) |
 | `rag` | `true` always search the index, `false` never, unset: the router decides; `collection` picks the index |
 | `tools` / `no_tools` | offer only these tools / none |
@@ -52,6 +58,24 @@ schemas, so a client such as ABP's operations panel renders forms for them witho
 | `audio_path`, `audio_base64` | a WAV, transcribed by Whistle first |
 | `image_paths`, `images_base64` | images, described by Mirage first |
 | `temperature`, `max_tokens` | sampling |
+
+### Environments and working folders
+
+A session works in the folder it was given (`cwd`), else the one in its environment, else her own workspace, and under
+its environment's policy, else hers. The scope is read again at every tool call, so a change made while a run is going
+applies from the run's next tool call.
+
+- **Folders.** With a folder from either place, `fs_*` tools reach that folder and the environment's `roots` and no
+  others (the `roots` in her settings do not apply there), a path without a folder means the working folder, and
+  `shell_run` starts in it. An environment with no folder at all changes only the policy and the variables. The secret
+  and escape guards hold inside every folder.
+- **Policy.** A class named in the environment's `policy` (`read`, `write`, `exec`, `net`, `hub`) takes `auto`, `ask` or
+  `deny` there instead of the value in her settings; a class left out keeps hers. A refusal names the environment.
+- **Variables.** `vars` are added to the few variables `shell_run` passes on (names `[A-Za-z_][A-Za-z0-9_]*`). They are
+  kept as plain text in her state database under the hub's home, `misty.env.list` returns them to the owner's token, and
+  a command can print them, so a model can read them.
+- **Who can change them.** Only the owner's token reaches `misty.env.*`, `misty.session.set` and `misty.browse`; none of
+  her tools does, so she cannot widen her own folders or loosen her own policy. Peers reach none of them.
 
 ### The outcome (`misty.ask`)
 

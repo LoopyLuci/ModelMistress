@@ -26,7 +26,49 @@ export interface MistyStatus {
 export interface Component { id: string; what: string; kind: string; size_bytes: number; installed: boolean; default: boolean; from: string; note: string }
 export interface SetupPlan { components: Component[]; default: string[]; default_download_bytes: number; how: string }
 
-export interface Session { id: string; title: string; created: number; updated: number; messages: number }
+/** What a class of tool does when Misty calls it: runs at once, waits for the owner, or is refused. */
+export type Policy = 'auto' | 'ask' | 'deny'
+export type ToolClass = 'read' | 'write' | 'exec' | 'net' | 'hub'
+
+export const TOOL_CLASSES: { id: ToolClass; label: string; what: string }[] = [
+  { id: 'read', label: 'Read', what: 'list, read and search files and the index; look things up' },
+  { id: 'write', label: 'Write', what: 'create and change files, add to the index' },
+  { id: 'exec', label: 'Commands', what: 'run commands in the working folder' },
+  { id: 'net', label: 'Network', what: 'fetch web pages' },
+  { id: 'hub', label: 'Models', what: 'load and unload models' },
+]
+
+/** A named working setup: a folder, more folders, variables for commands, and a policy per class of tool. */
+export interface Environment {
+  id: string
+  name: string
+  description: string
+  cwd: string | null
+  roots: string[]
+  vars: Record<string, string>
+  /** A class left out keeps Misty's own policy. */
+  policy: Partial<Record<ToolClass, Policy>>
+  created: number
+  updated: number
+}
+/** What `misty.env.save` takes: no id makes a new one. */
+export type EnvironmentInput = Partial<Omit<Environment, 'created' | 'updated'>> & { name: string }
+
+export interface Session {
+  id: string; title: string; created: number; updated: number; messages: number
+  /** The session's environment (id and name) and its own working folder, when it has them. */
+  env?: string | null; env_name?: string | null; cwd?: string | null
+}
+/** What `misty.session.set` answers: the session's choices and what they add up to. */
+export interface SessionScope {
+  session: string; env: string | null; env_name: string | null; cwd: string | null
+  scope: { environment: string | null; cwd: string | null; roots: string[]; policy: Record<ToolClass, Policy> }
+}
+export interface Browse {
+  path: string | null; parent: string | null; truncated: boolean
+  dirs: { name: string; path: string }[]
+  places: { label: string; path: string }[]
+}
 export interface Approval { approval: string; run: string; tool: string; class: string; args: any }
 
 /** One entry of a run's event log (the `type` says which fields it has; see agent.rs). */
@@ -37,6 +79,8 @@ export interface RunPage { run: string; events: RunEvent[]; next: number; done: 
 export interface Ask {
   input: string; session?: string; new_session?: boolean; role?: 'fast' | 'main' | 'deep'; rag?: boolean; collection?: string
   tools?: string[]; no_tools?: boolean; panel?: boolean; approvals?: 'ask' | 'deny'
+  /** Work in this environment (id or name) and/or this folder: remembered by the session, which they change. */
+  env?: string; cwd?: string
 }
 
 export interface Hit { chunk: number; collection: string; source: string; start_line: number; end_line: number; text: string; score: number; coverage: number; via: string }
@@ -64,6 +108,13 @@ export const misty = {
   newSession: async (title = 'chat'): Promise<string> => (await call('misty.session.new', { title })).session,
   session: async (session: string): Promise<{ role: string; content: string }[]> => (await call('misty.session.get', { session })).messages || [],
   rename: (session: string, title: string) => call('misty.session.rename', { session, title }),
+  /** Choose a session's environment and folder: `null` clears one, a key left out stays. */
+  setScope: (session: string, p: { env?: string | null; cwd?: string | null }): Promise<SessionScope> => call('misty.session.set', { session, ...p }),
+  envs: async (): Promise<Environment[]> => (await call('misty.env.list', {})).environments || [],
+  saveEnv: async (e: EnvironmentInput): Promise<Environment> => (await call('misty.env.save', e as any)).environment,
+  deleteEnv: (id: string) => call('misty.env.delete', { id }),
+  /** The folders inside `path` (hidden ones too when asked); with no path, the usual starting places. */
+  browse: (path?: string, hidden = false): Promise<Browse> => call('misty.browse', { ...(path ? { path } : {}), ...(hidden ? { hidden } : {}) }),
   remove: (session: string) => call('misty.session.delete', { session }),
   route: (input: string): Promise<any> => call('misty.route', { input }),
   ingest: (path: string, collection?: string): Promise<any> => call('misty.rag.ingest', { path, ...(collection ? { collection } : {}) }),

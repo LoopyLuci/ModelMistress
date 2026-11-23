@@ -30,6 +30,29 @@
       </aside>
 
       <section class="chat">
+        <div v-if="scopeOk" class="card scope" aria-label="where Misty works">
+          <div class="row">
+            <label class="field inline">environment
+              <select v-model="envId" :disabled="busy" aria-label="Environment" @change="scopeChanged">
+                <option value="">none: Misty's own settings</option>
+                <option v-for="e in envs" :key="e.id" :value="e.id">{{ e.name }}</option>
+                <option v-if="envId && !picked" :value="envId" disabled>(deleted)</option>
+              </select>
+            </label>
+            <router-link class="btn" to="/misty/environments">Manage...</router-link>
+          </div>
+          <div class="row">
+            <span class="muted small">working folder</span>
+            <span class="mono small grow folder" :title="folder.path">{{ folder.path || "Misty's own folder" }}</span>
+            <span v-if="folder.from" class="pill">{{ folder.from }}</span>
+            <button class="btn" type="button" :disabled="busy" @click="picking = true">Change...</button>
+            <button v-if="cwd" class="btn" type="button" :disabled="busy" @click="clearFolder">Use {{ picked?.cwd ? "the environment's" : "Misty's own" }}</button>
+          </div>
+          <p class="muted small can" aria-label="what she may do here">
+            <template v-for="c in TOOL_CLASSES" :key="c.id"><span>{{ c.label.toLowerCase() }}: <strong>{{ allowed[c.id] || '...' }}</strong></span></template>
+          </p>
+        </div>
+
         <div ref="scroller" class="thread card" aria-live="polite" aria-label="conversation">
           <article v-for="(m, i) in history" :key="i" class="msg" :class="m.role">
             <strong>{{ m.role === 'user' ? 'You' : 'Misty' }}</strong>
@@ -81,7 +104,7 @@
         </div>
 
         <form class="card compose" @submit.prevent="send">
-          <textarea v-model="input" rows="3" placeholder="Ask Misty (Ctrl+Enter sends)" aria-label="message" :disabled="busy" @keydown.ctrl.enter.prevent="send"></textarea>
+          <textarea ref="box" v-model="input" rows="3" placeholder="Ask Misty (Ctrl+Enter sends, Up brings back an earlier message)" aria-label="message" :disabled="busy" @keydown="onKey"></textarea>
           <div class="row">
             <label class="field inline">model
               <select v-model="role" :disabled="busy">
@@ -106,12 +129,16 @@
         </form>
       </section>
     </div>
+
+    <FolderPicker :open="picking" :start="folder.path || null" title="Working folder for this chat" @pick="pickFolder" @cancel="picking = false" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { fold, follow, misty, type Approval, type Ask, type Folded, type MistyStatus, type Session } from '@/misty'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import FolderPicker from '@/components/FolderPicker.vue'
+import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
+import { TOOL_CLASSES, fold, follow, misty, type Approval, type Ask, type Environment, type Folded, type MistyStatus, type Session } from '@/misty'
 
 const status = ref<MistyStatus | null>(null)
 const sessions = ref<Session[]>([])
@@ -127,11 +154,105 @@ const live = ref<Folded | null>(null)
 const pending = ref<Approval[]>([])
 const error = ref('')
 const scroller = ref<HTMLElement | null>(null)
+const box = ref<HTMLTextAreaElement | null>(null)
 let stopped = false
 let gone = false
 
 const fail = (e: any) => {
   error.value = e?.message || String(e)
+}
+
+// ---- where she works: the chat's environment and working folder (see src/misty/env.rs) ----------------------------
+const ENV_KEY = 'mm_misty_env'
+const CWD_KEY = 'mm_misty_cwd'
+const envs = ref<Environment[]>([])
+/** False on a hub that has no environments (an older one): the bar is not shown. */
+const scopeOk = ref(false)
+const envId = ref('')
+const cwd = ref('')
+const picking = ref(false)
+const picked = computed(() => envs.value.find((e) => e.id === envId.value))
+/** The folder she works in: the chat's own, else the environment's, else (empty) Misty's own. */
+const folder = computed(() =>
+  cwd.value
+    ? { path: cwd.value, from: 'this chat' }
+    : picked.value?.cwd
+      ? { path: picked.value.cwd, from: 'environment' }
+      : { path: '', from: '' },
+)
+/** What each class of tool does here: the environment's choice, else Misty's own policy. */
+const allowed = computed(() => {
+  const out: Record<string, string> = {}
+  for (const c of TOOL_CLASSES) out[c.id] = picked.value?.policy?.[c.id] || status.value?.policy?.[c.id] || ''
+  return out
+})
+const mem = {
+  get: (k: string): string => {
+    try {
+      return localStorage.getItem(k) || ''
+    } catch (_) {
+      return ''
+    }
+  },
+  set: (k: string, v: string) => {
+    try {
+      if (v) localStorage.setItem(k, v)
+      else localStorage.removeItem(k)
+    } catch (_) {
+      /* a convenience only */
+    }
+  },
+}
+/** A new chat starts where the last one worked. */
+function lastScope() {
+  const id = mem.get(ENV_KEY)
+  envId.value = envs.value.some((e) => e.id === id) ? id : ''
+  cwd.value = mem.get(CWD_KEY)
+}
+/** An opened chat shows the environment and folder it has. */
+function scopeOf(id: string) {
+  const s = sessions.value.find((x) => x.id === id)
+  envId.value = s?.env || ''
+  cwd.value = s?.cwd || ''
+}
+async function scopeChanged() {
+  mem.set(ENV_KEY, envId.value)
+  mem.set(CWD_KEY, cwd.value)
+  if (!session.value) return // a new chat takes them along with its first message
+  const id = session.value
+  try {
+    await misty.setScope(id, { env: envId.value || null, cwd: cwd.value || null })
+  } catch (e) {
+    fail(e)
+  }
+  await refresh()
+  scopeOf(id) // what the hub has, whether or not the change was accepted
+}
+function pickFolder(path: string) {
+  picking.value = false
+  cwd.value = path
+  scopeChanged()
+}
+function clearFolder() {
+  cwd.value = ''
+  scopeChanged()
+}
+
+// ---- Up and Down in the message box: earlier messages (see chat/recall.ts) ------------------------------------------
+const recall = createRecall(() =>
+  entriesFor(
+    history.value.filter((m) => m.role === 'user').map((m) => m.content),
+    loadSent(),
+  ),
+)
+watch(input, (t) => recall.edited(t))
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault()
+    send()
+    return
+  }
+  if (box.value) recallKey(e, box.value, recall, (t) => (input.value = t))
 }
 const toBottom = () => nextTick(() => scroller.value && (scroller.value.scrollTop = scroller.value.scrollHeight))
 
@@ -147,6 +268,8 @@ async function open(id: string) {
   try {
     history.value = await misty.session(id)
     session.value = id
+    scopeOf(id)
+    recall.reset()
     live.value = null
     pending.value = []
     error.value = ''
@@ -158,6 +281,8 @@ async function open(id: string) {
 
 function fresh() {
   session.value = ''
+  lastScope()
+  recall.reset()
   history.value = []
   live.value = null
   pending.value = []
@@ -181,11 +306,18 @@ async function send() {
   stopped = false
   error.value = ''
   history.value.push({ role: 'user', content: text })
+  remember(text)
+  recall.reset()
   input.value = ''
   live.value = fold([])
   toBottom()
   try {
     const a: Ask = { input: text, approvals: 'ask', ...(session.value ? { session: session.value } : { new_session: true }) }
+    if (!session.value) {
+      // a new chat is made with the environment and folder chosen above
+      if (envId.value) a.env = envId.value
+      if (cwd.value) a.cwd = cwd.value
+    }
     if (role.value) a.role = role.value as Ask['role']
     if (rag.value !== 'auto') a.rag = rag.value === 'on'
     if (noTools.value) a.no_tools = true
@@ -244,6 +376,13 @@ onMounted(async () => {
   } catch (e) {
     fail(e)
   }
+  try {
+    envs.value = await misty.envs()
+    scopeOk.value = true
+  } catch (_) {
+    scopeOk.value = false // a hub from before environments
+  }
+  lastScope()
   refresh()
 })
 onBeforeUnmount(() => {
@@ -260,7 +399,7 @@ onBeforeUnmount(() => {
 .link { flex: 1 1 auto; text-align: left; background: none; border: 0; padding: 6px 8px; color: var(--text); display: flex; flex-direction: column; min-width: 0; }
 .mini { background: none; border: 0; color: var(--muted); padding: 2px 6px; }
 .chat { min-width: 0; }
-.thread { min-height: 320px; max-height: calc(100vh - 340px); overflow-y: auto; }
+.thread { min-height: 320px; max-height: calc(100vh - 460px); overflow-y: auto; }
 .msg { margin-bottom: 14px; }
 .msg > strong { margin-right: 8px; }
 .msg.user .text { background: var(--panel-2); border-radius: 8px; padding: 8px 12px; margin-top: 4px; }
@@ -270,6 +409,11 @@ onBeforeUnmount(() => {
 .approval { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
 .args { white-space: pre-wrap; max-height: 200px; overflow: auto; margin: 6px 0; }
 .compose textarea { margin-bottom: 8px; }
+.scope { margin-bottom: 10px; }
+.scope > * + * { margin-top: 8px; }
+.scope .row { align-items: center; flex-wrap: wrap; gap: 8px; }
+.folder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.can { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; }
 .field.inline { flex-direction: row; align-items: center; gap: 6px; }
 @media (max-width: 760px) {
   .layout { grid-template-columns: 1fr; }

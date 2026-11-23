@@ -40,7 +40,7 @@ model-mistress misty doctor      # checks everything and makes one real call of 
 | Where | How |
 | --- | --- |
 | ModelMistress CLI | `model-mistress misty chat` (talk; `/help` inside), or `model-mistress misty ask "your question"` |
-| ModelMistress dashboard and desktop app | the **Misty** page: chat, sessions, approvals, and **Setup and status** |
+| ModelMistress dashboard and desktop app | the **Misty** page: chat, sessions, approvals, where she works, and **Environments** and **Setup and status** |
 | ModelMistress Windows/Qt window | the **Misty** page |
 | NLP-CLI | `nlp-cli misty ask "your question"`, `/misty` in its shell and windows, and automatically for a sentence it cannot turn into a command. Read-only: every request is sent with approvals denied. Described in NLP-CLI's `docs/MISTY.md` |
 | ABP CLI | `abp misty ask "your question"`, `abp misty status`, `abp misty search`, `abp misty ingest`, `abp misty setup`, `abp misty doctor` |
@@ -78,6 +78,15 @@ you want her to write a file.
 
 Every `ask` can continue a session (`--session ID`) or start one (`--new-session`). `model-mistress misty sessions`
 lists them, `sessions show ID` prints one, `sessions delete ID` removes it.
+
+### Earlier messages
+
+In the message box of the **Chat** page and of the **Misty** page, **Up** brings back the message you sent before and
+**Down** walks forward again; past the newest it gives back what you were typing. What Up walks through is, oldest
+first, what you sent in other chats (kept in this browser, the last 200) and then what you sent in this one, so a new
+chat can repeat or fix the last thing you sent anywhere. In a message of several lines Up and Down move the cursor as
+usual, and only on the first line (Up) or the last (Down) do they walk the history. Typing something walks you back out
+of it. Ctrl+Enter sends from the Misty box, as in Chat.
 
 ## Documents
 
@@ -160,6 +169,42 @@ secret-looking files inside them are refused. Add a folder:
 ```bash
 model-mistress misty config set '{"roots": ["D:/notes", "D:/projects/docs"]}'
 ```
+
+### Environments and working folders
+
+Left alone, she works in her own workspace folder under the policy in her settings. An **environment** is a named setup
+you make once and choose for a chat instead:
+
+- a **working folder**: a file name without a folder means this folder, and her commands start in it;
+- **other folders** her file tools may also reach;
+- **variables** her commands can see (a command otherwise gets almost nothing from your environment);
+- a **policy** for each class of tool (read, write, commands, network, models): *Allow without asking*, *Ask me each
+  time*, *Never*, or *Use Misty's setting*, which keeps the policy from her settings.
+
+In the dashboard and the desktop app, **Misty, Environments** lists, makes, changes, duplicates and deletes them, with
+**Browse...** to pick a folder, and **Use in a new Misty chat** starts the next chat in one. The bar above the chat on the
+**Misty** page chooses the environment and the working folder of the chat that is open; a new chat takes them with its
+first message and starts where the last one worked. **Change...** gives the chat a folder of its own (the folder list
+shows the machine the hub runs on, so it is right even when that is another machine), and **Use the environment's** (or
+**Use Misty's own**) takes it away. The line under the bar says what each class of tool does in that chat. Setting
+commands or the network to *Allow without asking* asks you to confirm first.
+
+The chat's own folder wins over the environment's; with neither, her own workspace applies. Changes apply from the next
+tool call, also to a run that is going. Deleting an environment leaves the chats that used it with their own folder, back
+under her policy. Only you can make or change an environment: she has no tool for it.
+
+```bash
+model-mistress misty env                       # the environments
+model-mistress misty env delete my-app
+model-mistress misty ask "what changed?" --new-session --env my-app --cwd D:/projects/app
+model-mistress misty chat --env my-app         # a session remembers its environment and folder
+model-mistress misty sessions set ID --env my-app --cwd D:/projects/app
+model-mistress misty sessions set ID --env none --cwd none
+model-mistress call misty.env.save '{"name": "my-app", "cwd": "D:/projects/app", "vars": {"MODE": "dev"}, "policy": {"exec": "ask"}}'
+```
+
+Variables are plain text on the machine the hub runs on and a command can print them: put in nothing she must not see.
+The secret and escape guards of the file tools hold inside every folder.
 
 ## Models and engines
 
@@ -348,7 +393,8 @@ answer and nothing else: no tools, no files, no index. Her operations (`misty.*`
 Tested with unit and integration tests (scripted models, no real ones): the router, the agent loop (tools, approvals,
 retries, citations, cancellation), retrieval, the policy and file/secret/SSRF guards, pipelines, the REST, SSE and
 OpenAI-virtual-model surfaces, peer rules, the setup planner (against pinned metadata), the ternary-engine guard, the
-CLI, the ABP client, tools and routes, and the Qt page.
+CLI, the ABP client, tools and routes, environments and working folders (the policy, folder and variables a session
+gets from its environment, the folder browser), and the Qt page.
 
 **Run for real** (Windows 10, Ryzen 9 5900X, 2026-11-21, a separate hub and home): the starter set was installed with its
 size and SHA-256 checks; `misty doctor` passed; Bonsai 2B and 9B ran on the Prism engine; Needle3, Whistle and Mirage ran
@@ -358,7 +404,8 @@ once as `main`.
 
 **Not run:** the 27B (`deep`) and so the escalation up to it and its thinking mode; the `Q2_0` and `PTQ1_0` packings;
 other operating systems and CPUs; the Misty page of the dashboard and desktop app (type-checked, unit-tested and built,
-and the desktop app attaches to a running hub, but nobody has opened the page itself) and of the Qt window (written
+and the desktop app attaches to a running hub, but the page was opened only in a browser, against a scratch hub: the environment bar, the folder picker, the
+Environments page and Up/Down history on 2026-11-23, not in the desktop app, and no real model ran in an environment) and of the Qt window (written
 without PySide6, so not run); ABP's dashboard and CLI (only the client module under them ran).
 
 **Known rough edges.** Needle chose the right tool for 15 of 21 test requests among fifteen tools and called none of

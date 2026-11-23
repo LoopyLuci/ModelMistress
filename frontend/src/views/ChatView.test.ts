@@ -144,3 +144,96 @@ describe('Auto in a chat', () => {
     expect(w.text()).not.toContain('The router chooses between')
   })
 })
+
+describe('Up and Down in the message box', () => {
+  const input = (w: VueWrapper) => w.find('textarea[aria-label="Message"]')
+  const area = (w: VueWrapper) => input(w).element as HTMLTextAreaElement
+  async function press(w: VueWrapper, key: string, mods: Record<string, boolean> = {}) {
+    await input(w).trigger('keydown', { key, ...mods })
+    await flushPromises()
+  }
+  async function chatting() {
+    const w = await open()
+    await w.find('#modelpick').setValue('qwen3-2b')
+    await say(w, 'first question')
+    await say(w, 'second question')
+    return w
+  }
+
+  it('walks back through what was sent in this chat and forward again to the empty box', async () => {
+    const w = await chatting()
+    expect(area(w).value).toBe('')
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('second question')
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('first question')
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('first question') // nothing older
+    await press(w, 'ArrowDown')
+    expect(area(w).value).toBe('second question')
+    await press(w, 'ArrowDown')
+    expect(area(w).value).toBe('')
+    w.unmount()
+  })
+
+  it('puts the caret at the end of a recalled message and sends it with Enter', async () => {
+    const w = await chatting()
+    await press(w, 'ArrowUp')
+    await flushPromises()
+    expect(area(w).selectionStart).toBe('second question'.length)
+    await input(w).trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+    expect(vi.mocked(streamChat)).toHaveBeenCalledTimes(3)
+    const history = vi.mocked(streamChat).mock.calls[2][1]
+    expect(history[history.length - 1]).toEqual({ role: 'user', content: 'second question' })
+    w.unmount()
+  })
+
+  it('keeps a half-typed message: Up from the start of it, Down brings it back', async () => {
+    const w = await chatting()
+    await input(w).setValue('half a thought')
+    // in the middle or at the end of typed text the arrow only moves the caret
+    area(w).setSelectionRange(14, 14)
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('half a thought')
+    area(w).setSelectionRange(0, 0)
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('second question')
+    await press(w, 'ArrowDown')
+    expect(area(w).value).toBe('half a thought')
+    w.unmount()
+  })
+
+  it('leaves the arrow alone with a modifier, and an edit of a recalled message starts the walk over', async () => {
+    const w = await chatting()
+    await press(w, 'ArrowUp', { shiftKey: true })
+    expect(area(w).value).toBe('')
+    await press(w, 'ArrowUp')
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('first question')
+    await input(w).setValue('first question, but better')
+    await press(w, 'ArrowDown') // not walking any more: nothing to go forward to
+    expect(area(w).value).toBe('first question, but better')
+    area(w).setSelectionRange(0, 0)
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('second question') // the newest again
+    w.unmount()
+  })
+
+  it('brings back what was sent in another chat when this one is new, and after a reload', async () => {
+    const w = await chatting()
+    await w.find('button.primary.grow').trigger('click') // New chat
+    await flushPromises()
+    expect(w.findAll('article.msg')).toHaveLength(0)
+    await press(w, 'ArrowUp')
+    expect(area(w).value).toBe('second question')
+    w.unmount()
+    // a fresh start of the app: the chats are gone from memory but what was sent is kept
+    chats.list.splice(0)
+    const again = await open()
+    await press(again, 'ArrowUp')
+    expect(area(again).value).toBe('second question')
+    await press(again, 'ArrowUp')
+    expect(area(again).value).toBe('first question')
+  })
+})

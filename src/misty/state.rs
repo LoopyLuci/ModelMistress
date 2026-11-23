@@ -1,4 +1,4 @@
-//! Sessions, messages and finished runs: `<home>/misty/state.db`. Local only; nothing here is sent anywhere.
+//! Sessions, messages, finished runs and environments: `<home>/misty/state.db`. Local only; nothing here is sent anywhere.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+
+use super::env::Environment;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -16,6 +18,18 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// An environment from its row. A row whose settings do not parse still comes back, by its name, so it can be seen and
+/// deleted.
+fn read_environment(r: &rusqlite::Row) -> Environment {
+    let text = |i: usize| r.get::<_, String>(i).unwrap_or_default();
+    let mut e: Environment = serde_json::from_str(&text(2)).unwrap_or_default();
+    e.id = text(0);
+    e.name = text(1);
+    e.created = r.get(3).unwrap_or(0);
+    e.updated = r.get(4).unwrap_or(0);
+    e
 }
 
 impl Store {
@@ -38,10 +52,129 @@ impl Store {
                role TEXT NOT NULL, content TEXT NOT NULL, ts INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
              CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, session_id TEXT, input TEXT NOT NULL, output TEXT NOT NULL, role TEXT,
-               status TEXT NOT NULL, started INTEGER NOT NULL, ms INTEGER NOT NULL, events TEXT NOT NULL);",
+               status TEXT NOT NULL, started INTEGER NOT NULL, ms INTEGER NOT NULL, events TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS environments(id TEXT PRIMARY KEY, name TEXT NOT NULL, spec TEXT NOT NULL,
+               created INTEGER NOT NULL, updated INTEGER NOT NULL);
+             CREATE UNIQUE INDEX IF NOT EXISTS environments_name ON environments(name COLLATE NOCASE);",
         )
         .map_err(|e| e.to_string())?;
+        // A session's environment and folder came after the first version of this file: add the columns to an old one.
+        for col in ["env_id", "cwd"] {
+            let has = conn
+                .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1")
+                .and_then(|mut q| q.exists(params![col]))
+                .map_err(|e| e.to_string())?;
+            if !has {
+                conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} TEXT"), [])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    // ---- environments and what a session works in ------------------------------------------------------------------
+
+    /// Every environment, by name.
+    pub fn environments(&self) -> Result<Vec<Environment>, String> {
+        let c = self.conn.lock();
+        let mut st = c
+            .prepare("SELECT id, name, spec, created, updated FROM environments ORDER BY name COLLATE NOCASE")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| Ok(read_environment(r)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    /// One environment, by id or else by name (any case).
+    pub fn environment(&self, key: &str) -> Result<Option<Environment>, String> {
+        let c = self.conn.lock();
+        c.query_row(
+            "SELECT id, name, spec, created, updated FROM environments WHERE id = ?1 OR name = ?1 COLLATE NOCASE
+             ORDER BY id = ?1 DESC LIMIT 1",
+            params![key],
+            |r| Ok(read_environment(r)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// Adds `e` (no id yet) or replaces the one with its id. Two environments never share a name (any case).
+    pub fn save_environment(&self, e: &mut Environment) -> Result<(), String> {
+        let c = self.conn.lock();
+        let clash: Option<String> = c
+            .query_row(
+                "SELECT id FROM environments WHERE name = ?1 COLLATE NOCASE AND id != ?2",
+                params![e.name, e.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if clash.is_some() {
+            return Err(format!("an environment named {:?} already exists", e.name));
+        }
+        let t = now();
+        if e.id.is_empty() {
+            e.id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+            e.created = t;
+            e.updated = t;
+            let spec = serde_json::to_string(e).map_err(|x| x.to_string())?;
+            c.execute(
+                "INSERT INTO environments(id, name, spec, created, updated) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![e.id, e.name, spec, t],
+            )
+            .map_err(|x| x.to_string())?;
+        } else {
+            e.updated = t;
+            let spec = serde_json::to_string(e).map_err(|x| x.to_string())?;
+            let n = c
+                .execute(
+                    "UPDATE environments SET name = ?2, spec = ?3, updated = ?4 WHERE id = ?1",
+                    params![e.id, e.name, spec, t],
+                )
+                .map_err(|x| x.to_string())?;
+            if n == 0 {
+                return Err(format!("no environment {}", e.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes an environment; the sessions that used it keep their own folder and go back to Misty's policy.
+    pub fn delete_environment(&self, id: &str) -> Result<bool, String> {
+        let c = self.conn.lock();
+        c.execute("UPDATE sessions SET env_id = NULL WHERE env_id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(c.execute("DELETE FROM environments WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?
+            > 0)
+    }
+
+    /// The environment id and working folder a session has (`None`: none chosen).
+    pub fn session_scope(&self, session: &str) -> Result<(Option<String>, Option<String>), String> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT env_id, cwd FROM sessions WHERE id = ?1",
+                params![session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sets both values (`None` clears one). False when there is no such session.
+    pub fn set_session_scope(&self, session: &str, env: Option<&str>, cwd: Option<&str>) -> Result<bool, String> {
+        Ok(self
+            .conn
+            .lock()
+            .execute(
+                "UPDATE sessions SET env_id = ?2, cwd = ?3 WHERE id = ?1",
+                params![session, env, cwd],
+            )
+            .map_err(|e| e.to_string())?
+            > 0)
     }
 
     pub fn new_session(&self, title: &str) -> Result<String, String> {
@@ -107,14 +240,18 @@ impl Store {
         let c = self.conn.lock();
         let mut st = c
             .prepare(
-                "SELECT s.id, s.title, s.created, s.updated, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
-                 FROM sessions s ORDER BY s.updated DESC, s.created DESC LIMIT ?1",
+                "SELECT s.id, s.title, s.created, s.updated, (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                        s.env_id, e.name, s.cwd
+                 FROM sessions s LEFT JOIN environments e ON e.id = s.env_id
+                 ORDER BY s.updated DESC, s.created DESC LIMIT ?1",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![limit as i64], |r| {
                 Ok(json!({"id": r.get::<_, String>(0)?, "title": r.get::<_, String>(1)?, "created": r.get::<_, i64>(2)?,
-                          "updated": r.get::<_, i64>(3)?, "messages": r.get::<_, i64>(4)?}))
+                          "updated": r.get::<_, i64>(3)?, "messages": r.get::<_, i64>(4)?,
+                          "env": r.get::<_, Option<String>>(5)?, "env_name": r.get::<_, Option<String>>(6)?,
+                          "cwd": r.get::<_, Option<String>>(7)?}))
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
@@ -209,6 +346,103 @@ mod tests {
         assert!(s.delete_session(&a).unwrap());
         assert!(s.history(&a, 10).unwrap().is_empty());
         assert!(!s.delete_session(&a).unwrap());
+    }
+
+    fn env(name: &str) -> Environment {
+        Environment {
+            name: name.into(),
+            cwd: Some("/work/a".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn environments_are_saved_replaced_found_by_id_or_name_and_deleted() {
+        let s = Store::memory().unwrap();
+        let mut a = env("Dev box");
+        a.vars.insert("MODE".into(), "dev".into());
+        s.save_environment(&mut a).unwrap();
+        assert_eq!(a.id.len(), 12);
+        assert!(a.created > 0 && a.created == a.updated);
+        let mut b = env("alpha");
+        s.save_environment(&mut b).unwrap();
+        // by name, any order and case, then by id
+        let names: Vec<String> = s.environments().unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["alpha", "Dev box"]);
+        let got = s.environment("DEV BOX").unwrap().unwrap();
+        assert_eq!((got.id.as_str(), got.vars["MODE"].as_str()), (a.id.as_str(), "dev"));
+        assert_eq!(s.environment(&b.id).unwrap().unwrap().name, "alpha");
+        assert!(s.environment("nope").unwrap().is_none());
+        // replace: same id, new settings
+        let mut again = got;
+        again.cwd = Some("/work/b".into());
+        again.name = "Dev box 2".into();
+        s.save_environment(&mut again).unwrap();
+        assert_eq!(s.environments().unwrap().len(), 2);
+        assert_eq!(s.environment(&a.id).unwrap().unwrap().cwd.as_deref(), Some("/work/b"));
+        // a name is never shared, whatever the case; renaming to its own name is fine
+        assert!(s
+            .save_environment(&mut env("ALPHA"))
+            .unwrap_err()
+            .contains("already exists"));
+        let mut same = s.environment(&b.id).unwrap().unwrap();
+        s.save_environment(&mut same).unwrap();
+        // a replace of an environment that is gone says so
+        let mut ghost = env("ghost");
+        ghost.id = "000000000000".into();
+        assert!(s.save_environment(&mut ghost).unwrap_err().contains("no environment"));
+        assert!(s.delete_environment(&a.id).unwrap() && !s.delete_environment(&a.id).unwrap());
+        assert_eq!(s.environments().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_session_remembers_its_environment_and_folder_and_loses_the_environment_when_it_is_deleted() {
+        let s = Store::memory().unwrap();
+        let mut e = env("work");
+        s.save_environment(&mut e).unwrap();
+        let sid = s.new_session("t").unwrap();
+        assert_eq!(s.session_scope(&sid).unwrap(), (None, None));
+        assert!(s.set_session_scope(&sid, Some(&e.id), Some("/work/own")).unwrap());
+        assert_eq!(
+            s.session_scope(&sid).unwrap(),
+            (Some(e.id.clone()), Some("/work/own".to_string()))
+        );
+        let listed = &s.sessions(10).unwrap()[0];
+        assert_eq!(
+            (
+                listed["env"].as_str(),
+                listed["env_name"].as_str(),
+                listed["cwd"].as_str()
+            ),
+            (Some(e.id.as_str()), Some("work"), Some("/work/own"))
+        );
+        assert!(s.delete_environment(&e.id).unwrap());
+        assert_eq!(s.session_scope(&sid).unwrap(), (None, Some("/work/own".to_string())));
+        assert!(!s.set_session_scope("nope", None, None).unwrap());
+        assert_eq!(s.session_scope("nope").unwrap(), (None, None));
+    }
+
+    #[test]
+    fn a_state_file_from_before_environments_is_upgraded_and_keeps_its_sessions() {
+        let d = crate::testing::TestDir::new("misty-state-old");
+        let path = d.join("state.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL);
+                 INSERT INTO sessions VALUES ('old1', 'before', 1, 2);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let listed = s.sessions(10).unwrap();
+        assert_eq!(listed[0]["title"], "before");
+        assert!(listed[0]["env"].is_null() && listed[0]["cwd"].is_null());
+        assert!(s.set_session_scope("old1", None, Some("/x")).unwrap());
+        drop(s);
+        // opening it a second time does not try to add the columns again
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.session_scope("old1").unwrap().1.as_deref(), Some("/x"));
     }
 
     #[test]

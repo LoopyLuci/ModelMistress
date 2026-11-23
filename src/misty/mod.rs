@@ -10,7 +10,8 @@
 //!   agent     the loop: route, retrieve, reflex, generate, act, escalate
 //!   auto      the router without the agent: the model name `auto`, `router.status`, `router.pick`
 //!   runs      live run logs, cancellation and approvals
-//!   state     sessions and finished runs
+//!   state     sessions, finished runs and environments
+//!   env       environments: a working folder, folders, variables and a tool policy a session works in
 //!   pipeline  short declarative chains of steps
 //!   setup     what to download, where it goes, and checks that it works
 //!   ops       the `misty.*` operations, REST routes, the OpenAI `misty` model
@@ -21,6 +22,7 @@ pub mod auto;
 pub mod cactus;
 pub mod cli;
 pub mod config;
+pub mod env;
 pub mod ops;
 pub mod pipeline;
 pub mod rag;
@@ -92,6 +94,34 @@ impl Misty {
         m.cactus.set_threads(threads);
         *slot = Some(m.clone());
         Ok(m)
+    }
+
+    /// What a session works in: its environment and folder resolved against Misty's settings. With no session, or one
+    /// that is gone, or an environment that was deleted, it is what is left (at the least, Misty's own settings).
+    pub fn scope_for(&self, session: Option<&str>) -> env::Scope {
+        let (env, cwd) = session
+            .and_then(|s| self.state.session_scope(s).ok())
+            .unwrap_or_default();
+        let environment = env.and_then(|id| self.state.environment(&id).ok().flatten());
+        env::Scope::of(&self.cfg.read(), &self.dir, environment.as_ref(), cwd.as_deref())
+    }
+
+    /// The scope for a request that names an environment (by id or name) and/or a folder, and has no session to
+    /// remember them. Says what is wrong with either.
+    pub fn scope_named(&self, environment: Option<&str>, cwd: Option<&str>) -> Result<env::Scope, String> {
+        let e = match environment {
+            Some(k) => Some(
+                self.state
+                    .environment(k)?
+                    .ok_or_else(|| format!("no environment {k:?} (misty.env.list shows them)"))?,
+            ),
+            None => None,
+        };
+        let cwd = cwd
+            .map(env::check_folder)
+            .transpose()
+            .map_err(|e| format!("working folder: {e}"))?;
+        Ok(env::Scope::of(&self.cfg.read(), &self.dir, e.as_ref(), cwd.as_deref()))
     }
 
     pub fn set_llm(&self, llm: Arc<dyn agent::Llm>) {

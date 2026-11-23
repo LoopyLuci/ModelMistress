@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::config::{Policy, PolicySet};
+use super::env::Scope;
 use super::Misty;
 use crate::engine::Fail;
 use crate::hub::Hub;
@@ -534,8 +535,15 @@ fn fail(f: impl Into<Fail>) -> String {
 }
 
 /// Runs one tool. The policy decision (and any approval) has been made by the caller; the guards run here regardless.
-pub async fn run(hub: &Hub, misty: &Misty, name: &str, a: &Value, default_collection: &str) -> Result<Value, String> {
-    let roots = misty.cfg.read().roots_or_default(&misty.dir);
+pub async fn run(
+    hub: &Hub,
+    misty: &Misty,
+    scope: &Scope,
+    name: &str,
+    a: &Value,
+    default_collection: &str,
+) -> Result<Value, String> {
+    let roots = scope.roots.clone();
     let collection = opt(a, "collection").unwrap_or(default_collection).to_string();
     match name {
         "fs_list" => {
@@ -651,7 +659,7 @@ pub async fn run(hub: &Hub, misty: &Misty, name: &str, a: &Value, default_collec
             .await
             .map_err(|e| fail(Fail::from(e))),
         "web_fetch" => web_fetch(arg(a, "url")?).await,
-        "shell_run" => shell_run(&roots, arg(a, "command")?, opt(a, "cwd")).await,
+        "shell_run" => shell_run(&roots, &scope.vars, arg(a, "command")?, opt(a, "cwd")).await,
         "datetime" => {
             let now = chrono::Local::now();
             Ok(
@@ -765,7 +773,14 @@ async fn web_fetch(url: &str) -> Result<Value, String> {
     Ok(json!({"url": u.as_str(), "status": status.as_u16(), "text": cap(text, 24_000)}))
 }
 
-async fn shell_run(roots: &[PathBuf], command: &str, cwd: Option<&str>) -> Result<Value, String> {
+/// Runs a command in a folder under `roots` (the first, by default) with almost no environment: the few variables a
+/// program needs to start, then `vars`, which are the owner's (an environment's).
+async fn shell_run(
+    roots: &[PathBuf],
+    vars: &std::collections::BTreeMap<String, String>,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<Value, String> {
     let dir = guard_path(roots, cwd.unwrap_or("."))?;
     let mut cmd = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
@@ -795,6 +810,7 @@ async fn shell_run(roots: &[PathBuf], command: &str, cwd: Option<&str>) -> Resul
             cmd.env(k, v);
         }
     }
+    cmd.envs(vars);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // no console window
     let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use super::agent::{self, Approvals, Ctx, Req};
 use super::config::Config;
+use super::env::{self, Environment};
 use super::pipeline;
 use super::roster::Role;
 use super::runs::Run;
@@ -48,6 +49,8 @@ fn ask_props() -> Value {
         "no_tools": {"type": "boolean"},
         "panel": {"type": "boolean", "description": "answer through a panel of two roles and an aggregator (needs panel = true in the config)"},
         "approvals": {"type": "string", "enum": ["ask", "deny"], "description": "a tool that needs approval: wait for misty.approve, or refuse (default: ask for run.start, deny for ask)"},
+        "env": t("work in this environment (an id or name from misty.env.list): with a session it is remembered there, without one it applies to this request"),
+        "cwd": t("work in this folder (a full path that exists); wins over the environment's folder"),
         "system": t("replace Misty's persona for this request"),
         "audio_path": t("a WAV file on the hub's machine, transcribed by Whistle first"),
         "audio_base64": t("WAV bytes, base64"),
@@ -77,7 +80,21 @@ pub fn operations() -> Vec<Value> {
         op("misty.approvals", "Tool calls that wait for the owner's answer", false, false, json!({}), &[]),
         op("misty.approve", "Answer a waiting tool call: allow it or refuse it", true, false, json!({"approval": t("an approval id from misty.approvals"), "allow": {"type": "boolean"}}), &["approval", "allow"]),
         op("misty.session.list", "Sessions, newest first", false, false, json!({"limit": {"type": "integer", "minimum": 1}}), &[]),
-        op("misty.session.new", "Start a session", true, false, json!({"title": t("a name")}), &[]),
+        op("misty.session.new", "Start a session, optionally in an environment and working folder", true, false,
+           json!({"title": t("a name"), "env": t("an environment id or name"), "cwd": t("a working folder (full path)")}), &[]),
+        op("misty.session.set", "Choose a session's environment and working folder; null clears one, a field left out stays as it is", true, false,
+           json!({"session": t("a session id"), "env": {"type": ["string", "null"], "description": "an environment id or name, or null for none"},
+                  "cwd": {"type": ["string", "null"], "description": "a full folder path, or null to use the environment's (or Misty's workspace)"}}), &["session"]),
+        op("misty.env.list", "Environments: named working setups (folder, extra folders, variables, a policy for each class of tool)", false, false, json!({}), &[]),
+        op("misty.env.save", "Create an environment, or change one by id (fields left out stay as they are; vars and roots replace the whole list)", true, false,
+           json!({"id": t("an existing environment's id; leave out to create"), "name": t("a unique name"), "description": t("what it is for"),
+                  "cwd": {"type": ["string", "null"], "description": "the working folder (full path, must exist)"},
+                  "roots": {"type": "array", "items": {"type": "string"}, "description": "more folders the file tools may reach"},
+                  "vars": {"type": "object", "description": "variables for shell_run, name to text"},
+                  "policy": {"type": "object", "description": "per class (read, write, exec, net, hub): auto, ask or deny; a class left out keeps Misty's own policy"}}), &[]),
+        op("misty.env.delete", "Delete an environment; its sessions keep their own folder and go back to Misty's policy", true, true, json!({"id": t("an environment id")}), &["id"]),
+        op("misty.browse", "The folders inside a folder, for choosing a working folder; with no path, the usual starting places (home, drives)", false, false,
+           json!({"path": t("a full folder path"), "hidden": {"type": "boolean", "description": "include folders whose name starts with a dot"}}), &[]),
         op("misty.session.get", "A session's messages", false, false, json!({"session": t("a session id"), "limit": {"type": "integer", "minimum": 1}}), &["session"]),
         op("misty.session.rename", "Rename a session", true, false, json!({"session": t("a session id"), "title": t("the new name")}), &["session", "title"]),
         op("misty.session.delete", "Delete a session and its messages", true, true, json!({"session": t("a session id")}), &["session"]),
@@ -154,7 +171,21 @@ fn req_from(misty: &Misty, a: &Value, default_approvals: Approvals) -> Res<Req> 
         ..Default::default()
     };
     r.session = os(a, "session").map(str::to_string);
-    if a["new_session"].as_bool().unwrap_or(false) && r.session.is_none() {
+    let names_scope = a.get("env").is_some() || a.get("cwd").is_some();
+    let new_session = a["new_session"].as_bool().unwrap_or(false) && r.session.is_none();
+    // the environment and folder are checked before a session is made for them
+    let mut chosen = None;
+    if names_scope && (r.session.is_some() || new_session) {
+        let cur = match &r.session {
+            Some(sid) => misty.state.session_scope(sid).map_err(io)?,
+            None => (None, None),
+        };
+        chosen = Some(scope_args(misty, a, cur)?);
+    } else if names_scope {
+        // no session to remember them: they apply to this request only
+        r.scope = Some(misty.scope_named(os(a, "env"), os(a, "cwd")).map_err(Fail::invalid)?);
+    }
+    if new_session {
         let title: String = r.input.chars().take(60).collect();
         r.session = Some(
             misty
@@ -162,6 +193,17 @@ fn req_from(misty: &Misty, a: &Value, default_approvals: Approvals) -> Res<Req> 
                 .new_session(if title.is_empty() { "chat" } else { &title })
                 .map_err(io)?,
         );
+    }
+    if let (Some(sid), Some((env_id, cwd))) = (&r.session, chosen) {
+        if !misty
+            .state
+            .set_session_scope(sid, env_id.as_deref(), cwd.as_deref())
+            .map_err(io)?
+        {
+            return Err(Fail::not_found(format!(
+                "no session {sid} (misty.session.list shows them)"
+            )));
+        }
     }
     if let Some(role) = os(a, "role") {
         r.role = Some(
@@ -206,6 +248,98 @@ fn req_from(misty: &Misty, a: &Value, default_approvals: Approvals) -> Res<Req> 
         return Err(Fail::invalid("input is required (or audio_path, or image_paths)"));
     }
     Ok(r)
+}
+
+/// A session's environment id and folder once `a` is applied to what it has now: a key left out stays, `null` or an
+/// empty string clears it. The environment may be named by id or name; the folder must exist.
+fn scope_args(
+    misty: &Misty,
+    a: &Value,
+    cur: (Option<String>, Option<String>),
+) -> Res<(Option<String>, Option<String>)> {
+    let env_id = match a.get("env") {
+        None => cur.0,
+        Some(Value::Null) => None,
+        Some(Value::String(k)) if k.trim().is_empty() => None,
+        Some(Value::String(k)) => Some(
+            misty
+                .state
+                .environment(k.trim())
+                .map_err(io)?
+                .ok_or_else(|| Fail::not_found(format!("no environment {k:?} (misty.env.list shows them)")))?
+                .id,
+        ),
+        Some(_) => return Err(Fail::invalid("env: an environment id or name, or null")),
+    };
+    let cwd = match a.get("cwd") {
+        None => cur.1,
+        Some(Value::Null) => None,
+        Some(Value::String(c)) if c.trim().is_empty() => None,
+        Some(Value::String(c)) => Some(env::check_folder(c).map_err(|e| Fail::invalid(format!("cwd: {e}")))?),
+        Some(_) => return Err(Fail::invalid("cwd: a full folder path, or null")),
+    };
+    Ok((env_id, cwd))
+}
+
+/// A session's environment, folder and what they add up to.
+fn session_view(misty: &Misty, sid: &str) -> Value {
+    let (env_id, cwd) = misty.state.session_scope(sid).unwrap_or_default();
+    let env_name = env_id
+        .as_deref()
+        .and_then(|id| misty.state.environment(id).ok().flatten())
+        .map(|e| e.name);
+    json!({"session": sid, "env": env_id, "env_name": env_name, "cwd": cwd, "scope": misty.scope_for(Some(sid)).describe()})
+}
+
+/// An environment from the arguments of `misty.env.save`, laid over `e` (a new one, or the one being changed).
+fn environment_from(a: &Value, mut e: Environment) -> Res<Environment> {
+    if let Some(n) = a.get("name").and_then(Value::as_str) {
+        e.name = n.to_string();
+    }
+    if let Some(d) = a.get("description").and_then(Value::as_str) {
+        e.description = d.to_string();
+    }
+    match a.get("cwd") {
+        None => {}
+        Some(Value::Null) => e.cwd = None,
+        Some(Value::String(c)) => e.cwd = Some(c.clone()),
+        Some(_) => return Err(Fail::invalid("cwd: a full folder path, or null")),
+    }
+    match a.get("roots") {
+        None => {}
+        Some(Value::Array(v)) => {
+            e.roots = v
+                .iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| Fail::invalid("roots: a list of folder paths"))
+                })
+                .collect::<Res<_>>()?
+        }
+        Some(_) => return Err(Fail::invalid("roots: a list of folder paths")),
+    }
+    match a.get("vars") {
+        None => {}
+        Some(Value::Object(m)) => {
+            e.vars = m
+                .iter()
+                .map(|(k, v)| match v {
+                    Value::String(x) => Ok((k.clone(), x.clone())),
+                    _ => Err(Fail::invalid(format!("variable {k}: the value must be text"))),
+                })
+                .collect::<Res<_>>()?
+        }
+        Some(_) => return Err(Fail::invalid("vars: an object, name to text")),
+    }
+    if let Some(p) = a.get("policy") {
+        e.policy = serde_json::from_value(p.clone()).map_err(|x| {
+            Fail::invalid(format!(
+                "policy: {x} (the classes are read, write, exec, net, hub; each auto, ask or deny)"
+            ))
+        })?;
+    }
+    Ok(e)
 }
 
 fn outcome(o: &agent::Outcome) -> Value {
@@ -315,8 +449,55 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             json!({"sessions": misty.state.sessions(a["limit"].as_u64().unwrap_or(50) as usize).map_err(io)?})
         }
         "misty.session.new" => {
-            json!({"session": misty.state.new_session(os(a, "title").unwrap_or("chat")).map_err(io)?})
+            let (env_id, cwd) = scope_args(&misty, a, (None, None))?;
+            let sid = misty.state.new_session(os(a, "title").unwrap_or("chat")).map_err(io)?;
+            if env_id.is_some() || cwd.is_some() {
+                misty
+                    .state
+                    .set_session_scope(&sid, env_id.as_deref(), cwd.as_deref())
+                    .map_err(io)?;
+            }
+            json!({"session": sid, "env": env_id, "cwd": cwd})
         }
+        "misty.session.set" => {
+            let sid = s(a, "session")?;
+            if !misty.state.has_session(sid) {
+                return Err(Fail::not_found(format!("no session {sid}")));
+            }
+            let cur = misty.state.session_scope(sid).map_err(io)?;
+            let (env_id, cwd) = scope_args(&misty, a, cur)?;
+            misty
+                .state
+                .set_session_scope(sid, env_id.as_deref(), cwd.as_deref())
+                .map_err(io)?;
+            session_view(&misty, sid)
+        }
+        "misty.env.list" => json!({"environments": misty.state.environments().map_err(io)?}),
+        "misty.env.save" => {
+            let base = match os(a, "id") {
+                Some(id) => misty
+                    .state
+                    .environment(id)
+                    .map_err(io)?
+                    .filter(|e| e.id == id)
+                    .ok_or_else(|| Fail::not_found(format!("no environment {id}")))?,
+                None => Environment::default(),
+            };
+            let mut e = environment_from(a, base)?;
+            e.check().map_err(Fail::invalid)?;
+            misty.state.save_environment(&mut e).map_err(Fail::invalid)?;
+            json!({"environment": e})
+        }
+        "misty.env.delete" => {
+            let key = s(a, "id")?;
+            let e = misty
+                .state
+                .environment(key)
+                .map_err(io)?
+                .ok_or_else(|| Fail::not_found(format!("no environment {key}")))?;
+            json!({"deleted": misty.state.delete_environment(&e.id).map_err(io)?, "id": e.id, "name": e.name})
+        }
+        "misty.browse" => env::browse(os(a, "path"), a["hidden"].as_bool().unwrap_or(false)).map_err(Fail::invalid)?,
         "misty.session.get" => {
             let sid = s(a, "session")?;
             if !misty.state.has_session(sid) {
@@ -956,6 +1137,307 @@ mod tests {
             .unwrap_err()
             .message
             .contains("no tool named nope"));
+    }
+
+    fn folder(r: &Rig, name: &str) -> String {
+        let p = r.dir.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn environments_are_made_changed_listed_and_deleted_and_bad_ones_say_why() {
+        let r = rig_ops(0);
+        let app = folder(&r, "app");
+        let made = c(
+            &r,
+            "misty.env.save",
+            json!({"name": " App ", "cwd": app, "vars": {"MODE": "dev"}, "policy": {"exec": "ask"}}),
+        )
+        .await
+        .unwrap();
+        let e = &made["environment"];
+        let id = e["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            (e["name"].as_str(), e["cwd"].as_str(), e["policy"]["exec"].as_str()),
+            (Some("App"), Some(app.as_str()), Some("ask"))
+        );
+        assert!(
+            e["policy"].get("write").is_none(),
+            "a class left out keeps Misty's own policy"
+        );
+
+        // change one field by id; the rest stays
+        let data = folder(&r, "data");
+        let changed = c(
+            &r,
+            "misty.env.save",
+            json!({"id": id, "description": "the app", "roots": [data]}),
+        )
+        .await
+        .unwrap();
+        let e = &changed["environment"];
+        assert_eq!(
+            (
+                e["description"].as_str(),
+                e["vars"]["MODE"].as_str(),
+                e["roots"][0].as_str()
+            ),
+            (Some("the app"), Some("dev"), Some(data.as_str()))
+        );
+        assert_eq!(
+            c(&r, "misty.env.list", json!({})).await.unwrap()["environments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // vars replace as a whole, and cwd can be cleared
+        let cleared = c(&r, "misty.env.save", json!({"id": id, "vars": {}, "cwd": null}))
+            .await
+            .unwrap();
+        assert!(
+            cleared["environment"]["cwd"].is_null() && cleared["environment"]["vars"].as_object().unwrap().is_empty()
+        );
+
+        // what cannot work is refused with the reason
+        let bad = |args: Value| {
+            let r = &r;
+            async move { c(r, "misty.env.save", args).await.unwrap_err() }
+        };
+        let missing = r.dir.join("missing").to_string_lossy().into_owned();
+        assert!(bad(json!({"name": "x", "cwd": missing}))
+            .await
+            .message
+            .contains("no such folder"));
+        assert!(
+            bad(json!({"name": "app"})).await.message.contains("already exists"),
+            "names are unique in any case"
+        );
+        assert!(bad(json!({"name": "x", "policy": {"exce": "ask"}}))
+            .await
+            .message
+            .contains("exce"));
+        assert!(bad(json!({"name": "x", "policy": {"exec": "always"}}))
+            .await
+            .message
+            .contains("always"));
+        assert!(bad(json!({"name": "x", "vars": {"N": 5}}))
+            .await
+            .message
+            .contains("must be text"));
+        assert!(bad(json!({"name": "x", "vars": {"1BAD": "v"}}))
+            .await
+            .message
+            .contains("variable"));
+        assert!(bad(json!({"description": "no name"}))
+            .await
+            .message
+            .contains("needs a name"));
+        assert_eq!(bad(json!({"id": "nope0000", "name": "x"})).await.status, 404);
+
+        // delete by name or id
+        let gone = c(&r, "misty.env.delete", json!({"id": "APP"})).await.unwrap();
+        assert_eq!(
+            (gone["deleted"].as_bool(), gone["id"].as_str()),
+            (Some(true), Some(id.as_str()))
+        );
+        assert_eq!(
+            c(&r, "misty.env.delete", json!({"id": "app"}))
+                .await
+                .unwrap_err()
+                .status,
+            404
+        );
+        assert!(c(&r, "misty.env.list", json!({})).await.unwrap()["environments"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_gets_an_environment_and_folder_when_made_and_can_change_them_later() {
+        let r = rig_ops(0);
+        let (app, other) = (folder(&r, "app"), folder(&r, "other"));
+        let env = c(&r, "misty.env.save", json!({"name": "App", "cwd": app}))
+            .await
+            .unwrap()["environment"]
+            .clone();
+        let sid = c(&r, "misty.session.new", json!({"title": "work", "env": "app"}))
+            .await
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let listed = |r: &Rig| {
+            let r = r.ctx.hub.clone();
+            async move { call(&r, "misty.session.list", &json!({})).await.unwrap()["sessions"][0].clone() }
+        };
+        let s = listed(&r).await;
+        assert_eq!(
+            (s["env"].as_str(), s["env_name"].as_str(), s["cwd"].is_null()),
+            (env["id"].as_str(), Some("App"), true)
+        );
+
+        // a folder of its own wins over the environment's, and the answer says what that adds up to
+        let set = c(&r, "misty.session.set", json!({"session": sid, "cwd": other}))
+            .await
+            .unwrap();
+        assert_eq!(set["scope"]["cwd"].as_str(), Some(other.as_str()));
+        assert_eq!(set["env_name"], "App", "a field left out stays");
+        // null clears one: back to the environment's folder
+        let set = c(&r, "misty.session.set", json!({"session": sid, "cwd": null}))
+            .await
+            .unwrap();
+        assert_eq!(
+            (set["cwd"].is_null(), set["scope"]["cwd"].as_str()),
+            (true, Some(app.as_str()))
+        );
+        // and with neither, Misty's own workspace and settings
+        let set = c(&r, "misty.session.set", json!({"session": sid, "env": null}))
+            .await
+            .unwrap();
+        assert!(set["env"].is_null() && set["scope"]["cwd"].is_null());
+        assert_eq!(set["scope"]["policy"]["exec"], "deny");
+
+        // refused with the reason, and nothing changes
+        let before = listed(&r).await;
+        assert_eq!(
+            c(&r, "misty.session.set", json!({"session": sid, "env": "nope"}))
+                .await
+                .unwrap_err()
+                .status,
+            404
+        );
+        let missing = r.dir.join("missing").to_string_lossy().into_owned();
+        assert!(c(&r, "misty.session.set", json!({"session": sid, "cwd": missing}))
+            .await
+            .unwrap_err()
+            .message
+            .contains("no such folder"));
+        assert!(c(&r, "misty.session.set", json!({"session": sid, "cwd": "relative"}))
+            .await
+            .unwrap_err()
+            .message
+            .contains("full path"));
+        assert_eq!(
+            c(&r, "misty.session.set", json!({"session": "nope"}))
+                .await
+                .unwrap_err()
+                .status,
+            404
+        );
+        assert_eq!(listed(&r).await, before);
+
+        // deleting the environment leaves the session working
+        c(
+            &r,
+            "misty.session.set",
+            json!({"session": sid, "env": "App", "cwd": other}),
+        )
+        .await
+        .unwrap();
+        c(&r, "misty.env.delete", json!({"id": "App"})).await.unwrap();
+        let s = listed(&r).await;
+        assert_eq!((s["env"].is_null(), s["cwd"].as_str()), (true, Some(other.as_str())));
+    }
+
+    #[tokio::test]
+    async fn a_run_remembers_the_environment_and_folder_it_started_with_and_a_bad_one_makes_no_session() {
+        let r = rig_ops(0);
+        let (app, other) = (folder(&r, "app"), folder(&r, "other"));
+        c(&r, "misty.env.save", json!({"name": "App", "cwd": app}))
+            .await
+            .unwrap();
+        r.llm.say("hello");
+        let v = c(
+            &r,
+            "misty.ask",
+            json!({"input": "hello", "new_session": true, "env": "App", "cwd": other}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["status"], "done", "{v}");
+        let sid = v["session"].as_str().unwrap().to_string();
+        let s = c(&r, "misty.session.list", json!({})).await.unwrap()["sessions"][0].clone();
+        assert_eq!(
+            (s["env_name"].as_str(), s["cwd"].as_str()),
+            (Some("App"), Some(other.as_str()))
+        );
+
+        // naming another folder for a session that exists moves it
+        r.llm.say("again");
+        c(&r, "misty.ask", json!({"input": "again", "session": sid, "cwd": app}))
+            .await
+            .unwrap();
+        let s = c(&r, "misty.session.list", json!({})).await.unwrap()["sessions"][0].clone();
+        assert_eq!(s["cwd"].as_str(), Some(app.as_str()));
+
+        // an environment that is not there stops the request before a session is made for it
+        let e = c(
+            &r,
+            "misty.ask",
+            json!({"input": "x", "new_session": true, "env": "nope"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.status, 404);
+        assert_eq!(
+            c(&r, "misty.session.list", json!({})).await.unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        // a request with no session uses them for that request alone
+        r.llm.say("one-off");
+        let v = c(&r, "misty.ask", json!({"input": "hi", "env": "App"})).await.unwrap();
+        assert_eq!(v["status"], "done");
+        assert_eq!(
+            c(&r, "misty.session.list", json!({})).await.unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(c(&r, "misty.ask", json!({"input": "hi", "env": "nope"}))
+            .await
+            .unwrap_err()
+            .message
+            .contains("no environment"));
+    }
+
+    #[tokio::test]
+    async fn browse_lists_the_folders_in_a_folder_and_the_places_to_start() {
+        let r = rig_ops(0);
+        let app = folder(&r, "app");
+        folder(&r, "app/src");
+        folder(&r, "app/.git");
+        let v = c(&r, "misty.browse", json!({"path": app})).await.unwrap();
+        assert_eq!(
+            v["dirs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["src"]
+        );
+        let v = c(&r, "misty.browse", json!({"path": app, "hidden": true}))
+            .await
+            .unwrap();
+        assert_eq!(v["dirs"].as_array().unwrap().len(), 2);
+        assert!(!c(&r, "misty.browse", json!({})).await.unwrap()["places"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            c(&r, "misty.browse", json!({"path": "relative"}))
+                .await
+                .unwrap_err()
+                .status,
+            400
+        );
     }
 
     #[tokio::test]

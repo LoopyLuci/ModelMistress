@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Misty chats have a working folder and environments, and Up and Down walk through earlier messages**
+  (`src/misty/env.rs`, `frontend/`; [guide](docs/misty/USER_GUIDE.md), [API](docs/misty/API.md)).
+  - *Environments.* A named, reusable setup the owner makes once: a working folder, other folders the file tools may
+  reach, variables for `shell_run`, and a policy for each class of tool that replaces Misty's own for chats in it. New
+  operations `misty.env.list`, `.save`, `.delete`, `misty.session.set` and `misty.browse` (only the owner's token reaches
+  them, and none of her tools does, so she cannot widen her own folders or loosen her own policy); `env` and `cwd` on
+  `misty.session.new`, `misty.ask` and `misty.run.start`; `env`, `env_name` and `cwd` on each listed session. Stored in
+  the existing `state.db` (new `environments` table, two new columns on `sessions`; an old database is upgraded on open,
+  and a session without either works exactly as before). The scope is read again at each tool call, so a change applies
+  to a run that is going. Folders: the chat's own wins over the environment's, and with either one the file tools reach
+  that folder and the environment's other folders only; the secret and escape guards hold inside all of them.
+  - *Where it shows.* The Misty page has a bar above the chat (environment, working folder with where it comes from, what
+  each class of tool does there) and a folder picker that lists folders on the machine the hub runs on; a new page
+  **Misty, Environments** lists, makes, changes, duplicates and deletes them (turning commands or the network on without
+  asking has to be confirmed). CLI: `misty ask|chat --env NAME --cwd FOLDER`, `misty sessions set ID --env NAME|none
+  --cwd FOLDER|none`, `misty env`, `misty env delete NAME`.
+  - *Message history.* In the message box of the Chat page and the Misty page, Up brings back the message sent before
+  and Down walks forward to what was being typed (what was sent in other chats comes first, kept in the browser, the
+  last 200). In a message of several lines the keys move the cursor and only the first line (Up) and the last (Down) walk
+  the history. Ctrl+Enter now sends in the Misty box too.
+  - *Plain Chat.* The Chat page's models have no tools, so a folder or environment has nothing to apply to there; they
+  are for Misty chats.
+  - *Found while checking in a browser, and fixed.* The folder picker waited for the dialog's `close` event to answer, and
+  a page that is not being drawn (a background tab, a hidden pane) never gets it, so choosing a folder did nothing there;
+  it now answers from its button. The folder browser showed `D:/work\docs` for a path written with `/` on Windows; it
+  now uses one kind of slash.
+  - *Checked.* Misty tests 125 (new: environment storage and upgrade, scope and policy in the agent loop with scripted
+  models, the operations, the CLI, the browser), the whole library suite 559 passed, 6 ignored (`--test-threads=3`; with
+  more threads the timing-sensitive factory tests fail on this machine from CPU contention, as before), clippy with
+  warnings denied and `cargo fmt --check`; the dashboard `npm run check` (vue-tsc, 127 tests, build). In a browser against
+  a scratch hub (debug build, scratch home): the environment bar, the picker (open, go into a folder, use it: the chat's
+  folder changed on the hub), making an environment with a folder, a variable and a policy on the Environments page,
+  **Use in a new Misty chat**, and Up and Down on both pages. Not run: the installed desktop app (it needs a new
+  build), a real language model working in an environment (scripted models only), the CLI against a live hub (its
+  tests only), and the folder picker on a hub on another machine.
+
 - **The desktop app finds a restarted hub again.** A hub picks a new token every time it starts and writes it to
   `control.json`, often at the same address (the Scheduled Task uses a fixed port). The app kept the client it made
   at start for as long as `/v1/health` answered, and health needs no token, so after a restart every operation on the

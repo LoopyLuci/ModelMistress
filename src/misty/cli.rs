@@ -15,9 +15,10 @@ model-mistress misty <command>
                                   bonsai-2b bonsai-4b bonsai-9b bonsai-27b
   status                          the roster, the Cactus runtime, engines, memory, the index, what to do next
   doctor                          check everything and make one real call of each kind
-  chat [--session ID] [--role fast|main|deep] [--no-tools]         talk to her (/help inside)
+  chat [--session ID] [--role fast|main|deep] [--no-tools] [--env NAME] [--cwd FOLDER]      talk to her (/help inside)
   ask <text...> [--session ID | --new-session] [--role R] [--rag | --no-rag] [--collection C]
         [--tools a,b | --no-tools] [--audio FILE.wav] [--image FILE]... [--approve ask|deny] [--panel] [--json]
+        [--env NAME] [--cwd FOLDER]     work in an environment and/or a folder (a session remembers them)
   route <text...>                 how a request would be routed, and why (nothing runs)
   rag add <path> [--collection C]       index a file or a folder      rag sources [--collection C]
   rag search <text...> [--k N] [--collection C]                       rag remove <source> | --all [--collection C]
@@ -26,6 +27,9 @@ model-mistress misty <command>
   config                          all settings;  config set '<json patch>'
   approvals                       tool calls waiting for you;   approve <id>   deny <id>
   sessions                        list;   sessions show <id>   sessions delete <id>
+  sessions set <id> [--env NAME|none] [--cwd FOLDER|none]     choose a session's environment and working folder
+  env                             the environments (made on the Environments page, or with `model-mistress call misty.env.save`);
+                                  env delete <name|id>
   pipeline list | show <name> | run <name> [--input key=value]... | save <file.toml>
   bench [--tokens N]              time a short generation on every ready role
 ";
@@ -108,6 +112,12 @@ fn ask_args(p: &Parsed, input: &str) -> Result<Value, String> {
     }
     if let Some(r) = p.flag("role") {
         a["role"] = json!(r);
+    }
+    if let Some(e) = p.flag("env") {
+        a["env"] = json!(e);
+    }
+    if let Some(c) = p.flag("cwd") {
+        a["cwd"] = json!(abs(c));
     }
     if p.on("rag") {
         a["rag"] = json!(true);
@@ -235,7 +245,30 @@ pub fn parse(args: &[String]) -> Result<(String, Value), String> {
                 a["session"] = json!(p.need(1, "a session id")?);
                 "misty.session.delete"
             }
-            Some(o) => return Err(format!("sessions {o}: use list, show or delete")),
+            Some("set") => {
+                a["session"] = json!(p.need(1, "a session id")?);
+                // `none` takes one away; a flag left out leaves it as it is
+                if let Some(e) = p.flag("env") {
+                    a["env"] = if e == "none" { Value::Null } else { json!(e) };
+                }
+                if let Some(c) = p.flag("cwd") {
+                    a["cwd"] = if c == "none" { Value::Null } else { json!(abs(c)) };
+                }
+                "misty.session.set"
+            }
+            Some(o) => return Err(format!("sessions {o}: use list, show, set or delete")),
+        },
+        "env" => match p.pos.first().map(String::as_str) {
+            None | Some("list") => "misty.env.list",
+            Some("delete") | Some("rm") => {
+                a["id"] = json!(p.need(1, "an environment name or id")?);
+                "misty.env.delete"
+            }
+            Some(o) => {
+                return Err(format!(
+                    "env {o}: use list or delete (the Environments page makes and changes them; so does `model-mistress call misty.env.save '{{...}}'`)"
+                ))
+            }
         },
         "pipeline" => match p.pos.first().map(String::as_str) {
             None | Some("list") => "misty.pipeline.list",
@@ -633,6 +666,11 @@ pub async fn run(home: &Path, args: Vec<String>) -> anyhow::Result<()> {
                 let mut a = base.clone();
                 a["input"] = json!(t);
                 let started = c.call("misty.run.start", a).await?;
+                // the first turn applied the environment and folder: the session keeps them
+                if let Some(o) = base.as_object_mut() {
+                    o.remove("env");
+                    o.remove("cwd");
+                }
                 // the first turn made the session: keep using it
                 if base.get("session").and_then(Value::as_str).is_none() {
                     if let Some(s) = started["session"].as_str() {
@@ -775,6 +813,17 @@ mod tests {
         assert_eq!(parse(&a("deny abc123")).unwrap().1["allow"], false);
         assert_eq!(parse(&a("sessions show s1")).unwrap().1["session"], "s1");
         assert_eq!(parse(&a("bench --tokens 32")).unwrap().1["tokens"], 32);
+        // environments: listed and deleted here, a session's choice set (none takes one away, a flag left out stays)
+        assert_eq!(parse(&a("env")).unwrap().0, "misty.env.list");
+        let (op, v) = parse(&a("env delete my-app")).unwrap();
+        assert_eq!((op.as_str(), v["id"].as_str()), ("misty.env.delete", Some("my-app")));
+        assert!(parse(&a("env add x")).unwrap_err().contains("misty.env.save"));
+        let (op, v) = parse(&a("sessions set s1 --env none --cwd /work/app")).unwrap();
+        assert_eq!(op, "misty.session.set");
+        assert!(v["env"].is_null() && v.get("env").is_some());
+        assert_eq!(v["cwd"].as_str().map(|c| c.ends_with("app")), Some(true));
+        let (_, v) = parse(&a("sessions set s1 --env work")).unwrap();
+        assert_eq!((v["env"].as_str(), v.get("cwd").is_none()), (Some("work"), true));
     }
 
     #[test]
@@ -830,6 +879,10 @@ mod tests {
         );
         assert_eq!(v["tools"], json!(["calc", "fs_read"]));
         assert_eq!(v["image_paths"].as_array().unwrap().len(), 2);
+        let v = ask_args(&split(&a("--env work --cwd /work/app")), "x").unwrap();
+        assert_eq!(v["env"], "work");
+        assert!(v["cwd"].as_str().unwrap().ends_with("app"));
+        assert!(ask_args(&split(&a("--role deep")), "x").unwrap().get("env").is_none());
         assert!(ask_args(&split(&a("--approve maybe")), "x").is_err());
         assert!(ask_args(&split(&a("--max-tokens many")), "x").is_err());
         // text may contain words that look like commands

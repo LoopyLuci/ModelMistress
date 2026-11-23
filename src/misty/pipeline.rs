@@ -348,13 +348,13 @@ fn s<'a>(d: &'a Value, k: &str) -> Result<&'a str, String> {
 }
 
 fn guarded(ctx: &Ctx, path: &str) -> Result<PathBuf, String> {
-    let roots = ctx.misty.cfg.read().roots_or_default(&ctx.misty.dir);
-    toolbox::guard_path(&roots, path)
+    // a pipeline has no session: it works where Misty's own settings say
+    toolbox::guard_path(&ctx.misty.scope_for(None).roots, path)
 }
 
 async fn gate(ctx: &Ctx, run: &Run, tool: &str, args: &Value, approvals: Approvals) -> Result<(), String> {
     let spec = toolbox::find(tool).ok_or_else(|| format!("there is no tool named {tool}"))?;
-    agent::gate(ctx, run, None, approvals, &spec, args).await
+    agent::gate(ctx, run, None, approvals, &ctx.misty.scope_for(None), &spec, args).await
 }
 
 fn approvals_of(d: &Value) -> Approvals {
@@ -490,8 +490,9 @@ async fn exec(ctx: &Ctx, run: &Run, kind: &str, d: &Value) -> Result<Value, Stri
             let name = s(d, "tool")?;
             let spec = toolbox::find(name).ok_or_else(|| format!("there is no tool named {name}"))?;
             let args = d.get("args").cloned().unwrap_or(json!({}));
-            agent::gate(ctx, run, None, approvals_of(d), &spec, &args).await?;
-            let r = toolbox::run(&ctx.hub, &ctx.misty, name, &args, &collection).await?;
+            let scope = ctx.misty.scope_for(None);
+            agent::gate(ctx, run, None, approvals_of(d), &scope, &spec, &args).await?;
+            let r = toolbox::run(&ctx.hub, &ctx.misty, &scope, name, &args, &collection).await?;
             let text = r["text"]
                 .as_str()
                 .map(str::to_string)
