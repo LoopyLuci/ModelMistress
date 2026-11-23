@@ -231,6 +231,14 @@ cannot; the **Prism** engine (`setup --install prism`) can, and ModelMistress us
 ternary file with no engine that can run it is refused with a clear message (HTTP 409, `engine_cannot_run`) instead of
 failing during load. `misty status` shows which engines are present.
 
+The Prism engine installed by `--install prism` runs on the CPU. On a machine with a Vulkan GPU, `misty setup --install
+prism-gpu` adds the same build with the Vulkan backend (29 MB, pinned like the rest; it is not in the starter set).
+ModelMistress then runs the `main` and `deep` ternary models on the card, as far as the card has room for them (what is
+left after `vram_reserve_mib`), and keeps `fast`, the embedder and the reranker on the CPU, so that the two processors
+work at the same time. On an RX 7900 XTX a 2B `PQ2_0` file read a prompt 15 times faster and generated 2.2 times faster
+on the card, with the same answers. A ternary file that does not fit the card, or a load the card cannot take, runs on the
+CPU build. A model whose profile sets `gpu_layers` is left where the profile puts it.
+
 A model that does not fit in free memory minus `ram_margin_mib` (2 GiB) is marked `unfit` in `misty status` and not
 used for that role; she falls back to a smaller one when there is one.
 

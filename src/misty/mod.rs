@@ -165,6 +165,7 @@ impl Misty {
         Engines {
             stock_q2: build.map(|b| b >= STOCK_Q2_BUILD).unwrap_or(false),
             prism: hub.engine.prism_server().is_some(),
+            prism_gpu: hub.engine.prism_gpu_server().is_some(),
             gpu_room_bytes: hub.engine.gpu_room_mib(&devices) * 1024 * 1024,
         }
     }
@@ -179,10 +180,15 @@ impl Misty {
             Self::free_ram(),
             cfg.ram_margin_mib * 1024 * 1024,
         );
-        // the embedder and the reranker stay on the CPU, so that the card is left to the language models
+        // `fast`, the embedder and the reranker stay on the CPU, so that the card is left to `main` and `deep` and the two
+        // processors work at once; so does a ternary file that does not fit the card (its server cannot split it)
         hub.engine.set_cpu_hints(
             res.iter()
-                .filter(|r| matches!(r.role, Role::Embed | Role::Rerank) && r.device == "cpu")
+                .filter(|r| r.device == "cpu")
+                .filter(|r| {
+                    matches!(r.role, Role::Fast | Role::Embed | Role::Rerank)
+                        || r.model.as_deref().is_some_and(|m| roster::ternary_pack(m).is_some())
+                })
                 .filter_map(|r| r.model.clone()),
         );
         res

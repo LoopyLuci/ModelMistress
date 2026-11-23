@@ -26,10 +26,15 @@ on, where it runs or would go, VRAM and RAM); Misty's roster counts the card's r
 keeps the embedder and reranker on the CPU. See [serving.md](serving.md) and [HANDOVER.md](HANDOVER.md).
 
 Run: the 27B Q5_K_XL (20.2 GB) loaded on the RX 7900 XTX twice with the new build, and `--fit-target` held a load to
-free memory minus the target. 572 library tests, clippy and the frontend tests pass. Not run: the retry ladder on the
+free memory minus the target. 574 library tests, clippy and the frontend tests pass. Not run: the retry ladder on the
 real card (the failures did not come back), the Models page chips in a browser, and any measurement of a CPU model and a
 GPU model at the same time. Not built: load progress for slow disks, a thread budget for a CPU and a GPU model together,
-a CPU draft model, the PrismML GPU build (open items in [HANDOVER.md](HANDOVER.md)).
+a CPU draft model, the PrismML GPU build on Linux (open items in [HANDOVER.md](HANDOVER.md)).
+
+Ternary Bonsai files on the card (2026-11-23): `misty setup --install prism-gpu` installs the PrismML build with the Vulkan
+backend (29 MB, pinned). A scratch hub on the RX 7900 XTX loaded the 9B `PQ2_0` file on it (2.3 GB of VRAM, 136 tokens/s)
+while the 2B ran on the CPU build (48 tokens/s), both at once, and both answered correctly. `llama-bench` on the 2B: prompt
+3,205 against 211 tokens/s on the CPU, generation 100.7 against 46.8.
 
 ## Ollama-compatible API
 

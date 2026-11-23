@@ -5,6 +5,8 @@
 //! or `misty.setup.run`); `misty.setup.plan` only reports.
 //!
 //!   prism      the PrismML build of llama.cpp (runs every ternary Bonsai packing), into `<home>/engines/prism/`
+//!   prism-gpu  the same build with the Vulkan backend, into `<home>/engines/prism-gpu/`: ternary files run on the GPU
+//!              with it (and on the CPU build when the GPU cannot take them)
 //!   cactus     the Cactus runtime library (from its Python wheel, which is a zip of the shared library), into
 //!              `<home>/engines/cactus/`
 //!   needle3, whistle, mirage    the `.cact` archives, into `<home>/models/cactus/`
@@ -79,6 +81,23 @@ pub fn prism_asset() -> Option<Asset> {
         size,
         sha256,
     })
+}
+
+/// The PrismML build with the Vulkan backend, where the project publishes one and it has been run here (Windows on x86-64:
+/// `PQ2_0` on an RX 7900 XTX gave the CPU build's answers 2.2 times faster to generate and 15 times faster to read a prompt).
+pub fn prism_gpu_asset() -> Option<Asset> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => {
+            let file = "llama-prism-b12128-d7b2896-bin-win-vulkan-x64.zip".to_string();
+            Some(Asset {
+                url: format!("https://github.com/PrismML-Eng/llama.cpp/releases/download/{PRISM_TAG}/{file}"),
+                file,
+                size: 28_692_091,
+                sha256: "ec1479514a34272c815b3d194046d27003867aa9c95069d9cd3031b5c31e01ff",
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The Cactus runtime wheel for this machine.
@@ -235,6 +254,17 @@ pub fn components(hub: &Hub, misty: &Misty) -> Vec<Component> {
         default: true,
         from: format!("github.com/PrismML-Eng/llama.cpp {PRISM_TAG}"),
         note: prism.is_none().then(|| "no prebuilt engine for this platform: build PrismML-Eng/llama.cpp (branch prism) and set the prism_server setting".to_string()),
+    });
+    let gpu = prism_gpu_asset();
+    out.push(Component {
+        id: "prism-gpu".into(),
+        what: "The PrismML build with the Vulkan backend: ternary Bonsai files run on the GPU (not in the starter set: it needs a Vulkan GPU)".into(),
+        kind: "engine",
+        size: gpu.as_ref().map(|a| a.size).unwrap_or(0),
+        installed: hub.engine.prism_gpu_server().is_some(),
+        default: false,
+        from: format!("github.com/PrismML-Eng/llama.cpp {PRISM_TAG}"),
+        note: gpu.is_none().then(|| "no GPU build of this engine has been tried on this platform".to_string()),
     });
     let cactus = cactus_asset();
     out.push(Component {
@@ -498,16 +528,33 @@ pub fn server_version(server: &Path) -> Result<String, String> {
 
 async fn install_prism(engine: &Engine, job: &Job) -> Result<Value, Fail> {
     let a = prism_asset().ok_or_else(|| Fail::invalid("there is no prebuilt PrismML engine for this platform; build PrismML-Eng/llama.cpp (branch prism) and set the prism_server setting"))?;
+    install_prism_build(engine, job, a, "prism", engine.prism_server()).await
+}
+
+async fn install_prism_gpu(engine: &Engine, job: &Job) -> Result<Value, Fail> {
+    let a = prism_gpu_asset()
+        .ok_or_else(|| Fail::invalid("there is no GPU build of the PrismML engine for this platform"))?;
+    install_prism_build(engine, job, a, "prism-gpu", engine.prism_gpu_server()).await
+}
+
+/// Installs a PrismML build into `<home>/engines/<dir>/`. An earlier folder is kept, never deleted.
+async fn install_prism_build(
+    engine: &Engine,
+    job: &Job,
+    a: Asset,
+    dir: &'static str,
+    existing: Option<PathBuf>,
+) -> Result<Value, Fail> {
     let engines = engine.home.join("engines");
-    let target = engines.join("prism");
-    if let Some(existing) = engine.prism_server() {
+    let target = engines.join(dir);
+    if let Some(existing) = existing {
         if existing.starts_with(&target) {
-            return Ok(json!({"id": "prism", "status": "already installed", "server": existing}));
+            return Ok(json!({"id": dir, "status": "already installed", "server": existing}));
         }
     }
     let file = download(engine, job, &a, &engines.join("_downloads")).await?;
     let (tmp, t2) = (
-        engines.join(format!("prism.new-{}", std::process::id())),
+        engines.join(format!("{dir}.new-{}", std::process::id())),
         target.clone(),
     );
     let tmp2 = tmp.clone();
@@ -520,7 +567,7 @@ async fn install_prism(engine: &Engine, job: &Job) -> Result<Value, Fail> {
         if t2.exists() {
             // an earlier folder is kept, never deleted
             let old = t2.with_file_name(format!(
-                "prism.old-{}",
+                "{dir}.old-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -541,7 +588,7 @@ async fn install_prism(engine: &Engine, job: &Job) -> Result<Value, Fail> {
     }
     let r2 = root.clone();
     let version = blocking(move || server_version(&r2)).await?;
-    Ok(json!({"id": "prism", "status": "installed", "server": root, "version": version}))
+    Ok(json!({"id": dir, "status": "installed", "server": root, "version": version}))
 }
 
 async fn install_cactus(engine: &Engine, misty: &Misty, job: &Job) -> Result<Value, Fail> {
@@ -595,6 +642,7 @@ async fn install_cact(engine: &Engine, misty: &Arc<Misty>, job: &Job, id: &str) 
 pub fn expand(ids: &[String]) -> Result<Vec<String>, Fail> {
     let known = [
         "prism",
+        "prism-gpu",
         "cactus",
         "needle3",
         "whistle",
@@ -671,6 +719,7 @@ pub async fn run(hub: &Hub, misty: &Arc<Misty>, ids: &[String], pack: Option<&st
             .start_task("misty", format!("misty setup: {id}"), move |job| async move {
                 match which.as_str() {
                     "prism" => install_prism(&engine, &job).await,
+                    "prism-gpu" => install_prism_gpu(&engine, &job).await,
                     "cactus" => install_cactus(&engine, &m, &job).await,
                     other => install_cact(&engine, &m, &job, other).await,
                 }
@@ -717,6 +766,18 @@ pub async fn doctor(hub: &Hub, misty: &Arc<Misty>) -> Value {
             "the PrismML engine is not installed: PQ2_0 and PTQ1_0 Bonsai files cannot run",
             Some("model-mistress misty setup --install prism"),
         )),
+    }
+    if let Some(p) = hub.engine.prism_gpu_server() {
+        let p2 = p.clone();
+        let v = tokio::task::spawn_blocking(move || server_version(&p2))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        out.push(check(
+            "engine.prism-gpu",
+            Some(v.is_ok()),
+            format!("{}: {}", p.display(), v.unwrap_or_else(|e| e)),
+            Some("model-mistress misty setup --install prism-gpu"),
+        ));
     }
     let ternary: Vec<_> = hub
         .engine
@@ -976,11 +1037,12 @@ mod tests {
         let misty = Misty::open_with(&dir, std::sync::Arc::new(cactus::fake::Fake::with_models(0))).unwrap();
         let p = plan(&hub, &misty);
         let c = p["components"].as_array().unwrap();
-        assert_eq!(c.len(), 9);
+        assert_eq!(c.len(), 10);
         let get = |id: &str| c.iter().find(|x| x["id"] == id).unwrap().clone();
         assert_eq!(get("bonsai-4b")["installed"], true);
         assert_eq!(get("bonsai-9b")["installed"], false);
         assert_eq!(get("prism")["installed"], false);
+        assert_eq!(get("prism-gpu")["installed"], false);
         assert_eq!(
             get("cactus")["installed"],
             true,

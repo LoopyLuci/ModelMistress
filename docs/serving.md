@@ -180,7 +180,15 @@ The cards are probed at most every 20 seconds for listings, so a listing does no
 Misty's status (`misty.status`) gives each roster entry the same block, and a `device`: where Misty means the model to
 run. The embedder and the reranker are kept on the CPU (a model with GPU layers set in its profile is not moved), so the
 card is left to the language models; a language model goes to the card when it fits there, and the roster counts the
-card's room when it asks whether a file fits.
+card's room when it asks whether a file fits. The `fast` role stays on the CPU too, so that a CPU model and a GPU model
+work at once.
+
+**The Prism GPU build.** Ternary Bonsai files are served by the PrismML build, which `misty setup --install prism` puts in
+`<home>/engines/prism/` and which runs on the CPU. `misty setup --install prism-gpu` adds the build with the Vulkan
+backend in `<home>/engines/prism-gpu/` (`MM_PRISM_GPU_SERVER` overrides). A load that puts layers on the card runs the
+GPU build; one with `gpu_layers = 0`, and the retry on the CPU after the card ran out of memory, runs the CPU build. That
+server has no `--fit`, so a ternary file is not split with RAM: it fits the card (counting `vram_reserve_mib`) or runs on
+the CPU. `hardware.can_run_on` says `["gpu","cpu"]` for a ternary file only when the GPU build is installed.
 
 ## Hub watchdog
 

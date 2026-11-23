@@ -18,8 +18,13 @@
   would go, VRAM and RAM), `quant` and `label`; the Models page and `model-mistress models` show them.
   - *Misty* counts the card's room when asking whether a model fits, says where each role is meant to run, and keeps the
   embedder and reranker on the CPU so that the card is left to the language models.
+  - *Ternary models on the GPU.* New setup component `prism-gpu` (the PrismML build with the Vulkan backend, 29 MB,
+  pinned size and SHA-256; `model-mistress misty setup --install prism-gpu`; not in the starter set). Loads that put
+  layers on the card use it, loads on the CPU use the CPU build. Measured on an RX 7900 XTX with the 2B `PQ2_0` file:
+  prompt 3,205 against 211 tokens/s on the CPU, generation 100.7 against 46.8, the same answer. Misty keeps `fast`, the
+  embedder and the reranker on the CPU so that a CPU and a GPU model work at once.
   - Not done yet (see the handover): load progress for slow disks, a thread budget for a CPU and a GPU model at the same
-  time, a CPU draft model, the PrismML GPU build.
+  time, a CPU draft model.
 
 - **Misty chats have a working folder and environments, and Up and Down walk through earlier messages**
   (`src/misty/env.rs`, `frontend/`; [guide](docs/misty/USER_GUIDE.md), [API](docs/misty/API.md)).

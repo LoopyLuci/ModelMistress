@@ -87,8 +87,8 @@ the owner saying yes to the exact file.
 
 ## State of the checks (update this when you run them)
 
-- Full library suite (`cargo test -p model-mistress --lib -- --test-threads=3`) on the finished tree: **572 passed,
-  0 failed, 6 ignored** (about 4 minutes). Send its output to a file: through a `grep` pipe it shows nothing until the end.
+- Full library suite (`cargo test -p model-mistress --lib -- --test-threads=3`) on the finished tree: **574 passed,
+  0 failed, 6 ignored** (about 3 minutes). Send its output to a file: through a `grep` pipe it shows nothing until the end.
 - `cargo clippy -p model-mistress --all-targets -- -D warnings` and `cargo fmt -p model-mistress`: clean.
 - Frontend: `npm run typecheck` and `npm run test` pass (127 tests). `npm run check` also runs `vite build`, which was
   not run.
@@ -130,15 +130,33 @@ the owner saying yes to the exact file.
    (near lossless; `q4_0` only on request), a context that matches the use, and a smaller quantisation on offer. The
    AirLLM spike of the plan (Phase 0) means installing AirLLM and PyTorch into the Forge environment: a large download
    that needs the owner's approval.
-8. **PrismML GPU build for Misty.** With the owner's yes to downloading the 27 MB Vulkan zip (SHA-256 to be pinned in
-   `src/misty/setup.rs` like the CPU one), test whether a `PQ2_0` Bonsai runs on the GPU and how fast; the CPU build
-   prompt-processed 67 tokens/s for the 4B on this machine, a GPU would be far ahead.
+8. **PrismML GPU build for Misty (done 2026-11-23; left: Linux, a 9B-on-both measurement, the owner's answer below).**
+   New setup component `prism-gpu` (`src/misty/setup.rs`, `model-mistress misty setup --install prism-gpu`, not in the
+   starter set): `llama-prism-b12128-d7b2896-bin-win-vulkan-x64.zip` from
+   `https://github.com/PrismML-Eng/llama.cpp/releases/download/prism-b12128-d7b2896/`, 28,692,091 bytes, SHA-256
+   `ec1479514a34272c815b3d194046d27003867aa9c95069d9cd3031b5c31e01ff`, installed into `<home>/engines/prism-gpu/`
+   (`MM_PRISM_GPU_SERVER` overrides). `Engine::server_for` runs it for a ternary load that puts layers on the card and the
+   CPU build for `gpu_layers = 0` and for the retry on the CPU; `can_use_gpu` and `hardware.can_run_on` say `["gpu","cpu"]`
+   for a ternary file only when it is installed. `roster::device_for` sends a ternary file to the card only when the GPU
+   build is there and the file fits what is left of the card (that server has no `--fit`, so no RAM split); `fast`, the
+   embedder and the reranker stay on the CPU, so a CPU and a GPU model work at once. **Checked on the real card with the
+   real installer (scratch hub on port 7890, its own home, the zip reused from the owner-approved download):** the install
+   passed its size and hash checks; `models` labelled the 2B `CPU` and the 4B and 9B `GPU`; the 9B loaded with `-ngl 999`
+   from `engines/prism-gpu` (2,346 MiB of VRAM) while the 2B ran from `engines/prism` with `-ngl 0`, both at once; both
+   answered 17 times 23 correctly (391); the 9B generated 136 tokens/s on the card and the 2B 48 tokens/s on the CPU;
+   `misty ask --role main` ran on the GPU build and `--role fast` on the CPU build. Earlier `llama-bench` on the 2B:
+   prompt 3,205 against 211 t/s (15 times), generation 100.7 against 46.8 t/s (2.2 times), the same answer. The scratch hub
+   and its home were removed. The verified build was also copied into the owner's hub home (`home/engines/prism-gpu/`,
+   ignored by git); the owner's running hub is an older binary and does not use it until it restarts on this build. Left:
+   Linux (`ubuntu-vulkan-x64.tar.gz`, SHA-256 `a73a76f2...cca4`, 33,757,914 bytes, no asset coded and untested), and a
+   9B measurement against the CPU build with nothing else on the card.
 9. **Finish.** Whole library suite, clippy, fmt, the frontend (`npm run check` in `frontend/`), a real run against a
    scratch hub, docs, CHANGELOG. Do not commit unless the owner asks.
 
 ## Open questions for the owner
 
-- May the 27 MB PrismML Vulkan build be downloaded to test ternary models on the GPU? (item 8)
+- May Misty install the PrismML Vulkan build by default (item 8: wired and checked on the card; today it is opt-in with
+  `--install prism-gpu` and the starter set is unchanged)?
 - AirLLM: the plan says no engine. Does the owner still want it after reading the plan's numbers, and may AirLLM and
   PyTorch be installed into the Forge environment for the Phase 0 benchmark? (item 7)
 - The commit headroom is the limit on this machine: should the page file be larger (a Windows setting, the owner's

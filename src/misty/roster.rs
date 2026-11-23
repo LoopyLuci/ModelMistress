@@ -106,20 +106,29 @@ pub struct Engines {
     pub stock_q2: bool,
     /// The Prism llama-server is installed: runs every ternary packing.
     pub prism: bool,
+    /// The Prism build with the Vulkan backend is installed (`misty setup --install prism-gpu`): ternary files can run
+    /// on the GPU.
+    pub prism_gpu: bool,
     /// Bytes of the GPU that models may use now: its free memory, held to what is left of the card after the reserve
     /// for the system (and the system's commit), see `Engine::plannable_free`. 0: no card.
     pub gpu_room_bytes: u64,
 }
 
-/// Where a file is meant to run. Ternary files go to the Prism build, which is the CPU one; the embedder and the
-/// reranker are small and run on the CPU so that the card is left to the language models; any other file goes to the
-/// GPU when it fits there, is split between the GPU and RAM when it fits only in part, and runs on the CPU when there
-/// is no card.
+/// Where a file is meant to run. The `fast` role, the embedder and the reranker run on the CPU: they are small, and
+/// with them there the card is left to `main` and `deep`, so that a CPU model and a GPU model work at the same time.
+/// Any other file goes to the GPU when it fits there. A ternary file needs the Prism GPU build for that (and cannot be
+/// split with RAM: the CPU build takes it when it does not fit the card); another file is split between the GPU and
+/// RAM when it fits only in part. With no card everything runs on the CPU.
 pub fn device_for(e: &ModelEntry, engines: Engines, role: Role) -> &'static str {
-    let prism = pack_of(e).is_some() && engines.prism;
-    if prism || matches!(role, Role::Embed | Role::Rerank) || engines.gpu_room_bytes == 0 {
-        "cpu"
-    } else if e.size_bytes.saturating_add(e.size_bytes / 10) <= engines.gpu_room_bytes {
+    if matches!(role, Role::Fast | Role::Embed | Role::Rerank) || engines.gpu_room_bytes == 0 {
+        return "cpu";
+    }
+    let fits_card = e.size_bytes.saturating_add(e.size_bytes / 10) <= engines.gpu_room_bytes;
+    if pack_of(e).is_some() && engines.prism {
+        // the Prism build serves it; only its GPU build can use the card, and it cannot split a model
+        return if engines.prism_gpu && fits_card { "gpu" } else { "cpu" };
+    }
+    if fits_card {
         "gpu"
     } else {
         "split"
@@ -480,6 +489,37 @@ mod tests {
         let r = resolve(&cat, &BTreeMap::new(), Engines::default(), 8 * GB, 2 * GB);
         assert_ne!(by(&r, Role::Deep).status, "ready");
         assert_eq!(by(&r, Role::Deep).device, "none");
+    }
+
+    #[test]
+    fn a_ternary_file_goes_to_the_card_only_with_the_gpu_build_and_fast_stays_on_the_cpu() {
+        let cat = vec![
+            entry("Ternary-Bonsai-2-9B-PQ2_0", 2.42, "qwen35"),
+            entry("Ternary-Bonsai-2-2B-PQ2_0", 0.52, "qwen35"),
+        ];
+        let device = |eng: Engines, role: Role| {
+            let r = resolve(&cat, &BTreeMap::new(), eng, 30 * GB, 2 * GB);
+            r.iter().find(|x| x.role == role).unwrap().device
+        };
+        let cpu_build = Engines {
+            prism: true,
+            gpu_room_bytes: 20 * GB,
+            ..Default::default()
+        };
+        let both = Engines {
+            prism_gpu: true,
+            ..cpu_build
+        };
+        // only the CPU build is installed: the card stays idle
+        assert_eq!(device(cpu_build, Role::Main), "cpu");
+        // with the GPU build `main` goes to the card, and `fast` stays on the CPU so that the two work at once
+        assert_eq!((device(both, Role::Main), device(both, Role::Fast)), ("gpu", "cpu"));
+        // a card with no room for the file: the CPU build takes it (a ternary file cannot be split with RAM)
+        let small = Engines {
+            gpu_room_bytes: GB,
+            ..both
+        };
+        assert_eq!(device(small, Role::Main), "cpu");
     }
 
     #[test]

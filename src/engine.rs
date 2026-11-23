@@ -821,6 +821,27 @@ impl Engine {
             .find(|p| p.is_file())
     }
 
+    /// The Prism `llama-server` with the Vulkan backend (`misty setup --install prism-gpu`): MM_PRISM_GPU_SERVER, else
+    /// `<home>/engines/prism-gpu/` (the zip's files may sit in that folder or one level down). Ternary files run on the
+    /// GPU with it; the CPU build ([`prism_server`](Self::prism_server)) serves them when no layer goes to the GPU.
+    pub fn prism_gpu_server(&self) -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("MM_PRISM_GPU_SERVER").map(PathBuf::from) {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        let base = self.home.join("engines").join("prism-gpu");
+        let direct = base.join(exe("llama-server"));
+        if direct.is_file() {
+            return Some(direct);
+        }
+        std::fs::read_dir(&base)
+            .ok()?
+            .flatten()
+            .map(|e| e.path().join(exe("llama-server")))
+            .find(|p| p.is_file())
+    }
+
     /// `llama-server --version`, cached per path.
     pub async fn llama_version(&self) -> Option<String> {
         let exe = self.llama_server()?;
@@ -1425,8 +1446,12 @@ impl Engine {
     /// says so.
     fn can_use_gpu(&self, r: &Resolved, devices: &[serving::Device]) -> bool {
         if r.flags.is_prism() {
-            let p = self.prism_server().map(|p| p.display().to_string().to_lowercase());
-            return p.is_some_and(|p| ["vulkan", "hip", "cuda", "metal"].iter().any(|k| p.contains(k)));
+            // the GPU build (`misty setup --install prism-gpu`), or a Prism program set by hand whose path says it is one
+            let named_gpu = |p: Option<PathBuf>| {
+                p.map(|p| p.display().to_string().to_lowercase())
+                    .is_some_and(|p| ["vulkan", "hip", "cuda", "metal"].iter().any(|k| p.contains(k)))
+            };
+            return (self.prism_gpu_server().is_some() && !devices.is_empty()) || named_gpu(self.prism_server());
         }
         !devices.is_empty()
     }
@@ -1803,7 +1828,12 @@ impl Engine {
     /// The server program a load with `r` runs.
     fn server_for(&self, r: &Resolved) -> Option<PathBuf> {
         if r.flags.is_prism() {
-            self.prism_server()
+            // the GPU build when layers go to the GPU, the CPU build when none do (and as the stand-in for the other)
+            if r.gpu_layers != 0 {
+                self.prism_gpu_server().or_else(|| self.prism_server())
+            } else {
+                self.prism_server().or_else(|| self.prism_gpu_server())
+            }
         } else if r.flags.is_rigel() {
             self.rigel_server()
         } else {
@@ -2199,7 +2229,7 @@ impl Engine {
             }
         }
         let exe = if resolved.flags.is_prism() {
-            self.prism_server().ok_or_else(|| {
+            self.server_for(&resolved).ok_or_else(|| {
                 Fail::unavailable(format!(
                     "{}: its profile says engine = \"prism\", but the Prism llama-server was not found: run                      `model-mistress misty setup`, or set prism_server with config.set",
                     entry.id
@@ -4113,6 +4143,49 @@ parallel = 1
         };
         assert!(again.ensure_loaded(&entry, &opts, true).await.is_err());
         assert!(starts(&d)[0].contains("--fit-target 768 "), "{:?}", starts(&d));
+    }
+
+    /// A ternary file is served by the Prism GPU build when layers go to the card and by the CPU build when none do, and
+    /// the label follows: CPU only with the CPU build alone, the card with the GPU build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ternary_file_runs_on_the_prism_gpu_build_for_the_card_and_the_cpu_build_for_the_cpu() {
+        let d = crate::testing::TestDir::new("mm-prism-gpu");
+        let place = |dir: &str| {
+            let p = d.join("engines").join(dir).join(exe("llama-server"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"stand-in").unwrap();
+            p
+        };
+        let cpu_build = place("prism");
+        let e = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                ollama_url: String::new(),
+                ..Default::default()
+            },
+        );
+        let mut entry = stand_in_entry(&d, 1 << 29);
+        entry.id = "Ternary-Bonsai-2-2B-PQ2_0".into();
+        let (s, opts) = (e.settings(), LoadOpts::default());
+        let mut r = e.resolve_serving(&s, &entry, &opts);
+        assert!(r.flags.is_prism());
+        // the CPU build alone serves it, and it has no card to use
+        assert_eq!(e.server_for(&r), Some(cpu_build.clone()));
+        assert!(!e.can_use_gpu(&r, &card(24_000, 23_000)));
+        assert_eq!(e.hardware_json(&entry, &card(24_000, 23_000))["runs_on"], "cpu");
+        // with the GPU build, a load that puts layers on the card uses it, and one that puts none does not
+        let gpu_build = place("prism-gpu");
+        assert_eq!(e.server_for(&r), Some(gpu_build.clone()));
+        r.gpu_layers = 0;
+        assert_eq!(e.server_for(&r), Some(cpu_build));
+        assert!(e.can_use_gpu(&r, &card(24_000, 23_000)));
+        assert!(!e.can_use_gpu(&r, &[]));
+        let h = e.hardware_json(&entry, &card(24_000, 23_000));
+        assert_eq!(
+            (h["runs_on"].as_str(), h["can_run_on"].clone()),
+            (Some("gpu"), json!(["gpu", "cpu"])),
+            "{h}"
+        );
     }
 
     /// A model's hardware label says what it can run on and where it would go: the CPU without a card, the GPU on a
