@@ -69,6 +69,12 @@ impl Client {
         }
     }
 
+    /// The token this client sends. A program that keeps a client for a long time compares it with the control file's,
+    /// because a hub that restarts picks a new one.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// The hub's open health answer: {ok, pid, version, uptime_s}.
     pub async fn health(&self) -> Result<Value> {
         Ok(self

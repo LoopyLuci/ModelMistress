@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **The desktop app finds a restarted hub again.** A hub picks a new token every time it starts and writes it to
+  `control.json`, often at the same address (the Scheduled Task uses a fixed port). The app kept the client it made
+  at start for as long as `/v1/health` answered, and health needs no token, so after a restart every operation on the
+  Models page (and every other page that calls an operation) failed with `unauthorized: this needs the hub's token or
+  a peer key` until the app was closed and opened. It now compares the client's token and address with the control
+  file on each call and makes a new client when they differ (`desktop-app/src/api.rs`; `Client::token()`). This
+  matters more now that the watchdog restarts a hub that stops answering. Covered by a test that changes the token in
+  the control file under a running link. Not run: the fix in the installed app (it needs a new build).
+
 ## 0.4.0 — 2026-11-22
 
 - **The hub no longer wedges after a failed GPU load, restarts itself if it ever does, and places each model on the GPU or

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hub_proc::read_control;
 use anyhow::{bail, Context, Result};
 use model_mistress::client::{default_home, Client};
 use model_mistress::engine::{Engine, Settings};
@@ -55,11 +56,26 @@ impl HubLink {
         }
     }
 
+    /// Is `c` still the hub the control file names? A hub that restarts picks a new token and may take another
+    /// address, but `/v1/health` needs no token, so a client with the old one still looks alive: only the control
+    /// file can tell. The check is skipped for a hub the user named with `MODELMISTRESS_URL`, which the control file
+    /// does not describe.
+    fn is_current(&self, c: &Client) -> bool {
+        let named_by_env = std::env::var("MODELMISTRESS_URL").is_ok_and(|u| !u.trim().is_empty());
+        let (Some(home), false) = (&self.home, named_by_env) else {
+            return true;
+        };
+        match read_control(home) {
+            Some(ctl) => ctl.token == c.token() && ctl.url.trim_end_matches('/') == c.url,
+            None => true, // no control file: the health check decides
+        }
+    }
+
     /// A client for a hub that answers, starting the app's own if none does.
     pub async fn client(&self) -> Result<Arc<Client>> {
         let mut cached = self.client.lock().await;
         if let Some(c) = cached.as_ref() {
-            if c.health().await.is_ok() {
+            if self.is_current(c) && c.health().await.is_ok() {
                 return Ok(c.clone());
             }
             *cached = None;
@@ -210,5 +226,34 @@ pub(crate) mod tests {
     async fn a_link_with_no_hub_says_so() {
         let link = HubLink::fixed("http://127.0.0.1:1", TOKEN);
         assert!(link.client().await.is_err());
+    }
+
+    /// A hub that restarts picks a new token and writes it to its control file, often at the same address (the
+    /// Scheduled Task starts it on a fixed port). `/v1/health` needs no token, so the old client still looked alive
+    /// and every operation after the restart was refused as `unauthorized` until the app was closed and opened.
+    #[tokio::test]
+    async fn a_hub_that_restarted_with_a_new_token_is_found_again_at_the_same_address() {
+        let r = rig().await;
+        let url = r.link.client().await.unwrap().url.clone();
+        let home = r.home.join("link-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let write_control = |token: &str| {
+            let doc = json!({"api": 1, "url": url, "token": token, "pid": 1});
+            std::fs::write(home.join("control.json"), doc.to_string()).unwrap();
+        };
+        let link = HubLink::new(Some(home.clone())).without_embedded();
+
+        // the app starts while the hub still has its old token: the hub answers, the token is refused
+        write_control("the-token-before-the-restart-0000000");
+        assert!(link.client().await.unwrap().status().await.is_err());
+
+        // the hub restarted: same address, the real token in its control file
+        write_control(TOKEN);
+        let c = link.client().await.unwrap();
+        assert_eq!(c.status().await.unwrap()["models_known"], 2);
+
+        // and when nothing changed, the same client is kept rather than made again
+        let again = link.client().await.unwrap();
+        assert!(Arc::ptr_eq(&c, &again));
     }
 }
