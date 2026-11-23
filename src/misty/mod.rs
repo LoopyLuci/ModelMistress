@@ -161,22 +161,31 @@ impl Misty {
     /// What the machine's llama.cpp builds can run.
     pub async fn engines(&self, hub: &Hub) -> Engines {
         let build = hub.engine.llama_version().await.and_then(|v| parse_build(&v));
+        let devices = hub.engine.gpu_devices_recent().await;
         Engines {
             stock_q2: build.map(|b| b >= STOCK_Q2_BUILD).unwrap_or(false),
             prism: hub.engine.prism_server().is_some(),
+            gpu_room_bytes: hub.engine.gpu_room_mib(&devices) * 1024 * 1024,
         }
     }
 
     pub async fn resolutions(&self, hub: &Hub) -> Vec<Resolution> {
         let cfg = self.cfg.read().clone();
         let engines = self.engines(hub).await;
-        roster::resolve(
+        let res = roster::resolve(
             &hub.engine.catalog(),
             &cfg.roles,
             engines,
             Self::free_ram(),
             cfg.ram_margin_mib * 1024 * 1024,
-        )
+        );
+        // the embedder and the reranker stay on the CPU, so that the card is left to the language models
+        hub.engine.set_cpu_hints(
+            res.iter()
+                .filter(|r| matches!(r.role, Role::Embed | Role::Rerank) && r.device == "cpu")
+                .filter_map(|r| r.model.clone()),
+        );
+        res
     }
 
     /// The router's view of the machine, and the resolutions it came from.
@@ -213,11 +222,20 @@ impl Misty {
                 json!({"role": role, "file": file, "present": cactus::archive_dir(&self.home).join(file).is_file(), "loaded": st.has(*mask)})
             })
             .collect();
+        let devices = hub.engine.gpu_devices_recent().await;
+        let catalog = hub.engine.catalog();
         let roster: Vec<Value> = res
             .iter()
             .map(|r| {
                 let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
                 v["loaded"] = json!(r.model.as_deref().map(|m| hub.engine.is_loaded(m)).unwrap_or(false));
+                // where it runs now or would go (the roster's `device` is where Misty means it to run)
+                v["hardware"] = r
+                    .model
+                    .as_deref()
+                    .and_then(|m| catalog.iter().find(|e| e.id == m))
+                    .map(|e| hub.engine.hardware_json(e, &devices))
+                    .unwrap_or(Value::Null);
                 v
             })
             .collect();

@@ -79,6 +79,17 @@ Memory`): llama-server's own "free" figure does not see what other processes hol
 with 5.8 GB taken by other programs, and 5 GB fewer after a 18.5 GB model was loaded). Where the counter is not
 available the planner uses llama-server's figure.
 
+**What models may use.** The card keeps `vram_reserve_mib` (default 2048) free for the system: models may use at most
+the card's total minus that (22 GB of a 24 GB card), and what other loaded models already hold counts against it. The
+planner, the first start of a load and the refusal messages all use this figure, not the card's raw free memory.
+
+**Windows commit.** On Windows the device memory of a GPU load is also charged against the system's *commit* (RAM plus
+page files, less what open programs have committed), about 1.2 times its size. When the commit has less headroom than
+that, the driver says `ErrorOutOfDeviceMemory` with gigabytes of VRAM still free. Measured on an RX 7900 XTX: 25 GB of
+headroom fell to 11 GB when an 11.8 GB model loaded on the GPU. The hub reads the headroom before each load and holds
+the load to what it allows ((headroom - 3 GiB) / 1.2); the part that does not fit stays in RAM. When a load still runs
+out of memory the error names the commit and what to do (close programs, a larger page file).
+
 - It fits: load.
 - It does not, but would after unloading idle models: they are unloaded, least recently used first (a model with a
   request running is never chosen), and the load waits for their memory to come back.
@@ -90,7 +101,8 @@ lacks the layer count) or no device listing (a CPU build), the guard does nothin
 
 `model.plan` (same arguments as `model.load`) answers without loading: the arguments the server would get, the
 estimate, the devices and their free memory, and the verdict `fits`, `fits_after_unloading` (with `unload`),
-`does_not_fit` or `unknown`.
+`does_not_fit` or `unknown`. `memory` adds what holds the load: `reserve_mib`, `usable_mib` (what models may use now),
+`commit_headroom_mib` and `commit_budget_mib` (Windows), and `learned_budget_mib` with the card's `gpu_limit`.
 
 The estimate is checked against measurements in [STATUS.md](STATUS.md).
 
@@ -125,11 +137,19 @@ shows both.
 **When the GPU fails a load.** With `gpu_fallback = true` (the default), a load that fails because of the GPU is tried
 again instead of being reported at once:
 
-1. *Out of memory* (the log says an allocation on a device failed): llama-server is asked to keep 2 GiB more free
-   (`--fit-target` margin + 2048), where it chooses the layers itself.
+1. *Out of memory* (the log says an allocation on a device failed): the load is held lower, to an eighth less than
+   what failed, with the rest of the model in RAM (llama-server's `--fit-target` is set so that it holds). Up to three
+   such splits, as long as the part in RAM fits the free RAM. The card's answer is kept (below).
 2. *Out of memory again, or a crash* (the server died the way a driver crash kills a process: exit code `0xC0000409` or
    another `0xC...` code on Windows, a signal elsewhere): the model is started on the CPU, if free RAM holds the file and
    a GiB more. If it does not, the GPU's own error is the answer.
+
+Even the first start is held: to the smallest of what the reserve allows, what the system's commit allows, and what
+this card has lately shown it can hold. The load is then a split from the start instead of a failure and a retry.
+
+**What the card has shown.** The largest load that worked and the smallest that ran out of memory are kept per card and
+server program in `<home>/gpu_limits.json`. A failure is believed for 24 hours (what else holds the memory changes), a
+success for good. `model.load` with `"retry_gpu": true` ignores a remembered failure.
 
 A failure that is not the GPU's (an unknown architecture, a file that cannot be read, a load that times out) is never
 retried. When every start fails, the error is the last one, with what was tried before it: `(before this: ...)`.
@@ -141,6 +161,26 @@ so in `placement_note`. A different or updated llama-server gets a new try on th
 box for it. An out-of-memory failure is not remembered: it depends on what else is using the GPU at the time.
 
 `gpu_fallback = false` turns all of this off: one start, one error.
+
+## Hardware labels
+
+`model.list` and `/v1/models` carry a `hardware` block on every model, and `quant` and `label` beside it:
+
+| Field | Meaning |
+|---|---|
+| `quant` | The quantisation as the file names it (`Q5_K_XL`, `PQ2_0`), else the GGUF header's. Files of one name differ in it. |
+| `label` | A name that tells models apart: the name in the file and the quantisation. |
+| `hardware.engine` | `llama.cpp`, `prism` or `rigel`. |
+| `hardware.can_run_on` | `["gpu","cpu"]`, or `["cpu"]` when no card is seen or the engine's build is CPU-only (the PrismML build `misty setup` installs). |
+| `hardware.runs_on`, `now` | `gpu`, `split`, `cpu`, `none` (does not fit) or `unknown`. Measured when loaded (`now` true), else where a load would go. |
+| `hardware.gpu_share`, `vram_mib`, `ram_mib` | The share on the card and the memory it takes there and in RAM: measured or estimated. |
+| `hardware.chip`, `label` | The words the Models page and `model-mistress models` show: `GPU`, `CPU`, `GPU 80% + CPU`, `does not fit`. |
+
+The cards are probed at most every 20 seconds for listings, so a listing does not start a process each time.
+Misty's status (`misty.status`) gives each roster entry the same block, and a `device`: where Misty means the model to
+run. The embedder and the reranker are kept on the CPU (a model with GPU layers set in its profile is not moved), so the
+card is left to the language models; a language model goes to the card when it fits there, and the roster counts the
+card's room when it asks whether a file fits.
 
 ## Hub watchdog
 

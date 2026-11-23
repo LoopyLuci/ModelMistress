@@ -519,12 +519,21 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         Cmd::Models { refresh } => {
             let v = client().await?.call("model.list", json!({"refresh": refresh})).await?;
             for m in v.as_array().cloned().unwrap_or_default() {
+                // the file's own quantisation (Q5_K_XL, PQ2_0) tells files of one name apart; the chip is where it
+                // runs (loaded) or would go
+                let hw = &m["hardware"];
+                let chip = hw["chip"].as_str().unwrap_or("-");
                 println!(
-                    "{:<52} {:>7} GB  {:<12} {:<8} {}",
+                    "{:<52} {:>7} GB  {:<12} {:<9} {:<14} {}",
                     m["id"].as_str().unwrap_or(""),
                     m["size_gb"],
                     m["architecture"].as_str().unwrap_or("-"),
-                    m["file_type"].as_str().unwrap_or("-"),
+                    m["quant"].as_str().or(m["file_type"].as_str()).unwrap_or("-"),
+                    if hw["now"] == true {
+                        format!("on {chip}")
+                    } else {
+                        chip.to_string()
+                    },
                     if m["loaded"] == true { "loaded" } else { "" }
                 );
             }

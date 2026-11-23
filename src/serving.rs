@@ -856,7 +856,7 @@ pub enum Fit {
 }
 
 /// Memory the server program itself and its buffers take on the CPU side, beyond the model.
-const RAM_OVERHEAD_MIB: u64 = 768;
+pub const RAM_OVERHEAD_MIB: u64 = 768;
 
 /// Chooses between the GPU, a split and the CPU. Unlike [`plan`] it never refuses for want of VRAM alone: what does not
 /// fit on the GPU runs from RAM, and only a model that fits neither is turned down.
@@ -899,6 +899,100 @@ pub fn fit_json(f: &Fit) -> Value {
             free_ram_mib,
         } => json!({"where": "none", "need_ram_mib": need_ram_mib, "free_ram_mib": free_ram_mib}),
     }
+}
+
+// ---- what a card really lets one process hold ------------------------------------------------------------------
+
+/// What loads have shown about how much of a card one process can hold. The driver's free figure is optimistic, and on
+/// Windows device memory is also charged against the system's commit (see `machine`), so a load that "fits" the card
+/// can still run out of memory. Measured on an RX 7900 XTX: 23.4 GB reported free, a 20 GB load failed on a 1 GB buffer
+/// while 25 GB of commit headroom was left, and the same load worked a while later. The hub keeps the smallest load
+/// that failed (for a day: what else holds the memory changes) and the largest that worked.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuLimit {
+    /// The most dedicated memory (MiB) a model server has held there after it loaded.
+    #[serde(default)]
+    pub ok_mib: u64,
+    /// The smallest ask (MiB) that ran out of memory there. 0: none has, or it was lifted.
+    #[serde(default)]
+    pub failed_mib: u64,
+    /// When that failure was seen (seconds since the epoch).
+    #[serde(default)]
+    pub failed_at: u64,
+}
+
+/// How long a failure is believed: what else is on the machine changes in a day.
+pub const LIMIT_TTL_S: u64 = 24 * 3600;
+/// The least a card is asked to hold in a split load. Below it the split is not worth making.
+pub const MIN_SPLIT_MIB: u64 = 1536;
+/// How many split loads are tried, each held further below the last, before the CPU.
+pub const MAX_SPLIT_TRIES: usize = 3;
+
+impl GpuLimit {
+    /// Whether a failure is on record and still believed.
+    pub fn failure_is_live(&self, now: u64) -> bool {
+        self.failed_mib > 0 && now.saturating_sub(self.failed_at) <= LIMIT_TTL_S
+    }
+
+    /// A load that asked `mib` of the card ran out of memory. An ask at or below what has worked is no news about the
+    /// card (something else held its memory at the time), and changes nothing. True when it was learned.
+    pub fn failed(&mut self, mib: u64, now: u64) -> bool {
+        if mib <= self.ok_mib || mib == 0 {
+            return false;
+        }
+        self.failed_mib = if self.failure_is_live(now) {
+            self.failed_mib.min(mib)
+        } else {
+            mib
+        };
+        self.failed_at = now;
+        true
+    }
+
+    /// A server loaded and holds `mib`. A load that held what once failed means the limit is gone. True when this
+    /// changed anything.
+    pub fn worked(&mut self, mib: u64) -> bool {
+        let mut changed = false;
+        if mib > self.ok_mib {
+            self.ok_mib = mib;
+            changed = true;
+        }
+        if self.failed_mib != 0 && mib >= self.failed_mib {
+            self.failed_mib = 0;
+            changed = true;
+        }
+        changed
+    }
+
+    /// What the next load is held to: an eighth under the ask that failed, and never less than what has worked. None:
+    /// nothing has failed lately, so the driver's figure stands.
+    pub fn budget_mib(&self, now: u64) -> Option<u64> {
+        self.failure_is_live(now).then(|| {
+            let under = self.failed_mib - self.failed_mib / 8;
+            under.max(self.ok_mib).min(self.failed_mib - 1)
+        })
+    }
+}
+
+/// The `--fit-target` (MiB that llama-server keeps free on each card) that holds a load to `budget_mib` of a card with
+/// `free_mib` free, and never leaves less than `floor_mib` free.
+pub fn fit_target_for(free_mib: u64, budget_mib: u64, floor_mib: u64) -> u64 {
+    free_mib.saturating_sub(budget_mib).max(floor_mib)
+}
+
+/// The free VRAM a load is planned against: what the cards have free, held to what models may use of them, which is
+/// each card's total less `reserve_mib` (kept for the system) and less what the hub's other models already hold. The
+/// margin is added back to the cap, because [`plan`] asks for the margin on top of a load's need: the reserve is a limit
+/// on what models use, and the margin is slack for the estimate.
+pub fn plannable_free_mib(devices: &[Device], reserve_mib: u64, held_by_others_mib: u64, margin_mib: u64) -> u64 {
+    let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+    let cap: u64 = devices.iter().map(|d| d.total_mib.saturating_sub(reserve_mib)).sum();
+    free.min(cap.saturating_sub(held_by_others_mib).saturating_add(margin_mib))
+}
+
+/// What a load asks of a card: its need, or what its `--fit-target` leaves of the free memory if that is less.
+pub fn asked_of_card(need_mib: u64, free_mib: u64, target_mib: u64) -> u64 {
+    need_mib.min(free_mib.saturating_sub(target_mib))
 }
 
 /// One GPU from `llama-server --list-devices`.
@@ -1230,6 +1324,76 @@ Exiting, please wait...
                    llama_kv_cache:      Vulkan0 KV buffer size =  1632.00 MiB\n";
         assert_eq!(vram_from_log(log), Some(17000.5 + 1632.0 + 300.0));
         assert_eq!(vram_from_log("nothing here"), None);
+    }
+
+    #[test]
+    fn a_card_that_ran_out_of_memory_is_held_below_the_load_that_failed_and_above_what_worked() {
+        let mut l = GpuLimit::default();
+        // nothing learned: the driver's figure stands
+        assert_eq!(l.budget_mib(100), None);
+        // the measured case: 20,594 MiB asked of a card that, that day, could not give it
+        assert!(l.failed(20_594, 100));
+        assert_eq!(l.budget_mib(100), Some(18_020), "an eighth under the failure");
+        // the load held to that worked: it is remembered, and the budget never goes under it
+        assert!(l.worked(18_195));
+        assert_eq!((l.ok_mib, l.failed_mib, l.failed_at), (18_195, 20_594, 100));
+        assert_eq!(l.budget_mib(200), Some(18_195));
+        // a failure at or below what has worked says nothing about the card (something else held its memory)
+        assert!(!l.failed(18_000, 300));
+        assert_eq!((l.failed_mib, l.failed_at), (20_594, 100));
+        // a smaller failure above it tightens the limit; the budget stays at what has worked, under the failure
+        assert!(l.failed(18_200, 400));
+        assert_eq!((l.failed_mib, l.budget_mib(400)), (18_200, Some(18_195)));
+        // a failure is believed for a day, then the driver's figure stands again; what worked is kept
+        assert!(l.budget_mib(400 + LIMIT_TTL_S).is_some());
+        assert_eq!(l.budget_mib(400 + LIMIT_TTL_S + 1), None);
+        assert!(!l.failure_is_live(400 + LIMIT_TTL_S + 1));
+        assert_eq!(l.ok_mib, 18_195);
+        // a failure after that starts over instead of tightening an old one
+        assert!(l.failed(19_000, 400 + LIMIT_TTL_S + 10));
+        assert_eq!(l.failed_mib, 19_000);
+        // a load that holds what once failed lifts the limit
+        assert!(l.worked(19_500));
+        assert_eq!((l.failed_mib, l.budget_mib(400 + LIMIT_TTL_S + 10)), (0, None));
+        // a worse run does not lower what is known to work
+        assert!(!l.worked(10_000));
+        assert_eq!(l.ok_mib, 19_500);
+    }
+
+    #[test]
+    fn models_never_take_the_reserve_the_system_keeps() {
+        let card = |total, free| Device {
+            name: "Vulkan0: test".into(),
+            total_mib: total,
+            free_mib: free,
+        };
+        // the 24 GB card: 2 GB kept, so models hold at most 22,512 MiB; the margin is slack on top, not part of the cap
+        let one = [card(24_560, 24_000)];
+        assert_eq!(plannable_free_mib(&one, 2_048, 0, 768), 23_280);
+        // a model that needs exactly the cap just fits: need + margin <= the plannable figure
+        assert_eq!(plan(22_512, 23_280, 768, &[]), Plan::Fits);
+        assert!(matches!(plan(22_513, 23_280, 768, &[]), Plan::Refuse { .. }));
+        // free memory below the cap still rules: the desktop holds what it holds
+        assert_eq!(plannable_free_mib(&[card(24_560, 20_000)], 2_048, 0, 768), 20_000);
+        // what the hub's other models hold is not available again
+        assert_eq!(plannable_free_mib(&one, 2_048, 10_000, 768), 13_280);
+        // never underflows
+        assert_eq!(plannable_free_mib(&[card(1_000, 900)], 2_048, 5_000, 0), 0);
+        // no reserve: the free memory as it was
+        assert_eq!(plannable_free_mib(&one, 0, 0, 768), 24_000);
+    }
+
+    #[test]
+    fn the_fit_target_holds_a_load_to_its_budget() {
+        // 23,392 MiB free, held to 18,021: llama-server keeps 5,371 free
+        assert_eq!(fit_target_for(23_392, 18_021, 768), 5_371);
+        // never less than the margin
+        assert_eq!(fit_target_for(23_392, 23_000, 768), 768);
+        assert_eq!(fit_target_for(1_000, 5_000, 768), 768);
+        // what a load asks of a card: its need, or what the target leaves
+        assert_eq!(asked_of_card(20_594, 23_392, 768), 20_594);
+        assert_eq!(asked_of_card(20_594, 23_392, 5_371), 18_021);
+        assert_eq!(asked_of_card(500, 100, 768), 0);
     }
 
     #[test]

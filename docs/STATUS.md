@@ -14,6 +14,23 @@ model on the GPU, a partial offload, an oversized request refused) and what was 
 Scheduled Task's relaunch time, a model larger than VRAM, the dashboard fields in a browser, non-Windows crash
 detection). 539 library tests pass.
 
+## Hardware-aware loading and labels (2026-11-23)
+
+Model loads hold to the memory the machine really has. The GPU keeps `vram_reserve_mib` (default 2048) free for the
+system, so models use at most 22 GB of a 24 GB card. On Windows a GPU load is also charged against the system's commit
+(measured about 1.2 times its size: 25 GB of headroom fell to 11 GB for an 11.8 GB model), which made 20 GB loads fail
+with `ErrorOutOfDeviceMemory` and 23 GB of VRAM free; loads are now held to what the commit allows, an out-of-memory
+failure is retried as up to three lower splits before the CPU, and the limit the card showed is kept in
+`gpu_limits.json`. Every model in `model.list` and `/v1/models` carries `quant`, `label` and `hardware` (what it can run
+on, where it runs or would go, VRAM and RAM); Misty's roster counts the card's room, reports a `device` per role and
+keeps the embedder and reranker on the CPU. See [serving.md](serving.md) and [HANDOVER.md](HANDOVER.md).
+
+Run: the 27B Q5_K_XL (20.2 GB) loaded on the RX 7900 XTX twice with the new build, and `--fit-target` held a load to
+free memory minus the target. 572 library tests, clippy and the frontend tests pass. Not run: the retry ladder on the
+real card (the failures did not come back), the Models page chips in a browser, and any measurement of a CPU model and a
+GPU model at the same time. Not built: load progress for slow disks, a thread budget for a CPU and a GPU model together,
+a CPU draft model, the PrismML GPU build (open items in [HANDOVER.md](HANDOVER.md)).
+
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):

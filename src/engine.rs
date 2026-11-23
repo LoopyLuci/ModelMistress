@@ -123,6 +123,9 @@ pub struct Settings {
     pub vram_guard: bool,
     /// MiB of VRAM left free beyond a load's estimate.
     pub vram_margin_mib: u64,
+    /// MiB of each GPU's memory that models never use, left for the system (the desktop, the driver): the models
+    /// together hold at most the card's total minus this (24,560 MiB card, 2048 reserved: 22,512 MiB, about 22 GB).
+    pub vram_reserve_mib: u64,
     /// Load a model on its first request.
     pub autoload: bool,
     pub load_timeout_s: u64,
@@ -204,6 +207,7 @@ impl Default for Settings {
             warnings: vec![],
             vram_guard: true,
             vram_margin_mib: 768,
+            vram_reserve_mib: 2048,
             autoload: true,
             load_timeout_s: 300,
             idle_unload_s: 0,
@@ -559,6 +563,19 @@ pub struct Engine {
     extras: Mutex<HashMap<String, Extras>>,
     /// Models whose load crashed on the GPU, and that go to the CPU until the engine changes (`placements.json`).
     learned: Mutex<BTreeMap<String, Learned>>,
+    /// What each GPU has shown it lets one process hold, by `device|server program` (`gpu_limits.json`).
+    limits: Mutex<BTreeMap<String, serving::GpuLimit>>,
+    /// The cards as last probed, so that listing models does not start a process per request.
+    device_cache: Mutex<Option<(Instant, Vec<serving::Device>)>>,
+    /// Models Misty keeps on the CPU (the embedder, the reranker), so that the card is left to the language models. A
+    /// model with GPU layers set in its profile or in the request is not moved.
+    cpu_hints: Mutex<std::collections::HashSet<String>>,
+    /// A test's cards, in place of what `llama-server --list-devices` and the performance counters say.
+    #[cfg(test)]
+    fake_devices: Mutex<Option<Vec<serving::Device>>>,
+    /// A test's commit headroom (None: there is no such limit).
+    #[cfg(test)]
+    fake_commit: Mutex<Option<u64>>,
     /// Which options a server program has, from its `--help`, by `path|flag`.
     help_flags: Mutex<HashMap<String, bool>>,
     /// The llama.cpp tools (llama-tts, llama-quantize) that take the machine's memory run one at a time per kind.
@@ -603,6 +620,13 @@ impl Engine {
             bundled_rigel: bundled::install_rigel(&home),
             extras: Mutex::new(load_extras(&home)),
             learned: Mutex::new(load_learned(&home)),
+            limits: Mutex::new(load_limits(&home)),
+            device_cache: Mutex::new(None),
+            cpu_hints: Mutex::new(Default::default()),
+            #[cfg(test)]
+            fake_devices: Mutex::new(None),
+            #[cfg(test)]
+            fake_commit: Mutex::new(None),
             help_flags: Mutex::new(HashMap::new()),
             tool_lock: tokio::sync::Mutex::new(()),
             home,
@@ -1268,8 +1292,17 @@ impl Engine {
 
     /// The options a load of `entry` with `opts` ends up with (see [`serving`]).
     pub fn resolve_serving(&self, s: &Settings, entry: &ModelEntry, opts: &LoadOpts) -> Resolved {
+        // a model Misty keeps on the CPU, unless the request or the model's profile says where its layers go
+        let on_cpu = opts.gpu_layers.is_none()
+            && s.profile_for(&entry.id).is_none_or(|p| p.gpu_layers.is_none())
+            && self.cpu_hints.lock().contains(&entry.id);
         let mut r = Resolved::new(
-            (opts.ctx_size, opts.gpu_layers, opts.parallel, &opts.serve),
+            (
+                opts.ctx_size,
+                if on_cpu { Some(0) } else { opts.gpu_layers },
+                opts.parallel,
+                &opts.serve,
+            ),
             s.profile_for(&entry.id),
             &s.serving,
             (s.ctx_size, s.gpu_layers, s.parallel),
@@ -1338,6 +1371,10 @@ impl Engine {
 
     /// The GPUs and their free memory, from `llama-server --list-devices` (empty: a CPU build, or it cannot tell).
     pub async fn gpu_devices(&self) -> Vec<serving::Device> {
+        #[cfg(test)]
+        if let Some(d) = self.fake_devices.lock().clone() {
+            return d;
+        }
         let Some(exe) = self.llama_server() else {
             return vec![];
         };
@@ -1367,6 +1404,93 @@ impl Engine {
         devices
     }
 
+    /// [`gpu_devices`](Self::gpu_devices) for a listing: the cards as probed in the last 20 seconds.
+    pub async fn gpu_devices_recent(&self) -> Vec<serving::Device> {
+        #[cfg(test)]
+        if self.fake_devices.lock().is_some() {
+            return self.gpu_devices().await;
+        }
+        if let Some((at, d)) = &*self.device_cache.lock() {
+            if at.elapsed() < Duration::from_secs(20) {
+                return d.clone();
+            }
+        }
+        let d = self.gpu_devices().await;
+        *self.device_cache.lock() = Some((Instant::now(), d.clone()));
+        d
+    }
+
+    /// Whether the program that serves `r` can use a GPU. The stock llama.cpp builds can when they see a card. The
+    /// PrismML build `misty setup` installs is the CPU one; another build is taken for a GPU build when its folder
+    /// says so.
+    fn can_use_gpu(&self, r: &Resolved, devices: &[serving::Device]) -> bool {
+        if r.flags.is_prism() {
+            let p = self.prism_server().map(|p| p.display().to_string().to_lowercase());
+            return p.is_some_and(|p| ["vulkan", "hip", "cuda", "metal"].iter().any(|k| p.contains(k)));
+        }
+        !devices.is_empty()
+    }
+
+    /// The hardware label of a model for listings (`model.list`, `/v1/models`): the engine, what it could run on,
+    /// where it runs now (loaded) or would go (not loaded), and the memory it takes or is expected to take.
+    pub fn hardware_json(&self, entry: &ModelEntry, devices: &[serving::Device]) -> Value {
+        let s = self.settings();
+        let opts = LoadOpts::default();
+        let r = self.resolve_serving(&s, entry, &opts);
+        let engine = Serving::from_resolved(&r).engine;
+        let gpu_ok = self.can_use_gpu(&r, devices);
+        let file_mib = entry.size_bytes / (1024 * 1024);
+        let loaded = self.loaded().into_iter().find(|i| i.model == entry.id);
+        let (runs_on, gpu_share, vram, ram): (&str, Option<f64>, Option<u64>, Option<u64>) = if let Some(i) = &loaded {
+            let sv = i.serving();
+            match sv.placement {
+                "gpu" => ("gpu", Some(1.0), sv.vram_mib.map(|v| v.round() as u64), Some(0)),
+                "partial" => ("split", None, sv.vram_mib.map(|v| v.round() as u64), None),
+                "cpu" => ("cpu", Some(0.0), Some(0), Some(file_mib)),
+                _ => ("unknown", None, sv.vram_mib.map(|v| v.round() as u64), None),
+            }
+        } else if r.gpu_layers == 0 || !gpu_ok {
+            ("cpu", Some(0.0), Some(0), Some(file_mib))
+        } else {
+            let est = self.estimate_for(entry, &opts, &r);
+            match self.placement_for(entry, &opts, devices) {
+                Some(serving::Fit::Gpu) | Some(serving::Fit::GpuAfter(..)) => {
+                    ("gpu", Some(1.0), est.map(|e| e.total_mib), Some(0))
+                }
+                Some(serving::Fit::Split { gpu_share }) => (
+                    "split",
+                    Some((gpu_share * 100.0).round() / 100.0),
+                    est.map(|e| (e.total_mib as f64 * gpu_share).round() as u64),
+                    Some((file_mib as f64 * (1.0 - gpu_share)).round() as u64),
+                ),
+                Some(serving::Fit::Cpu) => ("cpu", Some(0.0), Some(0), Some(file_mib)),
+                Some(serving::Fit::No { .. }) => ("none", None, est.map(|e| e.total_mib), None),
+                // no estimate (the header lacks the shape): the GPU is tried first, as a load would
+                None => ("gpu", None, None, None),
+            }
+        };
+        let chip = match (runs_on, gpu_share) {
+            ("split", Some(g)) => format!("GPU {}% + CPU", (g * 100.0).round()),
+            ("split", None) => "GPU + CPU".to_string(),
+            ("gpu", _) => "GPU".to_string(),
+            ("cpu", _) => "CPU".to_string(),
+            ("none", _) => "does not fit".to_string(),
+            _ => "?".to_string(),
+        };
+        json!({
+            "engine": engine,
+            "can_run_on": if gpu_ok { json!(["gpu", "cpu"]) } else { json!(["cpu"]) },
+            "runs_on": runs_on,
+            "now": loaded.is_some(),
+            "gpu_share": gpu_share,
+            "vram_mib": vram,
+            "ram_mib": ram,
+            "device": devices.first().map(|d| d.name.clone()),
+            "chip": chip,
+            "label": format!("{} · {chip}", entry.label()),
+        })
+    }
+
     /// Plans a load against the GPU's free memory: the estimate, the devices, and what to do.
     pub async fn plan_load(
         &self,
@@ -1393,9 +1517,53 @@ impl Engine {
         if devices.is_empty() {
             return (Some(est), Plan::Fits);
         }
-        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        let free = self.plannable_free(devices, &s, &entry.id);
         let plan = serving::plan(est.total_mib, free, s.vram_margin_mib, &self.residents(&entry.id));
         (Some(est), plan)
+    }
+
+    /// The free VRAM a load is planned against: what the cards have free, held to what models may use of them (each
+    /// card's total less `vram_reserve_mib`, which stays free for the system, less what the other loaded models hold).
+    pub fn plannable_free(&self, devices: &[serving::Device], s: &Settings, except: &str) -> u64 {
+        let others: u64 = self.residents(except).iter().map(|r| r.vram_mib).sum();
+        let free = serving::plannable_free_mib(devices, s.vram_reserve_mib, others, s.vram_margin_mib);
+        // on Windows the device memory of a load is charged against the system's commit as well
+        match self.commit_budget_mib() {
+            Some(c) => free.min(c.saturating_add(s.vram_margin_mib)),
+            None => free,
+        }
+    }
+
+    /// The models that are to stay on the CPU (replaces the earlier set). A model already loaded is not moved: this
+    /// decides its next load.
+    pub fn set_cpu_hints(&self, models: impl IntoIterator<Item = String>) {
+        *self.cpu_hints.lock() = models.into_iter().collect();
+    }
+
+    /// The video memory models may use in all, in MiB: what the cards have free plus what the loaded models already
+    /// hold, less the reserve kept for the system on each card. Unlike [`plannable_free`](Self::plannable_free) it
+    /// does not shrink when a model is loaded, so a model that is loaded still fits (Misty's roster asks this).
+    pub fn gpu_room_mib(&self, devices: &[serving::Device]) -> u64 {
+        let reserve = self.settings().vram_reserve_mib;
+        let held: u64 = self.residents("").iter().map(|r| r.vram_mib).sum();
+        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        let usable: u64 = devices.iter().map(|d| d.total_mib.saturating_sub(reserve)).sum();
+        free.saturating_add(held).min(usable)
+    }
+
+    /// What holds a GPU load below the card's free memory, for `model.plan`: the reserve kept for the system, what
+    /// models may use, the system's commit headroom and what it allows, and what the card has shown it can hold.
+    pub fn memory_json(&self, devices: &[serving::Device], r: &Resolved, model: &str) -> Value {
+        let s = self.settings();
+        let limit = self.gpu_limit(devices, r);
+        json!({
+            "reserve_mib": s.vram_reserve_mib,
+            "usable_mib": (!devices.is_empty()).then(|| self.plannable_free(devices, &s, model)),
+            "commit_headroom_mib": self.commit_headroom_mib(),
+            "commit_budget_mib": self.commit_budget_mib(),
+            "learned_budget_mib": self.learned_budget_mib(devices, r),
+            "gpu_limit": limit,
+        })
     }
 
     /// What a load must do about VRAM, given the devices: Ok(None) = go ahead, Ok(Some(models)) = unload these
@@ -1408,7 +1576,7 @@ impl Engine {
     ) -> Result<Option<(Vec<String>, u64)>> {
         let (est, plan) = self.plan_for(entry, opts, devices);
         let Some(est) = est else { return Ok(None) };
-        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        let free = self.plannable_free(devices, &self.settings(), &entry.id);
         match plan {
             Plan::Fits => Ok(None),
             Plan::Evict(models) => Ok(Some((models, est.total_mib + self.settings().vram_margin_mib))),
@@ -1418,7 +1586,8 @@ impl Engine {
                 format!(
                     concat!(
                         "{} needs about {} MiB of VRAM (weights {}, KV cache {}, state {}, compute {}) and the GPU ",
-                        "has {} MiB free with {} MiB more in models that could be unloaded. Lower ctx_size or ",
+                        "has {} MiB for models (its free memory, less the vram_reserve_mib kept for the system) with ",
+                        "{} MiB more in models that could be unloaded. Lower ctx_size or ",
                         "parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or load with ",
                         "skip_vram_check: true to try anyway."
                     ),
@@ -1523,7 +1692,11 @@ impl Engine {
         if devices.is_empty() {
             return None;
         }
-        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        let mut free = self.plannable_free(devices, &s, &entry.id);
+        // a card that has run out of memory before is not counted on for more than it has held
+        if let Some(b) = self.learned_budget_mib(devices, &r) {
+            free = free.min(b.saturating_add(s.vram_margin_mib));
+        }
         Some(serving::place(
             &est,
             free,
@@ -1548,12 +1721,12 @@ impl Engine {
                 need_ram_mib,
                 free_ram_mib,
             }) => {
-                let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+                let free = self.plannable_free(devices, &self.settings(), &entry.id);
                 Err(Fail::new(
                     503,
                     "insufficient_memory",
                     format!(
- "{} does not fit this machine as asked: with the {free} MiB of VRAM that is free it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization.",
+ "{} does not fit this machine as asked: with the {free} MiB of VRAM that models may use it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization.",
                         entry.id
                     ),
                 ))
@@ -1684,9 +1857,187 @@ impl Engine {
         }
     }
 
-    /// Starts the server for a load. When the GPU is what stops it (out of memory, or a driver crash that kills the
-    /// server) and `gpu_fallback` is on, it tries again: with more room kept free, then on the CPU. A crash is
-    /// remembered, so that the next load of that model goes straight to the CPU (`retry_gpu` tries the GPU again).
+    // ---- what the GPU really lets a process hold ----------------------------------------------------------------
+
+    /// The one card a load is planned against. With several, the free memory is a sum that no single process is held
+    /// to, so nothing is learned about them and no limit is applied.
+    fn the_card(devices: &[serving::Device]) -> Option<&serving::Device> {
+        match devices {
+            [d] => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The key a card's limit is kept under: the device and the server program (another build may behave differently).
+    fn limit_key(&self, d: &serving::Device, r: &Resolved) -> String {
+        format!("{}|{}", d.name, self.engine_key(r))
+    }
+
+    /// What the card has shown it lets a process hold (a failure is believed for a day, see [`serving::GpuLimit`]).
+    pub fn gpu_limit(&self, devices: &[serving::Device], r: &Resolved) -> Option<serving::GpuLimit> {
+        let d = Self::the_card(devices)?;
+        self.limits.lock().get(&self.limit_key(d, r)).cloned()
+    }
+
+    /// What loads on the card are held to for now: the learned limit, if a load failed lately.
+    pub fn learned_budget_mib(&self, devices: &[serving::Device], r: &Resolved) -> Option<u64> {
+        self.gpu_limit(devices, r).and_then(|l| l.budget_mib(now_s()))
+    }
+
+    /// The system's commit headroom, in MiB (None: not Windows, so no such limit; a test sets it).
+    pub fn commit_headroom_mib(&self) -> Option<u64> {
+        #[cfg(test)]
+        {
+            *self.fake_commit.lock()
+        }
+        #[cfg(not(test))]
+        {
+            crate::machine::commit_headroom_mib()
+        }
+    }
+
+    /// The most device memory a load can take with the commit headroom the system has (None: no such limit here).
+    pub fn commit_budget_mib(&self) -> Option<u64> {
+        self.commit_headroom_mib()
+            .map(crate::machine::gpu_budget_from_commit_mib)
+    }
+
+    /// A load of `need_mib` of device memory ran out of memory: whether the system's commit explains it, in words.
+    fn commit_hint(&self, need_mib: Option<u64>) -> Option<String> {
+        let headroom = self.commit_headroom_mib()?;
+        let want = crate::machine::commit_for_gpu_load_mib(need_mib?) + crate::machine::COMMIT_MARGIN_MIB;
+        (headroom < want).then(|| {
+            format!(
+                "Windows has only {headroom} MiB of memory commit left and this load needs about {want} MiB of it (the programs that are open hold the rest, and the page files are the limit): close programs, or give Windows a larger page file"
+            )
+        })
+    }
+
+    /// A load that asked `asked_mib` of the card ran out of memory. Returns what the next load should be held to.
+    fn note_gpu_failure(&self, d: &serving::Device, r: &Resolved, asked_mib: u64) -> Option<u64> {
+        let now = now_s();
+        let mut all = self.limits.lock();
+        let l = all.entry(self.limit_key(d, r)).or_default();
+        let learned = l.failed(asked_mib, now);
+        let budget = l.budget_mib(now);
+        if learned {
+            save_limits(&self.home, &all);
+        }
+        budget
+    }
+
+    /// A server loaded on the card and holds `held_mib` of its memory.
+    fn note_gpu_success(&self, devices: &[serving::Device], r: &Resolved, held_mib: f64) {
+        let Some(d) = Self::the_card(devices) else { return };
+        if held_mib < 128.0 {
+            return;
+        }
+        let mut all = self.limits.lock();
+        let l = all.entry(self.limit_key(d, r)).or_default();
+        if l.worked(held_mib.round() as u64) {
+            save_limits(&self.home, &all);
+        }
+    }
+
+    /// The first try of a load, when something holds the card to less than the load needs: the reserve kept for the
+    /// system, the system's commit headroom, or a load of this size having run out of memory on the card lately. The
+    /// load is held to what is left, and the rest of the model stays in RAM. None: nothing limits it, or what would
+    /// be left for RAM does not fit (the load as asked then fails with the reason, which is better than a load that
+    /// cannot work).
+    fn held_first_try(
+        &self,
+        s: &Settings,
+        r: &Resolved,
+        ground: &Ground<'_>,
+        ignore_learned: bool,
+    ) -> Option<(Try, String)> {
+        let d = Self::the_card(ground.devices)?;
+        let need = ground.need_mib?;
+        let others: u64 = self.residents(&ground.model).iter().map(|x| x.vram_mib).sum();
+        let mut budget = d.total_mib.saturating_sub(s.vram_reserve_mib).saturating_sub(others);
+        let mut why = format!("{} MiB of the card are kept for the system, so", s.vram_reserve_mib);
+        if let Some(c) = self.commit_budget_mib() {
+            if c < budget {
+                budget = c;
+                why = format!(
+                    "Windows has {} MiB of memory commit left and a GPU load is charged about a fifth more than its device memory, so",
+                    self.commit_headroom_mib().unwrap_or(0)
+                );
+            }
+        }
+        if let Some(l) = self.learned_budget_mib(ground.devices, r).filter(|_| !ignore_learned) {
+            if l < budget {
+                budget = l;
+                why = format!("this card has not held more than about {l} MiB for one program lately, so");
+            }
+        }
+        if budget >= need || budget < serving::MIN_SPLIT_MIB {
+            return None;
+        }
+        let in_ram = need - budget;
+        if in_ram + serving::RAM_OVERHEAD_MIB > free_ram_mib() {
+            return None;
+        }
+        let target = serving::fit_target_for(d.free_mib, budget, s.vram_margin_mib.max(512));
+        Some((
+            Try::Held { target, budget },
+            format!("{why} about {in_ram} MiB of the model stays in RAM"),
+        ))
+    }
+
+    /// After a load ran out of memory: a split held below the ask that failed (at most [`serving::MAX_SPLIT_TRIES`]
+    /// times), when the cards are known and the part that stays in RAM fits there. None: nothing to go by, or the
+    /// split cannot work, and the ladder goes on.
+    fn split_after_oom(
+        &self,
+        s: &Settings,
+        r: &Resolved,
+        how: &Try,
+        ground: &Ground<'_>,
+        tries: usize,
+    ) -> Option<(Try, String)> {
+        let d = Self::the_card(ground.devices)?;
+        let need = ground.need_mib?;
+        if tries >= serving::MAX_SPLIT_TRIES {
+            return None;
+        }
+        let floor = s.vram_margin_mib.max(512);
+        let target = match how {
+            Try::Asked => floor,
+            Try::Roomier(t) => *t,
+            Try::Held { target, .. } => *target,
+            Try::Cpu => return None,
+        };
+        let asked = serving::asked_of_card(need, d.free_mib, target);
+        let mut budget = self.note_gpu_failure(d, r, asked)?;
+        // the system's commit may be what ran out: what is left of it now is the better figure
+        if let Some(c) = self.commit_budget_mib() {
+            budget = budget.min(c);
+        }
+        if budget < serving::MIN_SPLIT_MIB || budget >= asked {
+            return None;
+        }
+        let in_ram = need.saturating_sub(budget);
+        if in_ram + serving::RAM_OVERHEAD_MIB > free_ram_mib() {
+            return None;
+        }
+        Some((
+            Try::Held {
+                target: serving::fit_target_for(d.free_mib, budget, floor),
+                budget,
+            },
+            format!(
+                "the GPU ran out of memory with {asked} MiB asked of it, so the load was held to {budget} MiB and about {in_ram} MiB of the model stays in RAM"
+            ),
+        ))
+    }
+
+    /// Starts the server for a load. A card that is known to hold less than the load needs (it ran a load out of
+    /// memory before, or the reserve for the system leaves it less) is asked for what it can give, and the rest of the
+    /// model stays in RAM. When the GPU is what stops a load (out of memory, or a driver crash that kills the server)
+    /// and `gpu_fallback` is on, it tries again: held lower each time, then on the CPU. A crash is remembered, so that
+    /// the next load of that model goes straight to the CPU (`retry_gpu` tries the GPU again); what the card held is
+    /// remembered too, so that the next load of a big model starts at what works.
     async fn load_with_fallback(
         &self,
         entry: &ModelEntry,
@@ -1696,6 +2047,11 @@ impl Engine {
         let s = self.settings();
         let r = self.resolve_serving(&s, entry, opts);
         let counted = !devices.is_empty();
+        let ground = Ground {
+            devices,
+            need_mib: self.estimate_for(entry, opts, &r).map(|e| e.total_mib),
+            model: entry.id.clone(),
+        };
         let mut how = Try::Asked;
         let mut note: Option<String> = None;
         if r.is_auto() && s.gpu_fallback && !opts.retry_gpu {
@@ -1704,6 +2060,12 @@ impl Engine {
                 note = Some(format!(
                     "on the CPU: {why}. Load it with retry_gpu: true to try the GPU again"
                 ));
+            }
+        }
+        if how == Try::Asked && r.is_auto() && s.vram_guard && !opts.skip_vram_check && self.fits_itself(&r).await {
+            if let Some((held, why)) = self.held_first_try(&s, &r, &ground, opts.retry_gpu) {
+                how = held;
+                note = Some(why);
             }
         }
         let mut history: Vec<String> = vec![];
@@ -1716,6 +2078,11 @@ impl Engine {
                     } else if opts.retry_gpu && how != Try::Cpu {
                         self.forget(&entry.id);
                     }
+                    if how != Try::Cpu {
+                        if let Some(v) = inst.serving().vram_mib {
+                            self.note_gpu_success(devices, &r, v);
+                        }
+                    }
                     if !history.is_empty() {
                         let tail = if how == Try::Cpu { "; it runs on the CPU" } else { "" };
                         note = Some(format!("{}{tail}", history.join("; ")));
@@ -1726,9 +2093,20 @@ impl Engine {
                     return Ok(inst);
                 }
                 Err(mut f) => {
-                    let Some((next, why, crash)) = self.after_failure(&s, &r, entry, &how, &f).await else {
+                    let Some((next, why, crash)) = self
+                        .after_failure(&s, &r, entry, &how, &f, &ground, history.len())
+                        .await
+                    else {
                         if !history.is_empty() {
                             f.message = format!("{} (before this: {})", f.message, history.join("; "));
+                        }
+                        // on Windows the system's commit often explains a GPU that "ran out of memory" with room to spare
+                        let ran_out = f.fields["gpu_failure"].as_str() == Some("memory")
+                            || history.iter().any(|h| h.contains("ran out of memory"));
+                        if ran_out {
+                            if let Some(hint) = self.commit_hint(ground.need_mib) {
+                                f.message = format!("{} ({hint})", f.message);
+                            }
                         }
                         return Err(f);
                     };
@@ -1743,7 +2121,10 @@ impl Engine {
     }
 
     /// What to try after a failed load: None = the failure is the answer. Only a failure that the GPU caused is
-    /// retried, and on the CPU only when the CPU's memory can hold the model. The last field says the server crashed.
+    /// retried. Out of memory first gets a split, held below what failed, where the cards are known (`tries` is how
+    /// many retries came before); where they are not, llama-server is asked to keep a fixed 2 GiB more free. After
+    /// that the CPU, and only when the CPU's memory can hold the model. The last field says the server crashed.
+    #[allow(clippy::too_many_arguments)]
     async fn after_failure(
         &self,
         s: &Settings,
@@ -1751,18 +2132,25 @@ impl Engine {
         entry: &ModelEntry,
         how: &Try,
         f: &Fail,
+        ground: &Ground<'_>,
+        tries: usize,
     ) -> Option<(Try, String, bool)> {
         if !s.gpu_fallback || r.gpu_layers == 0 || *how == Try::Cpu {
             return None;
         }
         let kind = f.fields["gpu_failure"].as_str()?;
-        if kind == "memory" && *how == Try::Asked && r.is_auto() && self.fits_itself(r).await {
-            let target = s.vram_margin_mib.max(512) + 2048;
-            return Some((
-                Try::Roomier(target),
-                format!("the GPU ran out of memory, so llama-server was asked to keep {target} MiB free"),
-                false,
-            ));
+        if kind == "memory" && r.is_auto() && self.fits_itself(r).await {
+            if let Some((next, why)) = self.split_after_oom(s, r, how, ground, tries) {
+                return Some((next, why, false));
+            }
+            if *how == Try::Asked {
+                let target = s.vram_margin_mib.max(512) + 2048;
+                return Some((
+                    Try::Roomier(target),
+                    format!("the GPU ran out of memory, so llama-server was asked to keep {target} MiB free"),
+                    false,
+                ));
+            }
         }
         // the CPU has to hold the weights it is given: if it cannot, the GPU's error is the answer
         if entry.size_bytes / (1024 * 1024) + 1024 > free_ram_mib() {
@@ -1839,6 +2227,7 @@ impl Engine {
         if resolved.is_auto() && self.fits_itself(&resolved).await {
             resolved.fit_target_mib = Some(match how {
                 Try::Roomier(mib) => *mib,
+                Try::Held { target, .. } => *target,
                 _ => s.vram_margin_mib.max(512),
             });
         }
@@ -2282,10 +2671,22 @@ impl Drop for Engine {
 enum Try {
     /// As configured. Where llama-server can choose the GPU layers itself (`--fit`), it does.
     Asked,
-    /// llama-server chooses again, keeping this many MiB free on each device (the first try ran out of memory).
+    /// llama-server chooses again, keeping this many MiB free on each device (the first try ran out of memory and
+    /// nothing is known about the card to go by).
     Roomier(u64),
+    /// The card is held to `budget` MiB for this load, because loads of this size have run out of memory on it:
+    /// llama-server is told to keep `target` MiB free, which leaves it the layers that fit, and the rest stays in RAM.
+    Held { target: u64, budget: u64 },
     /// Nothing on the GPU.
     Cpu,
+}
+
+/// What a load is placed against: the cards, and what the load needs of one.
+struct Ground<'a> {
+    devices: &'a [serving::Device],
+    need_mib: Option<u64>,
+    /// The model being loaded (the other loaded models are the ones that hold memory).
+    model: String,
 }
 
 /// What the GPU did to a load that failed.
@@ -2349,6 +2750,21 @@ fn load_learned(home: &Path) -> BTreeMap<String, Learned> {
 
 fn save_learned(home: &Path, all: &BTreeMap<String, Learned>) {
     let path = home.join("placements.json");
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(text) = serde_json::to_vec_pretty(all) {
+        let _ = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path));
+    }
+}
+
+fn load_limits(home: &Path) -> BTreeMap<String, serving::GpuLimit> {
+    std::fs::read(home.join("gpu_limits.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_limits(home: &Path, all: &BTreeMap<String, serving::GpuLimit>) {
+    let path = home.join("gpu_limits.json");
     let tmp = path.with_extension("json.tmp");
     if let Ok(text) = serde_json::to_vec_pretty(all) {
         let _ = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path));
@@ -2967,7 +3383,7 @@ parallel = 1
         let gpu = |free| {
             vec![serving::Device {
                 name: "Vulkan0: test".into(),
-                total_mib: 24_000,
+                total_mib: 48_000,
                 free_mib: free,
             }]
         };
@@ -2980,7 +3396,7 @@ parallel = 1
         let f = e.vram_decision(&entry, &big, &gpu(5000)).unwrap_err();
         assert_eq!((f.status, f.code), (503, "insufficient_vram"));
         assert!(
-            f.message.contains("skip_vram_check") && f.message.contains("5000 MiB free"),
+            f.message.contains("skip_vram_check") && f.message.contains("5000 MiB for models"),
             "{}",
             f.message
         );
@@ -3574,6 +3990,229 @@ parallel = 1
         assert!(!d.join("placements.json").exists());
     }
 
+    /// A 3 GiB model the planner can estimate (32 layers, 4 KV heads, 128-wide heads): 4,084 MiB with the default
+    /// context of 8192 tokens in 2 slots.
+    fn sized_entry(home: &Path) -> ModelEntry {
+        let mut e = stand_in_entry(home, 3 << 30);
+        for (k, v) in [
+            ("general.architecture", json!("tiny")),
+            ("tiny.block_count", json!(32)),
+            ("tiny.embedding_length", json!(2048)),
+            ("tiny.attention.head_count", json!(16)),
+            ("tiny.attention.head_count_kv", json!(4)),
+            ("tiny.attention.key_length", json!(128)),
+            ("tiny.attention.value_length", json!(128)),
+        ] {
+            e.meta.insert(k.into(), v);
+        }
+        e
+    }
+
+    fn card(total_mib: u64, free_mib: u64) -> Vec<serving::Device> {
+        vec![serving::Device {
+            name: "Vulkan0: test card".into(),
+            total_mib,
+            free_mib,
+        }]
+    }
+
+    /// The `--fit-target` of each start the stand-in saw (None: the start had none, as a CPU start).
+    fn fit_targets(starts: &[String]) -> Vec<Option<u64>> {
+        starts
+            .iter()
+            .map(|l| {
+                let mut w = l.split_whitespace();
+                w.by_ref().find(|x| *x == "--fit-target")?;
+                w.next()?.parse().ok()
+            })
+            .collect()
+    }
+
+    /// The 2 GiB the system keeps are never handed to a model: the first start is already held under them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reserve_for_the_system_holds_the_first_load_below_the_card() {
+        let d = crate::testing::TestDir::new("mm-ladder-reserve");
+        std::fs::write(d.join("oom"), "").unwrap();
+        let e = ladder_engine(&d, true);
+        // 6,000 MiB with 5,600 free: models may hold 6,000 - 2,048 = 3,952 of it, and the load needs 4,084
+        *e.fake_devices.lock() = Some(card(6_000, 5_600));
+        let entry = sized_entry(&d);
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        assert_eq!(
+            e.estimate_for(&entry, &LoadOpts::default(), &r).unwrap().total_mib,
+            4_084
+        );
+        assert!(e.ensure_loaded(&entry, &LoadOpts::default(), true).await.is_err());
+        let targets = fit_targets(&starts(&d));
+        // llama-server keeps 5,600 - 3,952 = 1,648 MiB free from the first start on, not just the 768 MiB margin
+        assert_eq!(targets[0], Some(1_648), "{targets:?}");
+        // when that run out of memory too, the next try keeps more free still
+        assert!(targets[1].is_some_and(|t| t > 1_648), "{targets:?}");
+    }
+
+    /// An out-of-memory error is answered with a split held lower each time, then the CPU; what failed is kept, and the
+    /// next load of the model starts where it worked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_that_runs_out_of_memory_is_asked_for_less_each_time_and_the_limit_is_kept() {
+        let d = crate::testing::TestDir::new("mm-ladder-split");
+        std::fs::write(d.join("oom"), "").unwrap();
+        let e = ladder_engine(&d, true);
+        *e.fake_devices.lock() = Some(card(10_000, 9_500));
+        let entry = sized_entry(&d);
+        let f = e
+            .ensure_loaded(&entry, &LoadOpts::default(), true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        assert!(
+            f.message
+                .contains("so the load was held to 3574 MiB and about 510 MiB of the model stays in RAM"),
+            "{}",
+            f.message
+        );
+        let seen = starts(&d);
+        let targets = fit_targets(&seen);
+        // as asked (the 768 MiB margin), then three splits, each keeping more free than the last: the ask that failed
+        // was 4,084, then 3,574, then 3,128, each held an eighth under
+        assert_eq!(
+            &targets[..4],
+            &[Some(768), Some(5_926), Some(6_372), Some(6_763)],
+            "{seen:?}"
+        );
+        // the CPU only when its RAM holds the file
+        if let Some(cpu) = seen.get(4) {
+            assert!(cpu.contains("-dev none"), "{cpu}");
+        }
+        assert!(seen.len() <= 5, "{seen:?}");
+        let kept = load_limits(&d);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let l = kept.values().next().unwrap();
+        assert_eq!((l.ok_mib, l.failed_mib), (0, 3_128));
+        assert!(kept.keys().next().unwrap().starts_with("Vulkan0: test card|"));
+
+        // another run of the hub (same server program) starts from what it learned: held to 3128 - 391 = 2737 at once
+        std::fs::remove_file(d.join("calls.txt")).unwrap();
+        let stub = e.settings().llama_server.clone().unwrap();
+        let again = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(stub),
+                ollama_url: String::new(),
+                ..Default::default()
+            },
+        );
+        *again.fake_devices.lock() = Some(card(10_000, 9_500));
+        assert!(again.ensure_loaded(&entry, &LoadOpts::default(), true).await.is_err());
+        let first = &starts(&d)[0];
+        assert!(first.contains("--fit-target 6763 "), "{first}");
+        // retry_gpu goes back to asking the driver's figure
+        std::fs::remove_file(d.join("calls.txt")).unwrap();
+        let opts = LoadOpts {
+            retry_gpu: true,
+            ..Default::default()
+        };
+        assert!(again.ensure_loaded(&entry, &opts, true).await.is_err());
+        assert!(starts(&d)[0].contains("--fit-target 768 "), "{:?}", starts(&d));
+    }
+
+    /// A model's hardware label says what it can run on and where it would go: the CPU without a card, the GPU on a
+    /// roomy one, a split on a card the reserve leaves too little of.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_is_labelled_with_the_hardware_it_runs_on() {
+        let d = crate::testing::TestDir::new("mm-hw-label");
+        let e = ladder_engine(&d, true);
+        let entry = sized_entry(&d);
+        let h = e.hardware_json(&entry, &[]);
+        assert_eq!(
+            (h["runs_on"].as_str(), h["chip"].as_str()),
+            (Some("cpu"), Some("CPU")),
+            "{h}"
+        );
+        assert_eq!(h["can_run_on"], json!(["cpu"]));
+        // a roomy card
+        let h = e.hardware_json(&entry, &card(24_000, 23_000));
+        assert_eq!(
+            (h["runs_on"].as_str(), h["chip"].as_str()),
+            (Some("gpu"), Some("GPU")),
+            "{h}"
+        );
+        assert_eq!(h["can_run_on"], json!(["gpu", "cpu"]));
+        assert_eq!(h["vram_mib"], 4_084);
+        assert!(h["label"].as_str().unwrap().ends_with("· GPU"), "{h}");
+        // a card the system's reserve leaves too little of: part of it runs from RAM
+        let h = e.hardware_json(&entry, &card(5_000, 4_800));
+        assert_eq!(h["runs_on"], "split", "{h}");
+        assert!(h["gpu_share"].as_f64().unwrap() < 1.0, "{h}");
+        assert!(h["ram_mib"].as_u64().unwrap() > 0, "{h}");
+    }
+
+    /// The system's commit is a limit on a GPU load like the card's free memory: a load is held to what the commit
+    /// leaves, and when it still fails the error says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_systems_commit_holds_a_gpu_load_and_is_named_when_it_runs_out() {
+        let d = crate::testing::TestDir::new("mm-ladder-commit");
+        std::fs::write(d.join("oom"), "").unwrap();
+        let e = ladder_engine(&d, true);
+        // a roomy card (policy cap 7,952 MiB), but only 6,000 MiB of commit headroom: (6,000 - 3,072) / 1.2 = 2,440
+        *e.fake_devices.lock() = Some(card(10_000, 9_500));
+        *e.fake_commit.lock() = Some(6_000);
+        assert_eq!(e.commit_budget_mib(), Some(2_440));
+        let entry = sized_entry(&d);
+        let f = e
+            .ensure_loaded(&entry, &LoadOpts::default(), true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        let targets = fit_targets(&starts(&d));
+        // the first start keeps 9,500 - 2,440 = 7,060 MiB free, not the 768 MiB margin
+        assert_eq!(targets[0], Some(7_060), "{targets:?}");
+        // the planner sees the same limit
+        let s = e.settings();
+        assert_eq!(e.plannable_free(&card(10_000, 9_500), &s, "m"), 2_440 + 768);
+        // and the error names the commit, with what to do about it
+        assert!(
+            f.message.contains("Windows has only 6000 MiB of memory commit left"),
+            "{}",
+            f.message
+        );
+        assert!(f.message.contains("larger page file"), "{}", f.message);
+        // with commit to spare there is nothing to say and nothing held
+        *e.fake_commit.lock() = Some(60_000);
+        assert!(e.commit_hint(Some(4_084)).is_none());
+        *e.fake_commit.lock() = None;
+        assert_eq!(e.commit_budget_mib(), None);
+    }
+
+    /// What loaded is remembered as what the card can hold, a figure too small to be a model's is ignored, and one that
+    /// reaches what failed lifts the limit.
+    #[test]
+    fn a_load_that_worked_is_remembered_as_what_the_card_can_hold() {
+        let d = crate::testing::TestDir::new("mm-limits");
+        let e = ladder_engine(&d, true);
+        let entry = sized_entry(&d);
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        let devs = card(24_560, 23_000);
+        e.note_gpu_success(&devs, &r, 100.0);
+        assert!(
+            load_limits(&d).is_empty(),
+            "a server that holds next to nothing says nothing"
+        );
+        e.note_gpu_success(&devs, &r, 18_195.0);
+        assert_eq!(load_limits(&d).values().next().unwrap().ok_mib, 18_195);
+        // two cards: nothing is learned or applied, the free memory is a sum
+        let two = [card(8_000, 7_000), card(8_000, 7_000)].concat();
+        e.note_gpu_success(&two, &r, 5_000.0);
+        assert_eq!(load_limits(&d).len(), 1);
+        assert!(e.gpu_limit(&two, &r).is_none());
+        // a failure far above what worked is a limit; the budget is held under it, never below what worked
+        let d0 = &devs[0];
+        assert_eq!(e.note_gpu_failure(d0, &r, 20_594), Some(18_195));
+        assert_eq!(e.gpu_limit(&devs, &r).unwrap().failed_mib, 20_594);
+        // a load that holds what once failed lifts it
+        e.note_gpu_success(&devs, &r, 20_700.0);
+        assert!(e.learned_budget_mib(&devs, &r).is_none());
+    }
+
     /// With the fallback off, a failed load stays a failed load (one start, the GPU's own error).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_the_fallback_off_a_gpu_failure_is_reported_as_it_is() {
@@ -3658,6 +4297,11 @@ parallel = 1
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_a_failure_the_gpu_caused_is_retried_and_only_where_it_can_help() {
         let d = crate::testing::TestDir::new("mm-ladder-rules");
+        let g = Ground {
+            devices: &[],
+            need_mib: None,
+            model: "m".into(),
+        };
         let e = ladder_engine(&d, true);
         let entry = stand_in_entry(&d, 1);
         let s = e.settings();
@@ -3670,19 +4314,19 @@ parallel = 1
         let roomier = s.vram_margin_mib.max(512) + 2048;
         // out of memory: more room first, then the CPU
         let (next, _, crash) = e
-            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("memory"), 1))
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("memory"), 1), &g, 0)
             .await
             .unwrap();
         assert_eq!((next, crash), (Try::Roomier(roomier), false));
         let (next, why, crash) = e
-            .after_failure(&s, &r, &entry, &Try::Roomier(roomier), &fail(Some("memory"), 1))
+            .after_failure(&s, &r, &entry, &Try::Roomier(roomier), &fail(Some("memory"), 1), &g, 0)
             .await
             .unwrap();
         assert_eq!((next, crash), (Try::Cpu, false));
         assert_eq!(why, "the GPU ran out of memory");
         // a crash goes to the CPU at once, and is the kind that is remembered
         let (next, why, crash) = e
-            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("crash"), -1_073_740_791))
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("crash"), -1_073_740_791), &g, 0)
             .await
             .unwrap();
         assert_eq!((next, crash), (Try::Cpu, true));
@@ -3697,13 +4341,13 @@ parallel = 1
             },
         );
         let (next, _, _) = e
-            .after_failure(&s, &fixed, &entry, &Try::Asked, &fail(Some("memory"), 1))
+            .after_failure(&s, &fixed, &entry, &Try::Asked, &fail(Some("memory"), 1), &g, 0)
             .await
             .unwrap();
         assert_eq!(next, Try::Cpu);
         // nothing to retry: the CPU start failed, no layers were on the GPU, or the failure was not the GPU's
         assert!(e
-            .after_failure(&s, &r, &entry, &Try::Cpu, &fail(Some("crash"), 1))
+            .after_failure(&s, &r, &entry, &Try::Cpu, &fail(Some("crash"), 1), &g, 0)
             .await
             .is_none());
         let cpu = e.resolve_serving(
@@ -3715,11 +4359,11 @@ parallel = 1
             },
         );
         assert!(e
-            .after_failure(&s, &cpu, &entry, &Try::Asked, &fail(Some("crash"), 1))
+            .after_failure(&s, &cpu, &entry, &Try::Asked, &fail(Some("crash"), 1), &g, 0)
             .await
             .is_none());
         assert!(e
-            .after_failure(&s, &r, &entry, &Try::Asked, &fail(None, 3))
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(None, 3), &g, 0)
             .await
             .is_none());
         // the fallback is off
@@ -3728,13 +4372,13 @@ parallel = 1
             ..s.clone()
         };
         assert!(e
-            .after_failure(&off, &r, &entry, &Try::Asked, &fail(Some("crash"), 1))
+            .after_failure(&off, &r, &entry, &Try::Asked, &fail(Some("crash"), 1), &g, 0)
             .await
             .is_none());
         // the CPU cannot hold it either: the GPU's error is the answer
         let huge = stand_in_entry(&d, u64::MAX / 4);
         assert!(e
-            .after_failure(&s, &r, &huge, &Try::Asked, &fail(Some("crash"), 1))
+            .after_failure(&s, &r, &huge, &Try::Asked, &fail(Some("crash"), 1), &g, 0)
             .await
             .is_none());
     }

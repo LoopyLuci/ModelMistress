@@ -835,6 +835,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let src = a["source"].as_str();
             // `deletable`: ModelMistress downloaded it, so model.delete may remove it
             let root = crate::pull::download_root(e);
+            let devices = e.gpu_devices_recent().await;
             let mut out: Vec<Value> = e
                 .catalog()
                 .iter()
@@ -842,6 +843,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .map(|m| {
                     let mut v = m.summary(e.is_loaded(&m.id));
                     v["deletable"] = json!(crate::pull::is_downloaded(&root, &m.path));
+                    v["hardware"] = e.hardware_json(m, &devices);
                     v
                 })
                 .collect();
@@ -908,7 +910,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "margin_mib": st.vram_margin_mib, "guard": st.vram_guard,
                    "verdict": if est.is_none() || devices.is_empty() { "unknown" } else { verdict },
                    "unload": evict, "reclaimable_mib": reclaimable,
-                   "placement": placement, "learned_cpu": learned})
+                   "placement": placement, "learned_cpu": learned,
+                   "memory": e.memory_json(&devices, &r, &m.id)})
         }
         "model.unload" => {
             let name = s(a, "model")?;
@@ -1612,6 +1615,7 @@ async fn stop(State(hub): State<Hub>) -> Json<Value> {
 async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>) -> Json<Value> {
     let e = &hub.engine;
     let allowed = |id: &str| who.0.as_ref().is_none_or(|p| p.allows(id, id));
+    let devices = e.gpu_devices_recent().await;
     let mut data: Vec<Value> = e
         .catalog()
         .iter()
@@ -1623,7 +1627,8 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
                 None => e.serving_preview(m),
             };
             json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
-                         "meta": m.summary(e.is_loaded(&m.id)), "serving": serving})
+                         "meta": m.summary(e.is_loaded(&m.id)), "serving": serving,
+                         "hardware": e.hardware_json(m, &devices)})
         })
         .collect();
     // Misty, the agent, answers to these names (a catalog model of the same name wins)

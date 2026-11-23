@@ -62,10 +62,46 @@ impl ModelEntry {
         self.meta.get(&format!("{arch}.context_length")).and_then(Value::as_u64)
     }
 
+    /// The quantisation, as the file names it (`Q5_K_XL`, `PQ2_0`), else what the GGUF header says. Models of one
+    /// name often come in several quantisations, and the name alone does not tell them apart.
+    pub fn quant(&self) -> Option<String> {
+        quant_in_name(&self.id)
+            .or_else(|| {
+                quant_in_name(
+                    &self
+                        .path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .or_else(|| {
+                let t = self.meta.get("general.file_type").and_then(Value::as_u64)?;
+                let n = file_type_name(t);
+                (!n.starts_with("type ")).then_some(n)
+            })
+    }
+
+    /// A name that tells models apart: the name in the header (else the id) and the quantisation.
+    pub fn label(&self) -> String {
+        let name = self
+            .meta
+            .get("general.name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(&self.id);
+        match self.quant() {
+            Some(q) if !name.to_uppercase().contains(&q) => format!("{name} {q}"),
+            _ => name.to_string(),
+        }
+    }
+
     /// A short summary for listings.
     pub fn summary(&self, loaded: bool) -> Value {
         json!({
             "id": self.id,
+            "label": self.label(),
+            "quant": self.quant(),
             "source": self.source,
             "size_gb": (self.size_bytes as f64 / 1e9 * 100.0).round() / 100.0,
             "architecture": self.architecture(),
@@ -373,6 +409,23 @@ fn sibling_mmproj(p: &Path) -> Option<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .find(|f| is_mmproj(f))
+}
+
+/// The quantisation a file name carries: a part made of capitals, digits and underscores that begins with a known
+/// family followed by a digit (`Q4_K_M`, `IQ3_XXS`, `PQ2_0`, `PTQ1_0`, `TQ2_0`, `MXFP4`, `BF16`, `F16`). The last one
+/// wins (`Qwen3-Q4_0-UD-Q5_K_XL`); a part that is only a size (`27B`, `F`) is not one.
+pub fn quant_in_name(name: &str) -> Option<String> {
+    const FAMILIES: [&str; 8] = ["IQ", "PTQ", "PQ", "TQ", "MXFP", "BF", "Q", "F"];
+    name.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .rfind(|p| {
+            let u = p.to_ascii_uppercase();
+            u == *p
+                && FAMILIES.iter().any(|f| {
+                    u.strip_prefix(f)
+                        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
+        })
+        .map(str::to_string)
 }
 
 /// llama.cpp's `general.file_type` numbers.
@@ -691,6 +744,29 @@ mod tests {
             (s["native"].clone(), s["family"].clone()),
             (true.into(), "dusty".into())
         );
+    }
+
+    #[test]
+    fn the_quantisation_is_read_from_the_name_and_models_of_one_name_get_different_labels() {
+        assert_eq!(quant_in_name("Qwen3.5-27B-UD-Q5_K_XL").as_deref(), Some("Q5_K_XL"));
+        assert_eq!(quant_in_name("Bonsai-4B-PQ2_0").as_deref(), Some("PQ2_0"));
+        assert_eq!(quant_in_name("m-IQ3_XXS").as_deref(), Some("IQ3_XXS"));
+        assert_eq!(quant_in_name("x-BF16").as_deref(), Some("BF16"));
+        // a size or a plain word is not a quantisation
+        assert_eq!(quant_in_name("Llama-3-8B-Instruct"), None);
+        assert_eq!(quant_in_name("Quest-1B"), None);
+        let d = tmp("quant");
+        let mk = |file: &str| {
+            let f = d.join(file);
+            gguf(&f, "llama", "Bonsai");
+            entry(file.trim_end_matches(".gguf").to_string(), "folder", f, None).unwrap()
+        };
+        let (a, b) = (mk("Bonsai-4B-PQ2_0.gguf"), mk("Bonsai-4B-Q2_0.gguf"));
+        assert_eq!(
+            (a.label().as_str(), b.label().as_str()),
+            ("Bonsai PQ2_0", "Bonsai Q2_0")
+        );
+        assert_eq!(a.summary(false)["quant"], "PQ2_0");
     }
 
     #[test]

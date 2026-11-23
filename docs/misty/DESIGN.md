@@ -130,6 +130,12 @@ Hardware fit is checked, not assumed: a member whose file plus a context estimat
 `unfit` and the router skips it. The default set for a 16 GB machine is `fast` + `main`; the 27B is offered only when
 `free RAM - size - KV estimate` stays above a margin.
 
+The card counts too: a file that goes to the GPU (not a ternary file, which the CPU-only Prism build serves, and not
+the embedder or reranker) fits when it fits the free RAM plus what models may use of the card (its free memory and what
+loaded models hold, less the `vram_reserve_mib` kept for the system). Each roster entry says where it is meant to run
+(`device`: `gpu`, `split`, `cpu`), and `misty.status` adds the model's `hardware` block (where it runs now or would go).
+The embedder and reranker are kept on the CPU, so that the card is left to the language models.
+
 ### 3.2 "MoE / MoA" as Misty means it
 
 - **Mixture of experts (gate)**: the router is the gate. For every step it scores the roles from cheap features and

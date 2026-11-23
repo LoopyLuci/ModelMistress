@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Model loading holds to the memory the machine really has, and models say where they run**
+  (`src/engine.rs`, `src/serving.rs`, `src/machine.rs`, `src/catalog.rs`, `src/misty/roster.rs`;
+  [serving](docs/serving.md), [plan and findings](docs/HANDOVER.md)).
+  - *Why GPU loads failed.* On Windows a GPU load is charged against the system's memory commit (about 1.2 times its
+  size), so a load of 20 GB failed with `ErrorOutOfDeviceMemory` and 23 GB of VRAM free when the open programs had
+  committed most of it, and worked later. The old retry changed nothing, and the CPU fallback was skipped for lack of RAM.
+  - *The GPU keeps 2 GB for the system.* New setting `vram_reserve_mib` (default 2048): models use at most the card's
+  total less that, 22 GB of a 24 GB card, counting the models already loaded.
+  - *Loads are held, then split.* The first start is held to the smallest of the reserve, the commit headroom and what
+  the card lately held; an out-of-memory failure is retried up to three times with the load held an eighth lower and the
+  rest in RAM, then on the CPU. The limit the card showed is kept in `gpu_limits.json` (a failure for 24 hours). The final
+  error names the commit when it explains the failure. `model.plan` adds `memory`.
+  - *Labels.* Every model in `model.list` and `/v1/models` has `hardware` (engine, what it can run on, where it runs or
+  would go, VRAM and RAM), `quant` and `label`; the Models page and `model-mistress models` show them.
+  - *Misty* counts the card's room when asking whether a model fits, says where each role is meant to run, and keeps the
+  embedder and reranker on the CPU so that the card is left to the language models.
+  - Not done yet (see the handover): load progress for slow disks, a thread budget for a CPU and a GPU model at the same
+  time, a CPU draft model, the PrismML GPU build.
+
 - **Misty chats have a working folder and environments, and Up and Down walk through earlier messages**
   (`src/misty/env.rs`, `frontend/`; [guide](docs/misty/USER_GUIDE.md), [API](docs/misty/API.md)).
   - *Environments.* A named, reusable setup the owner makes once: a working folder, other folders the file tools may

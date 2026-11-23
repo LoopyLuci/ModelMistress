@@ -55,6 +55,13 @@
             <strong class="name">{{ m.id }}</strong>
             <span v-if="m.native" class="pill good">MM model{{ m.family ? ': ' + m.family : '' }}</span>
             <span v-if="m.loaded" class="pill running">loaded</span>
+            <span v-if="m.quant" class="pill" title="the quantisation of this file">{{ m.quant }}</span>
+            <span
+              v-if="m.hardware"
+              class="pill"
+              :class="{ good: m.hardware.runs_on === 'gpu', bad: m.hardware.runs_on === 'none' }"
+              :title="hardwareTitle(m.hardware)"
+            >{{ m.hardware.now ? 'on ' : '' }}{{ m.hardware.chip }}</span>
             <span v-if="m.vision" class="pill">vision</span>
             <span v-if="m.experts" class="pill" title="mixture of experts">{{ m.experts }} experts{{ m.experts_used ? ', top ' + m.experts_used : '' }}</span>
             <span v-for="r in rolesOf(m.id)" :key="r.role" class="pill good" :title="roleTitle(r)">router: {{ r.role }}</span>
@@ -78,7 +85,8 @@
             <dt>Quantisation</dt><dd>{{ m.file_type || '-' }}</dd>
             <dt>Architecture</dt><dd>{{ m.architecture || '-' }}{{ m.size_label ? ' (' + m.size_label + ')' : '' }}</dd>
             <dt>Context</dt><dd>{{ m.context_length ? m.context_length.toLocaleString() + ' tokens' : '-' }}</dd>
-            <dt>Runs on</dt><dd>{{ m.source === 'ollama-daemon' ? 'Ollama' : 'llama.cpp (built in)' }}{{ m.loaded ? ', loaded' : '' }}</dd>
+            <dt>Runs on</dt><dd>{{ m.source === 'ollama-daemon' ? 'Ollama' : (m.hardware?.engine || 'llama.cpp') + ' (built in)' }}{{ m.loaded ? ', loaded' : '' }}</dd>
+            <template v-if="m.hardware"><dt>Hardware</dt><dd>{{ hardwareTitle(m.hardware) }}</dd></template>
             <template v-if="isCustom(profiles[m.id])"><dt>Settings</dt><dd>{{ describe(profiles[m.id]) }}</dd></template>
           </dl>
 
@@ -444,6 +452,22 @@ function where(l: LoadedModel): string {
   else if (a.includes('--n-cpu-moe')) bits.push(`experts of ${arg('--n-cpu-moe')} layers on CPU`)
   bits.push(`context ${arg('-c') || '?'}`)
   return bits.join(', ')
+}
+/** What the hardware chip means, in words: where it runs or would go, what it could run on, and the memory it takes. */
+function hardwareTitle(h: NonNullable<HubModel['hardware']>): string {
+  const mib = (v?: number | null) => (v == null ? '' : v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${v} MB`)
+  const where: Record<string, string> = {
+    gpu: 'on the GPU',
+    split: h.gpu_share != null ? `${Math.round(h.gpu_share * 100)}% on the GPU, the rest from RAM` : 'split between the GPU and RAM',
+    cpu: 'on the CPU',
+    none: 'does not fit this machine as asked',
+    unknown: 'not measured',
+  }
+  const bits = [(h.now ? 'Running ' : 'Would load ') + (where[h.runs_on] || h.runs_on)]
+  if (h.vram_mib) bits.push(`${mib(h.vram_mib)} of video memory`)
+  if (h.ram_mib) bits.push(`${mib(h.ram_mib)} of RAM`)
+  bits.push(h.can_run_on.length > 1 ? 'can run on GPU or CPU' : 'CPU only (this engine build has no GPU support here)')
+  return bits.join('; ')
 }
 function shownMeta(m: Record<string, any> | undefined) {
   const out: Record<string, any> = {}

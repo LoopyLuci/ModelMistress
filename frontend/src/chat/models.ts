@@ -21,6 +21,25 @@ export interface HubModel {
   task?: string | null
   /** ModelMistress downloaded it, so the hub may delete it (a model another program put on the disk is not). */
   deletable?: boolean
+  /** The quantisation the file names (`Q5_K_XL`, `PQ2_0`), else the header's; files of one name differ in it. */
+  quant?: string | null
+  /** A name that tells models apart: the name in the file and the quantisation. */
+  label?: string
+  /** What it can run on, where it runs now (loaded) or would go, and the memory that takes. */
+  hardware?: {
+    engine: string
+    can_run_on: ('gpu' | 'cpu')[]
+    runs_on: 'gpu' | 'split' | 'cpu' | 'none' | 'unknown'
+    /** true: loaded, `runs_on` is measured; false: where a load would go. */
+    now: boolean
+    gpu_share?: number | null
+    vram_mib?: number | null
+    ram_mib?: number | null
+    device?: string | null
+    /** "GPU", "CPU", "GPU 80% + CPU" or "does not fit". */
+    chip: string
+    label: string
+  }
   /** Not a file: the model router, which sends each message to the model that suits it. */
   router?: boolean
   /** For the router: at least one role has a model that can answer now (a new chat starts on it only then). */

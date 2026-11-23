@@ -16,6 +16,7 @@ Ollama-compatible API under `/api`, and it has a control API (every operation is
 |---|---|
 | What works, and when it was last measured | `docs/STATUS.md` |
 | What is still open, with the code that shows it | `docs/gap-analysis.md` |
+| Work in progress, the plan and the TODO for the next agent | `docs/HANDOVER.md` |
 | Each suggestion from the agent that uses the hub, and its status | `docs/agents.md` |
 | Peer keys, quotas, the key log, revocation | `docs/hosting.md` |
 | The Ollama-compatible API | `docs/STATUS.md` and `docs/agents.md` (row 7: error codes) |

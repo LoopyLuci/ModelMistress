@@ -106,6 +106,24 @@ pub struct Engines {
     pub stock_q2: bool,
     /// The Prism llama-server is installed: runs every ternary packing.
     pub prism: bool,
+    /// Bytes of the GPU that models may use now: its free memory, held to what is left of the card after the reserve
+    /// for the system (and the system's commit), see `Engine::plannable_free`. 0: no card.
+    pub gpu_room_bytes: u64,
+}
+
+/// Where a file is meant to run. Ternary files go to the Prism build, which is the CPU one; the embedder and the
+/// reranker are small and run on the CPU so that the card is left to the language models; any other file goes to the
+/// GPU when it fits there, is split between the GPU and RAM when it fits only in part, and runs on the CPU when there
+/// is no card.
+pub fn device_for(e: &ModelEntry, engines: Engines, role: Role) -> &'static str {
+    let prism = pack_of(e).is_some() && engines.prism;
+    if prism || matches!(role, Role::Embed | Role::Rerank) || engines.gpu_room_bytes == 0 {
+        "cpu"
+    } else if e.size_bytes.saturating_add(e.size_bytes / 10) <= engines.gpu_room_bytes {
+        "gpu"
+    } else {
+        "split"
+    }
 }
 
 /// The ternary packing of a file, from its id or path: `PTQ1_0`, `PQ2_0` or `Q2_0`.
@@ -163,6 +181,8 @@ pub struct Resolution {
     pub source: &'static str,
     pub size_bytes: u64,
     pub note: String,
+    /// Where the model is meant to run (see [`device_for`]): `gpu`, `split`, `cpu`, or `none` without a model.
+    pub device: &'static str,
 }
 
 /// Prefer the packing the machine runs fastest: PQ2_0 (the Bonsai demo's default for speed), then Q2_0, then PTQ1_0.
@@ -175,9 +195,14 @@ fn pack_rank(name: &str) -> u8 {
     }
 }
 
-fn fits(size: u64, free_ram: u64, margin: u64) -> bool {
-    // the weights plus roughly a tenth for the KV cache and buffers
-    size.saturating_add(size / 10).saturating_add(margin) <= free_ram
+/// Does the file fit the machine: the weights plus roughly a tenth for the KV cache and buffers, in the free RAM and,
+/// for a file that goes to the card, in what the GPU can take as well.
+fn fits(e: &ModelEntry, role: Role, engines: Engines, free_ram: u64, margin: u64) -> bool {
+    let room = match device_for(e, engines, role) {
+        "cpu" => free_ram,
+        _ => free_ram.saturating_add(engines.gpu_room_bytes),
+    };
+    e.size_bytes.saturating_add(e.size_bytes / 10).saturating_add(margin) <= room
 }
 
 /// Resolve every GGUF role. `overrides` is `[roles]` from the config; `free_ram` in bytes; `margin` in bytes.
@@ -210,6 +235,7 @@ fn resolve_one(
         source,
         size_bytes: e.map(|e| e.size_bytes).unwrap_or(0),
         note,
+        device: e.map(|e| device_for(e, engines, role)).unwrap_or("none"),
     };
     // 1. the owner's choice
     if let Some(want) = overrides.get(role.name()) {
@@ -229,7 +255,7 @@ fn resolve_one(
                 "config",
                 format!("{} needs the Prism engine (run `model-mistress misty setup`)", e.id),
             ),
-            Some(e) if role.is_brain() && !fits(e.size_bytes, free_ram, margin) => {
+            Some(e) if role.is_brain() && !fits(e, role, engines, free_ram, margin) => {
                 mk(Some(e), "unfit", "config", "does not fit the free RAM".into())
             }
             Some(e) => mk(Some(e), "ready", "config", String::new()),
@@ -263,7 +289,7 @@ fn resolve_one(
                 seen_unrunnable.get_or_insert(e);
                 continue;
             }
-            if role.is_brain() && !fits(e.size_bytes, free_ram, margin) {
+            if role.is_brain() && !fits(e, role, engines, free_ram, margin) {
                 return mk(Some(e), "unfit", "preferred", "does not fit the free RAM".into());
             }
             return mk(Some(e), "ready", "preferred", String::new());
@@ -292,7 +318,7 @@ fn resolve_one(
             .collect();
         // the largest that fits: a bigger model of the class is the better one
         hits.sort_by_key(|e| std::cmp::Reverse(e.size_bytes));
-        if let Some(e) = hits.into_iter().find(|e| fits(e.size_bytes, free_ram, margin)) {
+        if let Some(e) = hits.into_iter().find(|e| fits(e, role, engines, free_ram, margin)) {
             return mk(
                 Some(e),
                 "ready",
@@ -347,21 +373,24 @@ mod tests {
             "x-Q2_0",
             Engines {
                 stock_q2: true,
-                prism: false
+                prism: false,
+                ..Default::default()
             }
         ));
         assert!(!runnable(
             "x-PQ2_0",
             Engines {
                 stock_q2: true,
-                prism: false
+                prism: false,
+                ..Default::default()
             }
         ));
         assert!(runnable(
             "x-PQ2_0",
             Engines {
                 stock_q2: false,
-                prism: true
+                prism: true,
+                ..Default::default()
             }
         ));
         assert!(runnable("qwen3-8b-Q4_K_M", none));
@@ -381,6 +410,7 @@ mod tests {
             Engines {
                 stock_q2: false,
                 prism: true,
+                ..Default::default()
             },
             30 * GB,
             2 * GB,
@@ -412,6 +442,7 @@ mod tests {
         let eng = Engines {
             stock_q2: false,
             prism: true,
+            ..Default::default()
         };
         let r = resolve(&cat, &BTreeMap::new(), eng, 6 * GB, 2 * GB);
         let by = |role: Role| r.iter().find(|x| x.role == role).unwrap();
@@ -420,6 +451,35 @@ mod tests {
         assert_eq!(by(Role::Fast).source, "fallback");
         // 5 GB + a tenth + a 2 GB margin does not fit 6 GB: no main model rather than one that swaps
         assert_eq!(by(Role::Main).status, "missing");
+    }
+
+    #[test]
+    fn a_file_the_card_can_hold_fits_without_the_ram_and_the_embedder_stays_on_the_cpu() {
+        let cat = vec![
+            entry("qwen3-32b-Q4_K_M", 19.0, "qwen3"),
+            entry("nomic-embed-text", 0.3, "nomic-bert"),
+        ];
+        let by = |r: &[Resolution], role: Role| r.iter().find(|x| x.role == role).unwrap().clone();
+        // 8 GB of free RAM and a 2 GB margin: the 19 GB file fits only because the card takes it
+        let card = Engines {
+            gpu_room_bytes: 22 * GB,
+            ..Default::default()
+        };
+        let r = resolve(&cat, &BTreeMap::new(), card, 8 * GB, 2 * GB);
+        let deep = by(&r, Role::Deep);
+        assert_eq!((deep.status, deep.device), ("ready", "gpu"), "{deep:?}");
+        assert_eq!(by(&r, Role::Embed).device, "cpu");
+        // a card too small for all of it splits the file with RAM
+        let small = Engines {
+            gpu_room_bytes: 12 * GB,
+            ..Default::default()
+        };
+        let r = resolve(&cat, &BTreeMap::new(), small, 12 * GB, 2 * GB);
+        assert_eq!(by(&r, Role::Deep).device, "split");
+        // no card: the same machine has too little RAM for it
+        let r = resolve(&cat, &BTreeMap::new(), Engines::default(), 8 * GB, 2 * GB);
+        assert_ne!(by(&r, Role::Deep).status, "ready");
+        assert_eq!(by(&r, Role::Deep).device, "none");
     }
 
     #[test]
@@ -437,6 +497,7 @@ mod tests {
             Engines {
                 stock_q2: false,
                 prism: true,
+                ..Default::default()
             },
             30 * GB,
             2 * GB,
