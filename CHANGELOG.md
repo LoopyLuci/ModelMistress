@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 — 2026-11-23
 
 - **Model loading holds to the memory the machine really has, and models say where they run**
   (`src/engine.rs`, `src/serving.rs`, `src/machine.rs`, `src/catalog.rs`, `src/misty/roster.rs`;
