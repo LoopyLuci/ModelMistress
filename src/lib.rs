@@ -26,6 +26,7 @@ pub mod tools;
 pub mod trace;
 pub mod tts;
 pub mod vision;
+pub mod watchdog;
 
 #[cfg(test)]
 mod ollama_tests;

@@ -19,8 +19,8 @@ platform's standard folder, the same rule the hub uses.
 ## Pages
 
 - **Status**: version, process, uptime, engine, models known, loaded models, memory.
-- **Models**: the models on this machine, a filter, load and unload for the selected model, and a disk rescan.
-- **Chat**: streamed replies from a chat model, an optional system prompt. Ctrl+Enter sends, Stop (or Esc) stops. A
+- **Models**: the models on this machine, a filter, load and unload for the selected model, and a disk rescan. A Router column says which role each model has, and a "Router: which model answers" box chooses the model for each role (fast, main, deep, embed, rerank) or leaves it Automatic. The box is hidden on a hub with no router.
+- **Chat**: streamed replies from a chat model, an optional system prompt. Ctrl+Enter sends, Stop (or Esc) stops. The first choice, Auto, lets the hub's router pick the model for each message; the reply is headed with the role and model that answered, and `@fast`, `@main` or `@deep` in a message choose the role. A
   model's markup stays visible as text instead of being rendered.
 - **Misty**: chat with Misty, the agent inside the hub (see `docs/misty/`). The router picks the model, or you pick
   fast, main or deep; documents can be searched always, never, or when the router decides. Her answer streams in with
@@ -34,7 +34,7 @@ platform's standard folder, the same rule the hub uses.
 
 Ctrl+1 to Ctrl+5 switch pages. The Status page refreshes when it is opened. The window remembers its size and place.
 
-Not in this window yet: pulling models, loading with options (context size, GPU layers), peer keys and usage, and the
+Not in this window yet: pulling models, loading with options (context size, GPU layers), a model's serving settings and the fit check (the dashboard's Models page has them), peer keys and usage, and the
 dashboard's other pages (traces, knowledge modules, factory, speech, images, vision). The dashboard at `/ui` has the
 pages it has; it has no page for peer keys or usage, which are on the command line (`keys`, `usage`) and in the API.
 

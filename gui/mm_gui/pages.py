@@ -27,8 +27,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mm_gui.hub import Hub
-from mm_gui.models import fmt_mb, fmt_uptime, is_chat_model, model_label
+from mm_gui.hub import Hub, HubError
+from mm_gui.models import (
+    ROLE_HELP,
+    ROLES,
+    ROUTER,
+    STATUS_TEXT,
+    fmt_mb,
+    fmt_uptime,
+    is_chat_model,
+    model_label,
+    roles_of,
+    suits_role,
+    without_tags_in_last_user_message,
+)
 from mm_gui.prefs import TEXT_SIZES, THEMES, Appearance
 from mm_gui.tasks import run_task
 
@@ -147,7 +159,7 @@ class StatusPage(Page):
 
 
 class ModelsPage(Page):
-    COLUMNS = ["Model", "Source", "Size", "Architecture", "Context", "State"]
+    COLUMNS = ["Model", "Source", "Size", "Architecture", "Context", "Router role", "State"]
 
     def __init__(self):
         super().__init__("Models")
@@ -165,6 +177,28 @@ class ModelsPage(Page):
         self.table.setAccessibleName("Models")
         self._models: list[dict] = []
         self._visible: list[dict] = []
+        self._router: dict | None = None  # router.status, or None on a hub with no router
+
+        # Which model fills each role of the router: the choices that make the model `auto` usable in any chat.
+        self.roles_box = QGroupBox("Router: which model answers")
+        roles_form = QFormLayout(self.roles_box)
+        self.role_choice: dict[str, QComboBox] = {}
+        self.role_state: dict[str, QLabel] = {}
+        for role in ROLES:
+            choice = QComboBox()
+            choice.setAccessibleName(f"Model for {role}")
+            choice.setToolTip(ROLE_HELP[role])
+            choice.activated.connect(lambda _i, r=role: self._choose_role(r))
+            state = QLabel("-")
+            state.setWordWrap(True)
+            state.setAccessibleName(f"State of {role}")
+            line = QHBoxLayout()
+            line.addWidget(choice, 2)
+            line.addWidget(state, 3)
+            roles_form.addRow(f"{role}", line)
+            self.role_choice[role] = choice
+            self.role_state[role] = state
+        self.roles_box.setVisible(False)
 
         scan = QPushButton("Rescan disk")
         scan.clicked.connect(lambda: self.refresh(scan=True))
@@ -180,15 +214,51 @@ class ModelsPage(Page):
         layout = QVBoxLayout(self)
         layout.addWidget(self.filter)
         layout.addWidget(self.table, 1)
+        layout.addWidget(self.roles_box)
         layout.addLayout(buttons)
         layout.addWidget(self.status)
 
     def refresh(self, scan: bool = False) -> None:
-        self.ask("Reading the model list", lambda hub: hub.models(refresh=scan), self._show)
+        self.ask(
+            "Reading the model list",
+            lambda hub: (hub.models(refresh=scan), hub.router_status_or_none()),
+            self._show,
+        )
 
-    def _show(self, models: list[dict]) -> None:
+    def _show(self, result: tuple[list[dict], dict | None]) -> None:
+        models, router = result
         self._models = list(models)
+        self._router = router
         self._fill()
+        self._fill_roles()
+
+    def _fill_roles(self) -> None:
+        """The role choosers: Automatic, then every installed model that suits the role."""
+        status = self._router
+        self.roles_box.setVisible(status is not None)
+        if status is None:
+            return
+        rows = {r.get("role"): r for r in [*(status.get("roles") or []), *(status.get("support") or [])]}
+        overrides = status.get("overrides") or {}
+        for role in ROLES:
+            choice, row = self.role_choice[role], rows.get(role) or {}
+            choice.clear()
+            automatic = f"Automatic: {row['model']}" if row.get("model") and role not in overrides else "Automatic"
+            choice.addItem(automatic, None)
+            for m in sorted(self._models, key=lambda x: str(x.get("id"))):
+                if suits_role(role, str(m.get("id", "")), is_chat_model(m)):
+                    choice.addItem(model_label(m), m.get("id"))
+            chosen = overrides.get(role)
+            if chosen and choice.findData(chosen) < 0:
+                choice.addItem(f"{chosen} (not installed)", chosen)
+            choice.setCurrentIndex(max(choice.findData(chosen), 0) if chosen else 0)
+            text = STATUS_TEXT.get(str(row.get("status")), str(row.get("status") or "no model"))
+            self.role_state[role].setText(text + (", loaded" if row.get("loaded") else ""))
+
+    def _choose_role(self, role: str) -> None:
+        model = self.role_choice[role].currentData()
+        what = f"Using {model} for {role}" if model else f"Letting the router choose {role}"
+        self.ask(what, lambda hub: hub.set_role(role, model), self._changed)
 
     def _fill(self) -> None:
         text = self.filter.text().strip().lower()
@@ -202,6 +272,7 @@ class ModelsPage(Page):
                 size,
                 m.get("architecture") or "-",
                 m.get("context_length") or "-",
+                ", ".join(roles_of(self._router, str(m.get("id", "")))),
                 "loaded" if m.get("loaded") else "",
             ]
             for col, value in enumerate(cells):
@@ -233,6 +304,7 @@ class _Bridge(QObject):
     """Carries each piece of a streamed reply from the worker thread to the window."""
 
     delta = Signal(str)
+    routed = Signal(str)  # "main: qwen3-9b": the router chose the model for this reply
 
 
 class ChatPage(Page):
@@ -265,6 +337,7 @@ class ChatPage(Page):
         self._cancel: threading.Event | None = None
         self._bridge = _Bridge()
         self._bridge.delta.connect(self._on_delta)
+        self._bridge.routed.connect(self._on_routed)
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(80)
@@ -286,17 +359,21 @@ class ChatPage(Page):
         layout.addWidget(self.status)
 
     def refresh(self) -> None:
-        self.ask("Loading the models", lambda hub: hub.models(), self._models_listed)
+        self.ask("Loading the models", lambda hub: hub.chat_models(), self._models_listed)
 
     def _models_listed(self, models: list[dict]) -> None:
         chosen = self.model.currentData()
         self.model.clear()
-        for m in models:
-            if is_chat_model(m):
-                self.model.addItem(model_label(m), m.get("id"))
-        index = self.model.findData(chosen)
-        if index >= 0:
-            self.model.setCurrentIndex(index)
+        items = [m for m in models if is_chat_model(m)]
+        for m in items:
+            self.model.addItem(model_label(m), m.get("id"))
+        # A new chat starts on the router when it has a model that can answer; until then on the first real model.
+        default = next(
+            (i for i, m in enumerate(items) if m.get("router") and m.get("ready")),
+            next((i for i, m in enumerate(items) if not m.get("router")), 0),
+        )
+        index = self.model.findData(chosen) if chosen else -1
+        self.model.setCurrentIndex(index if index >= 0 else default)
         if self.model.count() == 0:
             self.status.setText("No chat model is listed. Download one first; the hub's dashboard can do it.")
 
@@ -318,10 +395,22 @@ class ChatPage(Page):
         self.status.setText("Writing...")
         self._render()
         run_task(
-            lambda: hub.chat_stream(model, history, self._bridge.delta.emit, cancel=cancel),
+            lambda: self._answer(hub, model, history, cancel),
             lambda _answer: self._reply_done(cancel),
             self._reply_failed,
         )
+
+    def _answer(self, hub: Hub, model: str, history: list[dict], cancel: threading.Event) -> str:
+        """On the worker thread. For the router: ask it which model suits the conversation, say so, then send the
+        conversation (without the role tags) to that model."""
+        if model == ROUTER:
+            pick = hub.router_pick(history)
+            if not pick.get("model"):
+                why = "; ".join(str(r) for r in pick.get("reasons") or []) or "no model is ready"
+                raise HubError(f"The router has no model to send this to: {why}. Choose models on the Models page.")
+            self._bridge.routed.emit(f"{pick.get('role') or '?'}: {pick['model']}")
+            return hub.chat_stream(str(pick["model"]), without_tags_in_last_user_message(history), self._bridge.delta.emit, cancel=cancel)
+        return hub.chat_stream(model, history, self._bridge.delta.emit, cancel=cancel)
 
     def stop(self) -> None:
         if self._cancel is not None:
@@ -336,7 +425,11 @@ class ChatPage(Page):
 
     def _history(self) -> list[dict]:
         history = [{"role": "system", "content": self.system.text().strip()}] if self.system.text().strip() else []
-        return history + self.messages[:-1]
+        return history + [{"role": m["role"], "content": m["content"]} for m in self.messages[:-1]]
+
+    def _on_routed(self, label: str) -> None:
+        self.messages[-1]["model"] = label
+        self._render()
 
     def _on_delta(self, text: str) -> None:
         self.messages[-1]["content"] += text
@@ -367,7 +460,7 @@ class ChatPage(Page):
         self._render_timer.stop()
         parts = []
         for m in self.messages:
-            who = "You" if m["role"] == "user" else "Model"
+            who = "You" if m["role"] == "user" else (f"Model ({m['model']})" if m.get("model") else "Model")
             # A backslash before < keeps a model's markup as plain text instead of letting the viewer render it.
             body = (m["content"] or "...").replace("<", "\\<")
             parts.append(f"**{who}**\n\n{body}")

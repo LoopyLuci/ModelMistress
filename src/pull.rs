@@ -406,6 +406,20 @@ pub fn download_dir(engine: &Engine) -> PathBuf {
     engine.settings().download_dir.unwrap_or_else(|| engine.home.clone())
 }
 
+/// The download folder as `is_downloaded` compares paths against it.
+pub fn download_root(engine: &Engine) -> PathBuf {
+    let root = download_dir(engine);
+    crate::catalog::plain_path(root.canonicalize().unwrap_or(root))
+}
+
+/// Is this file inside the download folder, so that `model.delete` may remove it (a model another program put on the
+/// disk is that program's to delete)? `root` is from [`download_root`].
+pub fn is_downloaded(root: &Path, file: &Path) -> bool {
+    file.canonicalize()
+        .map(crate::catalog::plain_path)
+        .is_ok_and(|c| c.starts_with(root))
+}
+
 /// A repo path made safe to join under a folder: no absolute parts, no `..`.
 fn safe_rel(p: &str) -> PathBuf {
     p.split(['/', '\\'])
@@ -785,13 +799,8 @@ pub fn delete(engine: &Engine, id: &str) -> Result<Value> {
         .into_iter()
         .find(|e| e.id == id)
         .ok_or_else(|| Fail::not_found(format!("no model {id:?}")))?;
-    let root = download_dir(engine);
-    let root = crate::catalog::plain_path(root.canonicalize().unwrap_or(root));
-    let inside = |p: &Path| {
-        p.canonicalize()
-            .map(crate::catalog::plain_path)
-            .is_ok_and(|c| c.starts_with(&root))
-    };
+    let root = download_root(engine);
+    let inside = |p: &Path| is_downloaded(&root, p);
     if !inside(&entry.path) {
         return Err(Fail::new(
             403,
@@ -991,6 +1000,14 @@ mod tests {
                 hf_dirs: vec![],
                 ..Default::default()
             },
+        );
+        // the listing says in advance what delete will refuse
+        let root = download_root(&e);
+        assert!(!is_downloaded(&root, &elsewhere.join("theirs.gguf")));
+        assert!(is_downloaded(&root, &snap.join("M-Q4_K_M.gguf")));
+        assert!(
+            !is_downloaded(&root, &home.join("hub/not-there.gguf")),
+            "a file that is not there is not ours"
         );
         let err = delete(&e, "theirs").unwrap_err();
         assert_eq!(err.code, "not_ours");

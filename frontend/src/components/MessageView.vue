@@ -2,6 +2,7 @@
   <article class="msg" :class="[msg.role, { err: !!msg.error }]" :aria-label="msg.role === 'user' ? 'You' : 'Reply'">
     <header class="who">
       <strong>{{ msg.role === 'user' ? 'You' : msg.model || 'Assistant' }}</strong>
+      <span v-if="msg.route?.role" class="pill good" title="The router chose this model for the message">router: {{ msg.route.role }}</span>
       <span class="grow"></span>
       <button v-if="msg.role === 'assistant' && msg.content" class="mini" type="button" @click="copyAll">{{ copied === 'all' ? 'Copied' : 'Copy' }}</button>
       <button v-if="canRetry" class="mini" type="button" @click="emit('retry')">Regenerate</button>
@@ -23,6 +24,11 @@
 
     <p v-if="msg.error" class="error-box" role="alert">{{ msg.error }}</p>
     <p v-if="msg.stopped" class="muted small">Stopped.</p>
+
+    <details v-if="msg.route?.why?.length" class="why muted small">
+      <summary>Why the router chose {{ msg.route.model }}</summary>
+      <ul><li v-for="(w, i) in msg.route.why" :key="i">{{ w }}</li></ul>
+    </details>
 
     <footer v-if="msg.role === 'assistant' && (msg.stats || msg.traceId)" class="stats muted small">
       <template v-if="msg.stats">
@@ -103,6 +109,9 @@ async function onClick(e: MouseEvent) {
 .think summary { cursor: pointer; font-size: 0.85rem; }
 .thinktext { white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; margin-top: 6px; max-height: 320px; overflow-y: auto; }
 .wait { font-size: 0.9rem; }
+.why { margin-top: 6px; }
+.why summary { cursor: pointer; }
+.why ul { margin: 4px 0 0 1.2em; }
 .stats { display: flex; gap: 4px 14px; flex-wrap: wrap; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); }
 .md { word-break: break-word; }
 .md :deep(p) { margin: 0 0 0.6em; }

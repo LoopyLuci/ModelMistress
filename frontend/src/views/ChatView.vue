@@ -35,12 +35,15 @@
             <option v-for="m in g.models" :key="m.id" :value="m.id">{{ modelLabel(m) }}</option>
           </optgroup>
         </select>
+        <span v-if="cur?.router" class="pill good" title="Each message goes to the fast, main or deep model that suits it">router</span>
         <span v-if="cur?.native" class="pill good">MM model</span>
         <span v-if="cur?.vision" class="pill">vision</span>
         <span class="grow"></span>
         <label class="row small" title="Record every token and its alternatives for this chat's replies"><input v-model="conv.trace" type="checkbox" /> trace replies</label>
         <button class="btn" type="button" :aria-expanded="showSettings" @click="showSettings = !showSettings">Settings</button>
       </header>
+
+      <RouterStrip v-if="cur?.router" :refresh="replies" />
 
       <div v-if="showSettings" class="settings card">
         <label class="field">System prompt
@@ -66,6 +69,10 @@
             Pick a model above and write below. A model that is not loaded yet loads on the first message;
             large ones take a minute. <span v-if="!allModels.length && loaded">No models were found: add a folder in Settings.</span>
           </p>
+          <p v-if="cur?.router" class="muted">
+            Auto sends each message to the fast, main or deep model that suits it, and each reply says which answered and why.
+            Put <span class="mono">@fast</span>, <span class="mono">@main</span> or <span class="mono">@deep</span> in a message to choose.
+          </p>
         </div>
         <MessageView
           v-for="(m, i) in conv.messages"
@@ -85,8 +92,8 @@
         </div>
         <div class="row inrow">
           <textarea ref="box" v-model="input" rows="2" class="grow" placeholder="Message (Enter sends, Shift+Enter for a new line)" aria-label="Message" @keydown="onKey" @paste="onPaste"></textarea>
-          <input v-if="cur?.vision" ref="file" type="file" accept="image/*" multiple hidden @change="onFiles" />
-          <button v-if="cur?.vision" class="btn" type="button" title="Attach a picture" @click="file?.click()">Picture</button>
+          <input v-if="canPicture" ref="file" type="file" accept="image/*" multiple hidden @change="onFiles" />
+          <button v-if="canPicture" class="btn" type="button" :title="cur?.router ? 'Attach a picture (the router then needs a model that can see pictures)' : 'Attach a picture'" @click="file?.click()">Picture</button>
           <button v-if="busy" class="btn danger" type="button" @click="stop">Stop</button>
           <button v-else class="btn primary" type="submit" :disabled="!canSend">Send</button>
         </div>
@@ -103,11 +110,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import MessageView from '@/components/MessageView.vue'
+import RouterStrip from '@/components/RouterStrip.vue'
 import { useRoute, useRouter } from 'vue-router'
 import { call } from '@/transport'
 import { splitThink } from '@/chat/markdown'
 import { streamChat, type ChatMessage } from '@/chat/hub'
-import { groupModels, isChatModel, listModels, modelLabel, type HubModel } from '@/chat/models'
+import { chatChoices, groupModels, isChatModel, modelLabel, type HubModel } from '@/chat/models'
+import { AUTO, pickFor, withoutTagsInLastUserMessage, type RouteNote } from '@/chat/router'
 import { chats, flush, lastId, newConversation, removeConversation, sorted, type Conversation, type Msg } from '@/chat/store'
 
 const route = useRoute()
@@ -130,6 +139,11 @@ const scroller = ref<HTMLElement | null>(null)
 const box = ref<HTMLTextAreaElement | null>(null)
 const file = ref<HTMLInputElement | null>(null)
 const waitSecs = ref(0)
+/** What the current reply waits for: the router's choice, then the model it chose (or the one picked by hand). */
+const routing = ref(false)
+const target = ref('')
+/** Counts finished replies: the router strip refreshes to show which models the router has loaded. */
+const replies = ref(0)
 let abort: AbortController | null = null
 let waitTimer: number | undefined
 let stick = true
@@ -139,14 +153,18 @@ const chatModels = computed(() => allModels.value.filter(isChatModel))
 const groups = computed(() => groupModels(chatModels.value))
 const cur = computed(() => allModels.value.find((m) => m.id === conv.value?.model))
 const known = (id: string) => allModels.value.some((m) => m.id === id)
+/** A picture can be attached to a model that sees pictures, and to the router (it picks one that does, or says it has none). */
+const canPicture = computed(() => !!cur.value?.vision || !!cur.value?.router)
 const canSend = computed(() => !busy.value && !!conv.value?.model && (!!input.value.trim() || pending.value.length > 0))
-const waiting = computed(() =>
-  waitSecs.value < 3 ? 'Waiting for the model...' : `Waiting for the model... ${waitSecs.value} s (a model that is not loaded yet is loading)`,
-)
+const waiting = computed(() => {
+  if (routing.value) return 'The router is choosing a model...'
+  const who = target.value ? `Waiting for ${target.value}...` : 'Waiting for the model...'
+  return waitSecs.value < 3 ? who : `${who} ${waitSecs.value} s (a model that is not loaded yet is loading)`
+})
 
 async function refreshModels(refresh = false) {
   try {
-    allModels.value = await listModels(refresh)
+    allModels.value = await chatChoices(refresh)
   } catch (e: any) {
     error.value = `Could not list models: ${e?.message || e}`
   }
@@ -160,9 +178,11 @@ function pickDefault() {
   const want = localStorage.getItem(MODEL_KEY)
   const m =
     chatModels.value.find((x) => x.id === want) ||
+    chatModels.value.find((x) => x.router && x.ready) || // a new chat starts on the router, which picks a model for each message
     chatModels.value.find((x) => x.native && x.loaded) ||
     chatModels.value.find((x) => x.loaded) ||
     chatModels.value.find((x) => x.native) ||
+    chatModels.value.find((x) => !x.router) || // the router is first in the list but is no default while it has nothing to send to
     chatModels.value[0]
   if (!c.model) c.model = m.id
 }
@@ -281,7 +301,7 @@ async function onFiles(e: Event) {
   el.value = ''
 }
 function onPaste(e: ClipboardEvent) {
-  if (!cur.value?.vision) return
+  if (!canPicture.value) return
   const fs = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'))
   if (fs.length) {
     e.preventDefault()
@@ -336,8 +356,26 @@ async function reply(c: Conversation) {
   abort = new AbortController()
   stick = true
   nextTick(() => scrollDown(true))
+  let model = c.model
+  let history = historyFor(c, idx)
+  target.value = model
   try {
-    const stats = await streamChat(c.model, historyFor(c, idx), c.params, c.trace, abort.signal, {
+    if (model === AUTO) {
+      // The router decides before anything is sent, so the reply can say which model is answering (and which one
+      // is loading, when it was not loaded yet). The request then goes to that model.
+      routing.value = true
+      target.value = ''
+      const d = await pickFor(history)
+      routing.value = false
+      if (!d.model) throw new Error(`The router has no model to send this to: ${d.reasons.join('; ') || 'no model is ready'}. Choose models on the Models page, under Router.`)
+      model = d.model
+      target.value = model
+      history = withoutTagsInLastUserMessage(history)
+      const note: RouteNote = { role: d.role || '', model, why: d.reasons }
+      a().model = model
+      a().route = note
+    }
+    const stats = await streamChat(model, history, c.params, c.trace, abort.signal, {
       onContent: (d) => {
         a().content += d
         nextTick(() => scrollDown())
@@ -353,12 +391,15 @@ async function reply(c: Conversation) {
     else a().error = String(e?.message || e)
   } finally {
     busy.value = false
+    routing.value = false
+    target.value = ''
     window.clearInterval(waitTimer)
     abort = null
     c.updated = Date.now()
     if (!a().reasoning) delete a().reasoning
-    if (c.trace && (a().content || a().reasoning)) findTrace(c, idx, t0)
+    if (c.trace && (a().content || a().reasoning)) findTrace(c, idx, t0, a().model || model)
     flush()
+    replies.value++
     refreshModels()
     nextTick(() => box.value?.focus())
   }
@@ -369,10 +410,10 @@ function stop() {
 }
 
 /** The hub does not name the trace in the reply, so the newest trace of this model since the request started is it. */
-async function findTrace(c: Conversation, idx: number, since: number) {
+async function findTrace(c: Conversation, idx: number, since: number, model: string) {
   for (let n = 0; n < 4; n++) {
     try {
-      const l = await call('trace.list', { model: c.model, limit: 5 })
+      const l = await call('trace.list', { model, limit: 5 })
       const t = (l.items as any[]).find((x) => x.started_ms >= since - 3000)
       if (t) {
         c.messages[idx].traceId = t.id

@@ -59,6 +59,10 @@ runs on its own.
   through the Cactus runtime. Use her from the CLI (`model-mistress misty`), the dashboard and desktop app, the Qt window, an
   OpenAI client (model `misty`), MCP and ABP. See [docs/misty/USER_GUIDE.md](docs/misty/USER_GUIDE.md); the first step
   is `model-mistress misty setup`. Not yet run against real Bonsai or Cactus files: the guide says what is tested.
+- **A model router for any chat: the model `auto`.** It sends each message to the fast, main or deep model that suits it
+  (a loaded model is preferred), in the Chat page, the Qt window and any OpenAI client, and says which answered. Choose
+  the models on the Models page, Router tab, which also edits each model's serving profile and checks a load will fit
+  before it starts. See [docs/misty/USER_GUIDE.md](docs/misty/USER_GUIDE.md#the-model-router-auto-in-any-chat).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 - **All-in-one item listing & sales platform** — **ItemForge** (`itemforge/`): auto-organize photos into item folders,

@@ -1,11 +1,14 @@
 // Conversations are kept in this browser (or the app's webview) only, in localStorage.
 import { reactive, watch } from 'vue'
 import type { ChatMessage, ChatParams, ReplyStats } from './hub'
+import type { RouteNote } from './router'
 
 export interface Msg extends ChatMessage {
   stats?: ReplyStats
   traceId?: string
   model?: string
+  /** The router chose `model` for this reply (the chat's model is `auto`): the role and why. */
+  route?: RouteNote
   error?: string
   stopped?: boolean
 }

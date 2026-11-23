@@ -4,6 +4,16 @@ Updated 2026-10-28 at repository commit 8409cd6. The measurements below were tak
 RX 7900 XTX and the built-in llama.cpp (commit 7fee178, Vulkan), unless a section says otherwise. On 2026-10-28 the
 pipeline's test stage passed (398 tests), and the pipeline's smoke test passed against the built binary.
 
+## Hub wedge, watchdog and placement (2026-11-22)
+
+A llama-server that exited while loading (GPU out of memory, a driver crash) deadlocked the load thread and silenced the
+whole hub; fixed in `src/engine.rs`, with a self-restart watchdog (`src/watchdog.rs`, exit 70) and automatic placement
+(`--fit on`, fallback to more free room and then the CPU, crashes remembered in `placements.json`). See
+[serving.md](serving.md) and the changelog entry for what was run on the RX 7900 XTX (crash to CPU in 5.8 s, a small
+model on the GPU, a partial offload, an oversized request refused) and what was not (the watchdog on a real hung hub, the
+Scheduled Task's relaunch time, a model larger than VRAM, the dashboard fields in a browser, non-Windows crash
+detection). 539 library tests pass.
+
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):
@@ -270,12 +280,30 @@ Not done or not verified:
   was right. Whistle misspelled one name ("Valdes" for "Valdez") in synthesized speech. Real recordings were not tried.
 - The Vue pages (`frontend/src/views/Misty*.vue`) pass `npm run check` (vue-tsc, 26 Vitest tests, build; 2026-11-22), the
   hub serves them at `/ui`, and the desktop app starts and attaches to a running hub. Nobody has opened the Misty page
-  itself in either (the dashboard asks for the owner token). The Qt page's tests are written but PySide6 is not installed
-  here. The ABP dashboard and CLI were not
+  itself in either (the dashboard asks for the owner token). The Qt window's tests run under `py -3.11` (PySide6 6.11.1,
+  `QT_QPA_PLATFORM=offscreen`; the default Python here has no PySide6): 45 pass, and two that were already failing still
+  fail (`test_look.py::test_the_window_remembers_its_size_and_opens_its_first_page` and
+  `test_pages.py::test_misty_stop_cancels_the_run`, both "timed out waiting for the window").
+  The ABP dashboard and CLI were not
   run (the CLI needs the dashboard); only the client module under them was. The full `cargo test` suite passes with
   `--test-threads=4`; the factory tests are timing-sensitive under full parallelism on this machine (unchanged by this work).
 - The bundled llama.cpp is still b11272. Updating it to b11556 or later would let stock llama.cpp run `Q2_0` Bonsai files
   without Prism; that changes the engine for every model and needs `mm-routing.patch` re-checked, so it is separate.
+
+### The model router (`auto`) and the Models page (2026-11-22)
+
+Tested: the hub side (`misty::auto::tests`, 8 tests, and `tests_hosting::auto_sends_each_chat_to_the_model_that_suits_it_and_says_which_answered`
+with three stand-in models and a peer key: fast and deep routing, the headers, `@deep` forcing, a peer without `auto` in
+its allow-list refused, a peer limited to one model sent only to it, `router.pick` and `router.status`); `pull::is_downloaded`
+and `model.list`'s `deletable`; the frontend (`npm run check`: vue-tsc, 75 Vitest tests, build), where the Chat and Models
+pages are mounted against a stand-in hub (Auto first, and the default only when a role is ready; the pick before the send;
+tags removed; the reply's route and reasons; a hub with no router; filter and sort; role choosers; the settings editor and
+the hub's refusal shown; the fit check); the Qt window (14 new tests).
+
+Not done or not verified: nobody has opened the new Chat or Models page against a real hub (the dashboard asks for the
+owner token); `auto` was not run with a real picture model; the `ServeProfile` fields the editor does not show
+(`cache_reuse`, `kv_unified`, `chat_template_file`, the Rigel options) are kept when a profile is saved but can be
+edited only in `config.toml`.
 
 ## Not done yet
 

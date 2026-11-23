@@ -237,6 +237,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::km::ops::operations());
     all.extend(crate::factory::ops::operations());
     all.extend(crate::misty::ops::operations());
+    all.extend(crate::misty::auto::operations());
     all.extend(crate::forge::operations());
     all
 }
@@ -832,11 +833,17 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                     .map_err(|x| Fail::new(500, "io", x.to_string()))?;
             }
             let src = a["source"].as_str();
+            // `deletable`: ModelMistress downloaded it, so model.delete may remove it
+            let root = crate::pull::download_root(e);
             let mut out: Vec<Value> = e
                 .catalog()
                 .iter()
                 .filter(|m| src.is_none_or(|s| m.source == s))
-                .map(|m| m.summary(e.is_loaded(&m.id)))
+                .map(|m| {
+                    let mut v = m.summary(e.is_loaded(&m.id));
+                    v["deletable"] = json!(crate::pull::is_downloaded(&root, &m.path));
+                    v
+                })
                 .collect();
             if src.is_none() && vision::AVAILABLE {
                 out.extend(vision_entries(&e.vision_dirs()));
@@ -880,6 +887,15 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let r = e.resolve_serving(&st, &m, &opts);
             r.validate().map_err(|x| Fail::invalid(format!("{}: {x}", m.id)))?;
             let (est, devices, plan) = e.plan_load(&m, &opts).await;
+            // where a load with automatic GPU layers would go, and a CPU placement remembered from a crash
+            let placement = if r.is_auto() {
+                e.placement_for(&m, &opts, &devices)
+                    .as_ref()
+                    .map(crate::serving::fit_json)
+            } else {
+                None
+            };
+            let learned = e.learned_why(&m, &r);
             let (verdict, evict, reclaimable) = match &plan {
                 crate::serving::Plan::Fits => ("fits", vec![], None),
                 crate::serving::Plan::Evict(v) => ("fits_after_unloading", v.clone(), None),
@@ -891,7 +907,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                    "devices": devices, "free_mib": devices.iter().map(|d| d.free_mib).sum::<u64>(),
                    "margin_mib": st.vram_margin_mib, "guard": st.vram_guard,
                    "verdict": if est.is_none() || devices.is_empty() { "unknown" } else { verdict },
-                   "unload": evict, "reclaimable_mib": reclaimable})
+                   "unload": evict, "reclaimable_mib": reclaimable,
+                   "placement": placement, "learned_cpu": learned})
         }
         "model.unload" => {
             let name = s(a, "model")?;
@@ -1083,6 +1100,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("km.") => crate::km::ops::call(hub, id, a).await?,
         id if id.starts_with("factory.") => crate::factory::ops::call(hub, id, a).await?,
         id if id.starts_with("misty.") => crate::misty::ops::call(hub, id, a).await?,
+        id if id.starts_with("router.") => crate::misty::auto::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1183,11 +1201,20 @@ async fn run_tts(hub: &Hub, req: &tts::SpeechRequest) -> ApiResult<(Vec<u8>, f64
     let tmp = e.home.join("tmp");
     std::fs::create_dir_all(&tmp).map_err(|x| Fail::new(500, "io", format!("{}: {x}", tmp.display())))?;
     let out = tmp.join(format!("tts-{}.wav", uuid::Uuid::new_v4().simple()));
-    let args = tts::tool_args(&model, &mmproj, req, speaker.as_deref(), &out, st.gpu_layers);
+    let args_for = |cpu: bool| {
+        let layers = if cpu { 0 } else { st.gpu_layers };
+        tts::tool_args(&model, &mmproj, req, speaker.as_deref(), &out, layers)
+    };
     let _one_at_a_time = e.tool_lock.lock().await;
     let t0 = Instant::now();
     let ran = e
-        .run_tool("llama-tts", &args, Duration::from_secs(1800), &mut |_| true)
+        .run_gpu_tool(
+            "llama-tts",
+            st.gpu_layers,
+            &args_for,
+            Duration::from_secs(1800),
+            &mut |_| true,
+        )
         .await;
     let wav = ran.and_then(|_| {
         std::fs::read(&out).map_err(|x| Fail::new(500, "tool_failed", format!("llama-tts wrote no audio: {x}")))
@@ -1225,16 +1252,22 @@ async fn run_image(
     let pattern = std::path::absolute(&dir)
         .unwrap_or(dir)
         .join(format!("image-{}_%d.png", uuid::Uuid::new_v4().simple()));
-    let args = image::tool_args(&model, req, seed, &pattern, st.gpu_layers == 0);
+    let args_for = |cpu: bool| image::tool_args(&model, req, seed, &pattern, cpu);
     let _one_at_a_time = e.tool_lock.lock().await;
     let t0 = Instant::now();
     let ran = e
-        .run_tool("sd-cli", &args, Duration::from_secs(6 * 3600), &mut |line| {
-            if let (Some(job), Some((done, total))) = (&job, image::progress(line)) {
-                job.progress(done, total, format!("step {done} of {total}"));
-            }
-            !job.as_ref().is_some_and(|j| j.cancelled())
-        })
+        .run_gpu_tool(
+            "sd-cli",
+            st.gpu_layers,
+            &args_for,
+            Duration::from_secs(6 * 3600),
+            &mut |line| {
+                if let (Some(job), Some((done, total))) = (&job, image::progress(line)) {
+                    job.progress(done, total, format!("step {done} of {total}"));
+                }
+                !job.as_ref().is_some_and(|j| j.cancelled())
+            },
+        )
         .await;
     let files = image::output_files(&pattern, req.n);
     let made = match ran {
@@ -1599,6 +1632,12 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
             .as_ref()
             .is_none_or(|p| crate::misty::ops::peer_may_use(p, m["id"].as_str().unwrap_or("")))
     }));
+    // `auto`, the model router: a plain chat sent to whichever model suits it (a peer needs it named in its key)
+    data.extend(crate::misty::auto::auto_model(&hub).filter(|_| {
+        who.0
+            .as_ref()
+            .is_none_or(|p| crate::misty::ops::peer_may_use(p, "auto"))
+    }));
     for m in e.ollama_models().await {
         if !allowed(&format!("ollama/{}", m["name"].as_str().unwrap_or(""))) {
             continue;
@@ -1826,6 +1865,33 @@ async fn chat(
             .await
             .map_err(ApiError::from);
     }
+    // `auto` is the model router: pick the model that suits the chat, then it is an ordinary chat to that model
+    if crate::misty::auto::is_auto(&hub, &asked) {
+        if let Some(p) = &who.0 {
+            if !crate::misty::ops::peer_may_use(p, &asked) {
+                return Err(Fail::new(
+                    403,
+                    "model_not_allowed",
+                    format!(
+                        "this key may not use \"{asked}\": name it in the key's models (its models: {})",
+                        p.allow_list().join(", ")
+                    ),
+                )
+                .into());
+            }
+        }
+        let picked = crate::misty::auto::route_chat(&hub, who.0.as_deref(), &mut body)
+            .await
+            .map_err(ApiError::from)?;
+        let mut resp = chat_to_model(hub, who, headers, body).await?;
+        crate::misty::auto::stamp(&mut resp, &picked);
+        return Ok(resp);
+    }
+    chat_to_model(hub, who, headers, body).await
+}
+
+/// A chat for one model of the catalog (or Ollama): traced when the owner asks, then forwarded.
+async fn chat_to_model(hub: Hub, who: Caller, headers: HeaderMap, mut body: Value) -> ApiResult<Response> {
     // the owner's requests can be traced (src/trace); a peer's never are
     let scope = crate::trace::capture::wants(&hub.engine.home, &headers, &mut body);
     if let (Some(scope), true) = (scope, who.0.is_none()) {
@@ -2163,6 +2229,7 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     let stop = hub.stop.clone();
     let engine = hub.engine.clone();
     let keys = hub.keys.clone();
+    let heartbeat = crate::watchdog::spawn_heartbeat();
     let housekeeping = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         loop {
@@ -2185,6 +2252,7 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     })
     .await;
     housekeeping.abort();
+    heartbeat.abort();
     keys.flush();
     let n = engine.unload_all();
     let _ = std::fs::remove_file(&control);

@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **The hub no longer wedges after a failed GPU load, restarts itself if it ever does, and places each model on the GPU or
+  the CPU by what it can run on** (`src/engine.rs`, `src/serving.rs`, `src/watchdog.rs`,
+  [docs/serving.md](docs/serving.md)).
+  - *The wedge.* A llama-server that exited while loading (GPU out of memory, a driver crash, a bad file) deadlocked the
+  thread that ran the load: the exit check held the lock on the child process in an `if let`, and `stop()` took the same
+  lock. One stuck thread silences the whole async runtime, so `/v1/health` stopped answering while the operating system
+  still accepted connections and the process sat at 0 % CPU, which the Scheduled Task cannot tell from a healthy hub.
+  Reproduced with `nomic-embed-text` on the Vulkan GPU, read from symbolized thread stacks, fixed (the status is read
+  before `stop()`), and covered by a test that runs the load on a runtime of its own with a timeout outside it.
+  - *The watchdog.* `model-mistress serve` probes its own `/v1/health` every 10 s; after `watchdog_s` (default 90, 0 =
+  off) without an answer it writes `<home>/logs/hang-<time>.txt` (when the runtime's timer last ran, memory and the stack
+  of every thread on x86-64 Windows) and exits with code 70, so that the Scheduled Task starts a new hub. The
+  desktop app's embedded hub does not run it.
+  - *Placement.* With `gpu_layers` at its default (999) llama-server now chooses the layers itself (`--fit on
+  --fit-target`, from what each device has free when the server starts) instead of being told `-ngl 999`: all on the GPU,
+  part on the GPU and the rest from RAM, or on the CPU. The hub's header estimate decides which idle models to unload
+  (a model on the CPU is never unloaded for VRAM) and refuses a load that fits neither (`503 insufficient_memory`).
+  `model.plan` adds `placement`; a loaded model reports `serving.placement` (`gpu`, `partial`, `cpu`, `unknown`) and
+  `serving.placement_note`; the Models page shows both and the split before a load. `gpu_layers = 0` now means no GPU
+  backend at all (`-ngl 0 -dev none`).
+  - *Fallback* (`gpu_fallback`, default on). A load that fails because of the GPU is tried again: out of memory first with
+  2 GiB more kept free, then on the CPU; a driver crash goes straight to the CPU. A crash is remembered in
+  `<home>/placements.json` against the llama-server program, so the next load starts on the CPU; `retry_gpu: true` (a box
+  on the load form) tries the GPU again. Failures that are not the GPU's are never retried. `llama-tts` and `sd-cli` fall
+  back to the CPU the same way. New settings `gpu_fallback` and `watchdog_s` are in the Settings page.
+  - Run on this machine (Windows 10, RX 7900 XTX, amdvlk Vulkan driver, 2026-11-22), on a scratch hub: `nomic-embed-text`
+  crashed the driver (exit 0xC0000409) and loaded on the CPU 5.8 s later while the hub kept answering; the next load went
+  straight to the CPU in 5 s from the remembered crash, and `retry_gpu: true` tried the GPU again. `Bonsai-1.7B-Q2_K`
+  placed itself on the GPU (878 MiB, `placement: gpu`); with the margin raised to leave 240 MiB on the GPU it reported
+  `partial` and still answered; a request larger than the machine's RAM was refused up front. The new build then replaced
+  the live hub's: health, `config.get`, `model.list`, `router.status`, `misty doctor` and an `auto` chat all worked.
+  Checks: `cargo fmt`, `cargo clippy -D warnings`, 539 library tests pass (6 ignored), the dashboard type-checks and its
+  81 tests pass.
+  - Not run: the watchdog on a real hung hub (it has 7 tests against stand-ins, and ran 10 minutes without a false
+  trigger); how long the Scheduled Task takes to start a hub after exit 70 (expected 1 to 5 minutes, not timed); a model
+  larger than the GPU's memory; `--fit` with the Prism and Rigel engines (they keep `-ngl`); the new dashboard fields in a
+  browser; crash detection from a signal on Linux and macOS (built for Windows only); the `llama-tts` and `sd-cli`
+  fallback end to end (only its decision is tested).
 - **Misty, a CPU-first agent** (`src/misty`, [docs/misty](docs/misty/USER_GUIDE.md)). One request goes through a router
   to a role (fast, main or deep, filled by your models; Ternary Bonsai 2 2B, 9B and 27B are preferred), with retrieval
   from her own index (keyword search, plus vectors when an embedding model is installed), tools under a class policy
@@ -42,6 +80,29 @@
     half and retried, up to four times. The bundled llama-server (0.5.0-dev) crashes (exit `0xC0000409`) on
     `nomic-embed-text` when it offloads to the Vulkan GPU, and on CPU with a batch above 512; a profile with
     `engine = "prism"`, `gpu_layers = 0` and larger `ctx_size`, `batch_size` and `ubatch_size` runs it (user guide).
+- **The model router in every chat: the model `auto`**, and a Models page that manages models.
+  - `auto` is a plain chat that goes to the model that suits each message. The hub picks the role (`fast`, `main` or
+    `deep`) with Misty's router, forwards the chat to that role's model and says which answered in the headers
+    `x-mm-routed-model`, `x-mm-routed-role` and `x-mm-routed-why`. It has no tools, files or index (that is `misty`).
+    `@fast`, `@main` and `@deep` in a message choose the role and are removed before the model sees them. A
+    conversation with a picture goes only to a model that has a projector. A peer key may use it only when its allow-list
+    names `auto`, and the router then considers only models the key allows. With no model ready it answers 409
+    `no_model_ready` with the reasons. A catalog model named `auto` wins. See [docs/misty/API.md](docs/misty/API.md).
+  - Operations `router.status` (each role's model, whether it can run now, whether it is loaded, your overrides, free
+    memory) and `router.pick` (which model a message or conversation would go to and why; nothing is sent).
+  - Chat page (dashboard and desktop app) and the Qt window: Auto is the first choice and the default once a role has a
+    model that can answer. A reply says which role and model answered and why (a "router" chip and a "why" list), and
+    the strip above the chat shows the roles. The page asks `router.pick` first, so it can say which model is loading.
+  - Models page: a **Router** tab (choose the model for each role, or Automatic; load or unload it; try a message and see
+    where it would go and the scores), a role badge on each model with a "use for" menu, a per-model **Settings** editor
+    for the serving profile (engine, GPU layers, context, parallel, batch sizes, flash attention, KV cache types, prompt
+    cache, Jinja; validated by the hub, applied on the next load, "reset" removes it), a **fit check** in the Load form
+    (`model.plan`: fits, fits after unloading what, or does not fit), a filter, a "show" menu and a sort, and embedding
+    models in their own group. `model.list` now says `deletable` (ModelMistress downloaded it); Delete is off for the
+    others instead of failing. The Qt window's Models page has the role choosers and a Router column.
+  - Tests: 8 router tests and a hosting test in the hub, 75 Vitest tests (the Chat and Models pages are mounted against a
+    stand-in hub), 14 new Qt and window-model tests. Not run: the pages against a real hub with a person at them (the
+    dashboard asks for the owner token), and `auto` with a real picture model.
 - **`raise_priority`** (Windows, off by default): a hub started at below-normal or idle priority, as a Scheduled Task is
   by default, lifts itself to normal, and the model servers it starts after that inherit it. Without it, CPU work in the
   hub (embedding, Bonsai on the Prism engine) ran four to five times slower than in a hub started by hand while other

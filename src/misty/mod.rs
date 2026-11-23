@@ -8,6 +8,7 @@
 //!   toolbox   the tools, their classes and the guards that hold whatever a model says
 //!   cactus    Needle 3 / Whistle / Mirage through the Cactus runtime library
 //!   agent     the loop: route, retrieve, reflex, generate, act, escalate
+//!   auto      the router without the agent: the model name `auto`, `router.status`, `router.pick`
 //!   runs      live run logs, cancellation and approvals
 //!   state     sessions and finished runs
 //!   pipeline  short declarative chains of steps
@@ -16,6 +17,7 @@
 //!   cli       `model-mistress misty ...`
 
 pub mod agent;
+pub mod auto;
 pub mod cactus;
 pub mod cli;
 pub mod config;

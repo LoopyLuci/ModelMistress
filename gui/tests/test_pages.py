@@ -136,6 +136,121 @@ def test_chat_shows_a_model_s_markup_as_text(app):
     assert "<img" in page.transcript.toPlainText()
 
 
+def _role(role, model, status="ready", loaded=False):
+    return {"role": role, "model": model, "status": status if model else "missing", "loaded": loaded}
+
+
+ROUTER_STATUS = {
+    "model": "auto", "enabled": True, "overrides": {}, "free_ram_mb": 8192,
+    "roles": [_role("fast", "qwen3-2b"), _role("main", "qwen3-9b", loaded=True), _role("deep", None)],
+    "support": [_role("embed", "nomic-embed-text"), _role("rerank", None)],
+}
+ROUTER_MODELS = [
+    {"id": "qwen3-2b", "source": "hf", "size_gb": 1.5},
+    {"id": "qwen3-9b", "source": "hf", "size_gb": 6},
+    {"id": "nomic-embed-text", "source": "hf", "size_gb": 0.1},
+]
+
+
+def test_chat_starts_on_the_router_and_sends_to_the_model_it_picks(app):
+    pick = {"role": "deep", "model": "qwen3-9b", "forced": "deep", "reasons": ["you asked for deep"], "candidates": []}
+    hub = FakeHub({"model.list": ROUTER_MODELS, "router.status": ROUTER_STATUS, "router.pick": pick}, pieces=("Do", "ne"))
+    page = ChatPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.model.count() == 3)
+    assert page.model.itemData(0) == "auto" and page.model.currentData() == "auto"
+
+    page.input.setPlainText("@deep prove it")
+    page.send()
+
+    wait_for(app, lambda: page.messages[-1]["content"] == "Done" and page._cancel is None)
+    assert ("router.pick", {"messages": [{"role": "user", "content": "@deep prove it"}]}) in hub.calls
+    # the picked model gets the message without the tag
+    assert ("chat", "qwen3-9b", [{"role": "user", "content": "prove it"}]) in hub.calls
+    assert page.messages[-1]["model"] == "deep: qwen3-9b"
+    assert "Model (deep: qwen3-9b)" in page.transcript.toPlainText()
+
+
+def test_chat_does_not_start_on_a_router_with_nothing_to_send_to(app):
+    status = {**ROUTER_STATUS, "roles": [_role("fast", None), _role("main", None), _role("deep", None)]}
+    hub = FakeHub({"model.list": ROUTER_MODELS, "router.status": status})
+    page = ChatPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.model.count() == 3)
+    assert page.model.currentData() == "qwen3-2b"  # a model, not Auto; Auto is still there to choose
+
+
+def test_chat_says_why_the_router_has_no_model_and_sends_nothing(app):
+    pick = {"role": None, "model": None, "forced": None, "reasons": ["a picture, and no model can see it"], "candidates": []}
+    hub = FakeHub({"model.list": ROUTER_MODELS, "router.status": ROUTER_STATUS, "router.pick": pick})
+    page = ChatPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.model.count() == 3)
+
+    page.input.setPlainText("what is this?")
+    page.send()
+
+    wait_for(app, lambda: page._cancel is None and "router has no model" in page.status.text())
+    assert "no model can see it" in page.status.text()
+    assert not any(c[0] == "chat" for c in hub.calls)
+
+
+def test_chat_on_a_hub_without_a_router_lists_only_models(app):
+    hub = FakeHub({"model.list": ROUTER_MODELS})
+    page = ChatPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.model.count() == 2)
+    assert "auto" not in [page.model.itemData(i) for i in range(page.model.count())]
+
+
+def test_a_picked_model_is_sent_the_conversation_without_the_extra_keys_of_the_window(app):
+    pick = {"role": "main", "model": "qwen3-9b", "forced": None, "reasons": [], "candidates": []}
+    hub = FakeHub({"model.list": ROUTER_MODELS, "router.status": ROUTER_STATUS, "router.pick": pick}, pieces=("ok",))
+    page = ChatPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.model.count() == 3)
+    for text in ("one", "two"):
+        page.input.setPlainText(text)
+        page.send()
+        wait_for(app, lambda: page._cancel is None and page.messages[-1]["content"] == "ok")
+        page.messages[-1]["content"] = "ok"
+    chats = [c for c in hub.calls if c[0] == "chat"]
+    assert chats[-1][2] == [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "two"},
+    ]
+
+
+def test_models_page_shows_and_changes_the_router_roles(app):
+    hub = FakeHub({"model.list": ROUTER_MODELS, "router.status": ROUTER_STATUS, "misty.config.set": {}})
+    page = ModelsPage()
+    page.attach(hub)
+    wait_for(app, lambda: page.table.rowCount() == 3)
+
+    assert not page.roles_box.isHidden()
+    roles = {page.table.item(r, 0).text(): page.table.item(r, 5).text() for r in range(3)}
+    assert roles == {"qwen3-2b": "fast", "qwen3-9b": "main", "nomic-embed-text": "embed"}
+    main = page.role_choice["main"]
+    assert [main.itemData(i) for i in range(main.count())] == [None, "qwen3-2b", "qwen3-9b"]
+    assert page.role_state["main"].text() == "ready, loaded"
+    assert page.role_state["deep"].text() == "no model"
+    embed = page.role_choice["embed"]
+    assert [embed.itemData(i) for i in range(embed.count())] == [None, "nomic-embed-text"]
+
+    fast = page.role_choice["fast"]
+    fast.setCurrentIndex(2)  # qwen3-9b
+    fast.activated.emit(2)
+    wait_for(app, lambda: ("misty.config.set", {"patch": {"roles": {"fast": "qwen3-9b"}}}) in hub.calls)
+
+
+def test_models_page_hides_the_roles_on_a_hub_without_a_router(app):
+    page = ModelsPage()
+    page.attach(FakeHub({"model.list": ROUTER_MODELS}))
+    wait_for(app, lambda: page.table.rowCount() == 3)
+    assert page.roles_box.isHidden()
+
+
 class MistyFake(FakeHub):
     """A hub whose Misty answers from a script: `pages` are the pages misty.run.get returns, in order."""
 

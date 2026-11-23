@@ -40,7 +40,8 @@ The same through the hub's operations: `key.create`, `key.list`, `key.revoke`, `
 
 A peer sends its key like any OpenAI key: `Authorization: Bearer mmk_...` (or `x-api-key`). It may use
 `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank` and `/v1/audio/*`, and
-nothing else: the control API answers `403`.
+nothing else: the control API answers `403`. The router model `auto` is on the list only for a key whose allow-list
+names it, and it then chooses among the models that key may use.
 
 ## Quotas
 

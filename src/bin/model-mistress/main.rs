@@ -457,6 +457,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         Cmd::Serve { host, port } => {
             std::fs::create_dir_all(&home)?;
             let settings = Settings::load(&home).map_err(anyhow::Error::msg)?;
+            let watchdog_s = settings.watchdog_s;
             let engine = {
                 let home = home.clone();
                 tokio::task::spawn_blocking(move || Engine::new(home, settings)).await?
@@ -470,7 +471,25 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 .filter(|t| t.len() >= 16)
                 .unwrap_or_else(new_token);
             let hub = Hub::new(engine.clone(), token);
-            hub::serve(hub, ServeOpts { home, host, port }).await?;
+            // A hub that stops answering ends itself, so that its Scheduled Task or service manager starts it again.
+            let watchdog = (watchdog_s > 0 && port != 0)
+                .then(|| {
+                    let cfg = model_mistress::watchdog::Config::new(
+                        model_mistress::watchdog::probe_addr(host, port),
+                        home.clone(),
+                        std::time::Duration::from_secs(watchdog_s),
+                    );
+                    let home = home.clone();
+                    model_mistress::watchdog::start(cfg, move |_| {
+                        model_mistress::watchdog::terminate_hub(&home, model_mistress::watchdog::EXIT_DEAF)
+                    })
+                })
+                .and_then(|r| r.ok());
+            let served = hub::serve(hub, ServeOpts { home, host, port }).await;
+            if let Some(w) = watchdog {
+                w.stop();
+            }
+            served?;
             drop(engine);
         }
         Cmd::Status => {

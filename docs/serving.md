@@ -33,7 +33,7 @@ cache_prompt = true
 | `ctx_size` | `-c` | Context tokens **in all**. llama-server divides them between the slots unless `kv_unified` is on. 0 = the model's own (can be 256k and will not fit). |
 | `ctx_per_slot` | `-c` = this x `parallel` | Context per slot. Wins over `ctx_size` in the same layer. |
 | `parallel` | `-np` | Slots (requests decoded at once). |
-| `gpu_layers` | `-ngl` | Layers on the GPU (999 = all). |
+| `gpu_layers` | `-ngl`, or `--fit` | Layers on the GPU. 999 (default) = as many as fit, chosen by llama-server; 0 = CPU only. See "Where a model runs". |
 | `cache_type_k`, `cache_type_v` | `-ctk`, `-ctv` | KV-cache type: `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1`. A quantised V cache needs flash attention. |
 | `flash_attn` | `-fa` | `on`, `off` or `auto`. |
 | `cache_prompt` | `--cache-prompt` / `--no-cache-prompt` | Keep a slot's prompt between requests, so the next turn of an agent only processes what is new. llama-server's default is on. |
@@ -93,6 +93,63 @@ estimate, the devices and their free memory, and the verdict `fits`, `fits_after
 `does_not_fit` or `unknown`.
 
 The estimate is checked against measurements in [STATUS.md](STATUS.md).
+
+## Where a model runs: the GPU, both, or the CPU
+
+`gpu_layers` says how much of a model goes on the GPU. Three cases:
+
+| `gpu_layers` | What the hub does |
+|---|---|
+| 999 (the default) or a negative number | **Automatic.** The hub and llama-server place the model: every layer on the GPU if they fit, else as many as fit with the rest running from RAM, else all on the CPU. |
+| 1 to 998 | That many layers (`-ngl N`). It must fit the GPU's free memory (planner above), or the load is refused with `503 insufficient_vram`. |
+| 0 | CPU only: `-ngl 0 -dev none` (the GPU backend is left out, so a driver that crashes the server is not touched). |
+
+**Automatic placement.** llama.cpp's own `--fit` measures the free memory of each device when the server starts, which is
+more exact than the estimate from the GGUF header, and it keeps experts of mixture-of-experts models in RAM when that
+saves the GPU. The hub passes `--fit on --fit-target <margin>` (the margin is `vram_margin_mib`, at least 512 MiB)
+instead of `-ngl` when the stock llama-server has the flag (`--help` lists `--fit`; the answer is remembered). A PrismML
+or Rigel server has no `--fit`, so it still gets `-ngl`. Before the server starts the hub uses its header estimate only
+for two things: unloading idle models to make room (a model that holds no VRAM is never unloaded for VRAM), and refusing
+a load that cannot run at all, `503 insufficient_memory`: the part that does not fit the GPU would have to fit in free
+RAM, and it does not. Where `model.plan` can estimate, it adds `placement`: `{"where": "gpu"}`,
+`{"where": "gpu_after_unloading", "unload": [...]}`, `{"where": "split", "gpu_share": 0.57}`, `{"where": "cpu"}` or
+`{"where": "none", "need_ram_mib": ..., "free_ram_mib": ...}`.
+
+**What was measured.** Each loaded model reports `serving.placement`: `gpu` (the weights are on the GPU), `partial`
+(some are), `cpu`, or `unknown` (no GPU counters on this machine, or not measured yet). It comes from the dedicated
+GPU memory of the model's server process compared with the weights and KV cache of every layer (compute buffers are on
+the GPU either way, so they are left out). Where the counters work, a server
+that holds none is `cpu`. `serving.placement_note` says why a model is not where it was asked to be (below). The Models page
+shows both.
+
+**When the GPU fails a load.** With `gpu_fallback = true` (the default), a load that fails because of the GPU is tried
+again instead of being reported at once:
+
+1. *Out of memory* (the log says an allocation on a device failed): llama-server is asked to keep 2 GiB more free
+   (`--fit-target` margin + 2048), where it chooses the layers itself.
+2. *Out of memory again, or a crash* (the server died the way a driver crash kills a process: exit code `0xC0000409` or
+   another `0xC...` code on Windows, a signal elsewhere): the model is started on the CPU, if free RAM holds the file and
+   a GiB more. If it does not, the GPU's own error is the answer.
+
+A failure that is not the GPU's (an unknown architecture, a file that cannot be read, a load that times out) is never
+retried. When every start fails, the error is the last one, with what was tried before it: `(before this: ...)`.
+
+A **crash** is remembered. When the CPU start works after one, `<home>/placements.json` records the model and the
+llama-server program (path, size, date) it crashed with; the next load of that model starts on the CPU at once and says
+so in `placement_note`. A different or updated llama-server gets a new try on the GPU. `model.load` with
+`"retry_gpu": true` tries the GPU again (and forgets the record when it works); the load form of the Models page has a
+box for it. An out-of-memory failure is not remembered: it depends on what else is using the GPU at the time.
+
+`gpu_fallback = false` turns all of this off: one start, one error.
+
+## Hub watchdog
+
+`model-mistress serve` runs a watchdog thread. Every 10 seconds it asks the hub's own `/v1/health` over the loopback; if
+that does not answer for `watchdog_s` seconds (default 90; 0 turns it off; 3 minutes of grace after the start) it writes
+`<home>/logs/hang-<time>.txt` (the time, when the runtime's timer task last ran, memory and, on x86-64 Windows, the
+stack of every thread; the newest five are kept) and ends the process with exit code 70, so that the Scheduled Task starts a fresh hub. It is for a hub that is
+alive but deaf: the operating system still accepts connections for a process that has stopped answering, so nothing else
+notices. The desktop app's own hub does not run it.
 
 ## Recommended profile: Qwen3-Coder-30B-A3B (Q4_K_XL, 17.7 GB) on a 24 GB card for four agents
 

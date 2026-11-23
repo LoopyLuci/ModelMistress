@@ -19,6 +19,12 @@ export interface HubModel {
   loaded?: boolean | null
   kind?: string
   task?: string | null
+  /** ModelMistress downloaded it, so the hub may delete it (a model another program put on the disk is not). */
+  deletable?: boolean
+  /** Not a file: the model router, which sends each message to the model that suits it. */
+  router?: boolean
+  /** For the router: at least one role has a model that can answer now (a new chat starts on it only then). */
+  ready?: boolean
 }
 
 export interface LoadedModel {
@@ -31,6 +37,8 @@ export interface LoadedModel {
   reranking: boolean
   args: string[]
   log?: string
+  /** How it is served; `placement` is where the weights went, `placement_note` why when that is not what was asked. */
+  serving?: { placement?: 'gpu' | 'partial' | 'cpu' | 'unknown'; placement_note?: string | null; vram_mib?: number | null }
 }
 
 const notChat = ['clip', 'sd', 'sd3', 'flux', 'whisper', 'wavtokenizer-dec']
@@ -54,16 +62,37 @@ export async function loadedModels(): Promise<LoadedModel[]> {
 
 export interface Group { label: string; models: HubModel[] }
 
-/** The picker's groups: MM's own models first, then the rest by where they are from. */
+/** The router as a choice in a chat's model list: the model name `auto`. */
+export const routerChoice = (ready = true): HubModel => ({ id: 'auto', source: 'router', router: true, ready })
+
+/**
+ * The models a chat can choose from: the router first when the hub has one, then the chat models. The Models page
+ * shows files only, so the router is added here and not in `listModels`.
+ */
+export async function chatChoices(refresh = false): Promise<HubModel[]> {
+  const files = await listModels(refresh)
+  let router: HubModel[] = []
+  try {
+    // router.status answers only on a hub that has the router (it comes with Misty)
+    const st = (await call('router.status', {})) as { enabled?: boolean; roles?: { status: string }[] }
+    if (st.enabled !== false) router = [routerChoice((st.roles || []).some((r) => r.status === 'ready'))]
+  } catch (_) {
+    /* an older hub, or one without Misty: no router in the list */
+  }
+  return [...router, ...files]
+}
+
+/** The picker's groups: the router first, then MM's own models, then the rest by where they are from. */
 export function groupModels(ms: HubModel[]): Group[] {
   const by = (f: (m: HubModel) => boolean) => ms.filter(f).sort((a, b) => a.id.localeCompare(b.id))
   const groups: Group[] = [
-    { label: 'MM models', models: by((m) => !!m.native) },
-    { label: 'Local models', models: by((m) => !m.native && !m.source.startsWith('ollama')) },
-    { label: 'Ollama', models: by((m) => !m.native && m.source.startsWith('ollama')) },
+    { label: 'Router', models: by((m) => !!m.router) },
+    { label: 'MM models', models: by((m) => !m.router && !!m.native) },
+    { label: 'Local models', models: by((m) => !m.router && !m.native && !m.source.startsWith('ollama')) },
+    { label: 'Ollama', models: by((m) => !m.router && !m.native && m.source.startsWith('ollama')) },
   ]
   return groups.filter((g) => g.models.length)
 }
 
 export const modelLabel = (m: HubModel): string =>
-  `${m.id}${m.size_gb ? ` (${m.size_gb} GB)` : ''}${m.loaded ? ' - loaded' : ''}`
+  m.router ? 'Auto: the router picks the model for each message' : `${m.id}${m.size_gb ? ` (${m.size_gb} GB)` : ''}${m.loaded ? ' - loaded' : ''}`

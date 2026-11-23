@@ -281,11 +281,12 @@ async fn the_allow_list_limits_the_models_a_key_can_use_and_see() {
         .send()
         .await
         .unwrap();
-    // the owner also sees Misty, the agent, under her four names
+    // the owner also sees the router (`auto`) and Misty, the agent, under her four names
     assert_eq!(
         ids(all.json().await.unwrap()),
         [
             "alpha",
+            "auto",
             "beta",
             "gamma",
             "misty",
@@ -538,4 +539,81 @@ async fn misty_reaches_a_peer_only_when_its_key_names_her_and_then_without_tools
         .await
         .unwrap();
     assert_eq!(denied.status(), 403);
+}
+
+#[tokio::test]
+async fn auto_sends_each_chat_to_the_model_that_suits_it_and_says_which_answered() {
+    let r = rig(&["qwen3.5-2b-test", "qwen3.5-27b-test"]).await;
+    let (_a, _sa) = r.model("qwen3.5-2b-test", "FAST", 0).await;
+    let (_b, _sb) = r.model("qwen3.5-27b-test", "DEEP", 0).await;
+    let ask = |key: &str, text: &str| {
+        r.http
+            .post(format!("{}/v1/chat/completions", r.url))
+            .bearer_auth(key)
+            .json(&json!({"model": "auto", "messages": [{"role": "user", "content": text}]}))
+    };
+    let hard = "prove that the square root of 2 is irrational, step by step, and analyze the trade-offs of each method";
+
+    let hello = ask(TOKEN, "hello").send().await.unwrap();
+    assert_eq!(hello.status(), 200);
+    assert_eq!(hello.headers()["x-mm-routed-role"], "fast");
+    assert_eq!(hello.headers()["x-mm-routed-model"], "qwen3.5-2b-test");
+    assert!(!hello.headers()["x-mm-routed-why"].is_empty());
+    assert_eq!(text_of(hello).await, "FAST");
+
+    let deep = ask(TOKEN, hard).send().await.unwrap();
+    assert_eq!(deep.headers()["x-mm-routed-role"], "deep");
+    assert_eq!(text_of(deep).await, "DEEP");
+
+    // the client can still say which role it wants, and the tag is not sent on
+    let forced = ask(TOKEN, "@deep hello").send().await.unwrap();
+    assert_eq!(forced.headers()["x-mm-routed-role"], "deep");
+    assert_eq!(text_of(forced).await, "DEEP");
+
+    // a peer reaches the router only when its key names it, and then only the models its key allows
+    let open = r.key(json!({"peer": "open"})).await;
+    let refused = ask(&open, "hello").send().await.unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"]["code"],
+        "model_not_allowed"
+    );
+    let named = r
+        .key(json!({"peer": "named", "models": ["auto", "qwen3.5-2b-test"]}))
+        .await;
+    let listed = r
+        .http
+        .get(format!("{}/v1/models", r.url))
+        .bearer_auth(&named)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["auto", "qwen3.5-2b-test"]);
+    let peer = ask(&named, hard).send().await.unwrap();
+    assert_eq!(
+        peer.headers()["x-mm-routed-model"],
+        "qwen3.5-2b-test",
+        "the deep model is not this key's to use, so it is never chosen"
+    );
+    assert_eq!(text_of(peer).await, "FAST");
+
+    // the operations show the same decision without sending anything
+    let (st, v) = r.call("router.pick", json!({"input": hard})).await;
+    assert_eq!((st, v["result"]["role"].as_str()), (200, Some("deep")), "{v}");
+    let (st, v) = r.call("router.status", json!({})).await;
+    assert_eq!(
+        (st, v["result"]["roles"].as_array().map(Vec::len)),
+        (200, Some(3)),
+        "{v}"
+    );
 }

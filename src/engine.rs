@@ -139,6 +139,14 @@ pub struct Settings {
     /// normal) raises itself to normal priority, so the model servers it starts after that inherit normal priority
     /// too. Off by default: a hub started low stays low. It never goes above normal and never lowers a priority.
     pub raise_priority: bool,
+    /// `serve` ends the hub when its own `/v1/health` has not answered for this many seconds (0 = never), so that
+    /// whatever started it (a Scheduled Task, a service manager) starts it again, and leaves `logs/hang-<time>.txt`
+    /// to say where every thread was stuck. Read when the hub starts.
+    pub watchdog_s: u64,
+    /// When a load fails because of the GPU (it ran out of memory, or the driver crashed the server), try again with
+    /// more room kept free and then on the CPU, and remember a crash so that the next load goes straight to the CPU.
+    /// Off: the failure is the answer.
+    pub gpu_fallback: bool,
     /// Let requests from this machine (the peer address is 127.0.0.1 or ::1) call the hub without a token, so
     /// Ollama clients that send no Authorization header work. Off by default; see the README.
     pub allow_loopback_no_token: bool,
@@ -202,6 +210,8 @@ impl Default for Settings {
             max_loaded_embedding: 1,
             fail_fast_busy: false,
             raise_priority: false,
+            watchdog_s: 90,
+            gpu_fallback: true,
             allow_loopback_no_token: false,
             default_model: None,
             extra_args: vec![],
@@ -330,6 +340,9 @@ pub struct LoadOpts {
     /// Load even if the VRAM planner says it does not fit.
     #[serde(default)]
     pub skip_vram_check: bool,
+    /// Try the GPU again for a model that was moved to the CPU after a crash (see the `gpu_fallback` setting).
+    #[serde(default)]
+    pub retry_gpu: bool,
 }
 
 /// A LoRA adapter attached to a model.
@@ -503,7 +516,8 @@ impl Instance {
         if let Some(mut c) = self.child.lock().take() {
             let _ = c.start_kill();
         }
-        if let Some(f) = self.on_stop.lock().take() {
+        let on_stop = self.on_stop.lock().take();
+        if let Some(f) = on_stop {
             f();
         }
     }
@@ -543,6 +557,10 @@ pub struct Engine {
     bundled_rigel: Option<PathBuf>,
     /// LoRA adapters and draft models per model id (see [`Extras`]).
     extras: Mutex<HashMap<String, Extras>>,
+    /// Models whose load crashed on the GPU, and that go to the CPU until the engine changes (`placements.json`).
+    learned: Mutex<BTreeMap<String, Learned>>,
+    /// Which options a server program has, from its `--help`, by `path|flag`.
+    help_flags: Mutex<HashMap<String, bool>>,
     /// The llama.cpp tools (llama-tts, llama-quantize) that take the machine's memory run one at a time per kind.
     pub tool_lock: tokio::sync::Mutex<()>,
     #[cfg(windows)]
@@ -584,6 +602,8 @@ impl Engine {
             bundled: bundled::install(&home),
             bundled_rigel: bundled::install_rigel(&home),
             extras: Mutex::new(load_extras(&home)),
+            learned: Mutex::new(load_learned(&home)),
+            help_flags: Mutex::new(HashMap::new()),
             tool_lock: tokio::sync::Mutex::new(()),
             home,
             #[cfg(windows)]
@@ -924,15 +944,49 @@ impl Engine {
         if status.success() {
             Ok(())
         } else {
-            Err(Fail::new(
-                500,
-                "tool_failed",
-                format!(
-                    "{name} failed ({status}):\n{}",
-                    tail.into_iter().collect::<Vec<_>>().join("\n")
-                ),
-            ))
+            let text = tail.into_iter().collect::<Vec<_>>().join("\n");
+            let mut f = Fail::new(500, "tool_failed", format!("{name} failed ({status}):\n{text}"));
+            // what a retry on the CPU can act on (see `run_gpu_tool`)
+            f.fields = json!({"exit_code": status.code(),
+                              "gpu_failure": gpu_failure(&text, &status).map(GpuFailure::name)});
+            Err(f)
         }
+    }
+
+    /// [`run_tool`](Self::run_tool) for a tool that can use the GPU (llama-tts, sd-cli). `args_for(cpu)` are its
+    /// arguments, for the CPU only when `cpu` is true. When it fails because of the GPU (out of memory, or a driver
+    /// crash) and `gpu_fallback` is on, it is run once more on the CPU. `gpu_layers` 0 is a tool that never had the GPU.
+    pub async fn run_gpu_tool(
+        &self,
+        name: &str,
+        gpu_layers: i32,
+        args_for: &(dyn Fn(bool) -> Vec<String> + Sync),
+        timeout: Duration,
+        on_line: &mut (dyn FnMut(&str) -> bool + Send),
+    ) -> Result<()> {
+        let Err(first) = self.run_tool(name, &args_for(gpu_layers == 0), timeout, on_line).await else {
+            return Ok(());
+        };
+        let Some(why) = self.cpu_retry_for_tool(gpu_layers, &first) else {
+            return Err(first);
+        };
+        self.run_tool(name, &args_for(true), timeout, on_line)
+            .await
+            .map_err(|mut f| {
+                f.message = format!("{} (before this, on the GPU: {why})", f.message);
+                f
+            })
+    }
+
+    /// Whether a tool that failed is run again on the CPU, and what to say about the first failure.
+    fn cpu_retry_for_tool(&self, gpu_layers: i32, f: &Fail) -> Option<String> {
+        if gpu_layers == 0 || !self.settings().gpu_fallback || f.code != "tool_failed" {
+            return None;
+        }
+        Some(match f.fields["gpu_failure"].as_str()? {
+            "crash" => "the tool crashed".to_string(),
+            _ => "the GPU ran out of memory".to_string(),
+        })
     }
 
     /// The LoRA adapters and draft model a model is loaded with.
@@ -1056,9 +1110,9 @@ impl Engine {
         }
         // A reload keeps the old instance serving while the new one loads (both are in memory for a while), then
         // `install` switches over.
-        self.fit_vram(entry, opts).await?;
+        let devices = self.fit_vram(entry, opts).await?;
         let t0 = Instant::now();
-        let inst = Arc::new(self.spawn(entry, opts).await?);
+        let inst = Arc::new(self.load_with_fallback(entry, opts, &devices).await?);
         self.install(inst.clone());
         let mut m = self.metrics.lock();
         let mm = m.entry(entry.id.clone()).or_default();
@@ -1340,25 +1394,7 @@ impl Engine {
             return (Some(est), Plan::Fits);
         }
         let free: u64 = devices.iter().map(|d| d.free_mib).sum();
-        let resident: Vec<Resident> = self
-            .loaded()
-            .iter()
-            .filter(|i| i.model != entry.id)
-            .map(|i| {
-                let sv = i.serving();
-                Resident {
-                    model: i.model.clone(),
-                    idle_s: i.idle_s(),
-                    vram_mib: sv
-                        .vram_mib
-                        .map(|v| v.round() as u64)
-                        .or(sv.estimated_vram_mib)
-                        .unwrap_or(0),
-                    busy: i.inflight() > 0,
-                }
-            })
-            .collect();
-        let plan = serving::plan(est.total_mib, free, s.vram_margin_mib, &resident);
+        let plan = serving::plan(est.total_mib, free, s.vram_margin_mib, &self.residents(&entry.id));
         (Some(est), plan)
     }
 
@@ -1399,15 +1435,29 @@ impl Engine {
         }
     }
 
-    /// Before a load: make sure its estimated VRAM fits, unloading least recently used models if that helps, else
-    /// refuse. Does nothing when the guard is off, the load says to skip it, or the estimate/devices are unknown.
-    async fn fit_vram(&self, entry: &ModelEntry, opts: &LoadOpts) -> Result<()> {
-        if !self.settings().vram_guard || opts.skip_vram_check {
-            return Ok(());
+    /// Before a load: make sure it has somewhere to go. A load whose GPU layers are the hub's to choose (`gpu_layers`
+    /// 999, and a llama-server that fits them itself) is placed: all on the GPU, after unloading idle models if that
+    /// makes it fit; else split between the GPU and RAM; else on the CPU; and only refused when RAM cannot hold the
+    /// rest either. A load with a fixed number of layers must fit the GPU's free VRAM (idle models are unloaded for
+    /// it) or is refused. Does nothing when the guard is off, the load says to skip it, or the estimate or devices are
+    /// unknown. Returns the GPUs that were listed (none: a CPU build, or nothing to list).
+    async fn fit_vram(&self, entry: &ModelEntry, opts: &LoadOpts) -> Result<Vec<serving::Device>> {
+        let s = self.settings();
+        let r = self.resolve_serving(&s, entry, opts);
+        if r.gpu_layers == 0 {
+            return Ok(vec![]);
         }
         let devices = self.gpu_devices().await;
-        let Some((models, want)) = self.vram_decision(entry, opts, &devices)? else {
-            return Ok(());
+        if !s.vram_guard || opts.skip_vram_check {
+            return Ok(devices);
+        }
+        let decision = if r.is_auto() && self.fits_itself(&r).await {
+            self.placement_decision(entry, opts, &devices)?
+        } else {
+            self.vram_decision(entry, opts, &devices)?
+        };
+        let Some((models, want)) = decision else {
+            return Ok(devices);
         };
         for m in &models {
             self.unload(m);
@@ -1417,7 +1467,7 @@ impl Engine {
         loop {
             let now: u64 = self.gpu_devices().await.iter().map(|d| d.free_mib).sum();
             if now >= want {
-                return Ok(());
+                return Ok(devices);
             }
             if Instant::now() > deadline {
                 return Err(Fail::new(
@@ -1433,6 +1483,117 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// The models that are loaded, as the planner sees them (the model being loaded is left out).
+    fn residents(&self, except: &str) -> Vec<Resident> {
+        self.loaded()
+            .iter()
+            .filter(|i| i.model != except)
+            .map(|i| {
+                let sv = i.serving();
+                Resident {
+                    model: i.model.clone(),
+                    idle_s: i.idle_s(),
+                    // a model measured on the CPU frees no VRAM when it is unloaded, whatever was estimated for it
+                    vram_mib: if sv.placement == "cpu" {
+                        0
+                    } else {
+                        sv.vram_mib
+                            .map(|v| v.round() as u64)
+                            .or(sv.estimated_vram_mib)
+                            .unwrap_or(0)
+                    },
+                    busy: i.inflight() > 0,
+                }
+            })
+            .collect()
+    }
+
+    /// Where a load with automatic GPU layers goes (see [`serving::place`]), with the numbers it used.
+    pub fn placement_for(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        devices: &[serving::Device],
+    ) -> Option<serving::Fit> {
+        let s = self.settings();
+        let r = self.resolve_serving(&s, entry, opts);
+        let est = self.estimate_for(entry, opts, &r)?;
+        if devices.is_empty() {
+            return None;
+        }
+        let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+        Some(serving::place(
+            &est,
+            free,
+            s.vram_margin_mib,
+            &self.residents(&entry.id),
+            free_ram_mib(),
+        ))
+    }
+
+    /// `vram_decision` for a load whose GPU layers are chosen automatically: Ok(None) = go ahead, Ok(Some(models)) =
+    /// unload these first, Err = not even the CPU side fits.
+    pub fn placement_decision(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        devices: &[serving::Device],
+    ) -> Result<Option<(Vec<String>, u64)>> {
+        match self.placement_for(entry, opts, devices) {
+            None | Some(serving::Fit::Gpu) | Some(serving::Fit::Split { .. }) | Some(serving::Fit::Cpu) => Ok(None),
+            Some(serving::Fit::GpuAfter(models, want)) => Ok(Some((models, want))),
+            Some(serving::Fit::No {
+                need_ram_mib,
+                free_ram_mib,
+            }) => {
+                let free: u64 = devices.iter().map(|d| d.free_mib).sum();
+                Err(Fail::new(
+                    503,
+                    "insufficient_memory",
+                    format!(
+ "{} does not fit this machine as asked: with the {free} MiB of VRAM that is free it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization.",
+                        entry.id
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Whether llama-server can choose the GPU layers itself (`--fit`): the stock llama.cpp, in a build that has it.
+    async fn fits_itself(&self, r: &Resolved) -> bool {
+        if r.flags.is_rigel() || r.flags.is_prism() {
+            return false;
+        }
+        let Some(exe) = self.llama_server() else {
+            return false;
+        };
+        self.server_has_flag(&exe, "--fit").await
+    }
+
+    /// Whether `exe --help` lists `flag`. Only a real answer is remembered.
+    async fn server_has_flag(&self, exe: &Path, flag: &str) -> bool {
+        let key = format!("{}|{flag}", exe.display());
+        if let Some(known) = self.help_flags.lock().get(&key).copied() {
+            return known;
+        }
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.arg("--help").stdin(std::process::Stdio::null()).kill_on_drop(true);
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        no_window(&mut cmd);
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        if text.trim().is_empty() {
+            return false;
+        }
+        let has = text.contains(flag);
+        self.help_flags.lock().insert(key, has);
+        has
     }
 
     /// Once a server is up: what it says about itself (`/props`) and the memory it took (its log).
@@ -1466,11 +1627,167 @@ impl Engine {
         sv.estimated_vram_mib = estimate;
     }
 
-    async fn spawn(&self, entry: &ModelEntry, opts: &LoadOpts) -> Result<Instance> {
-        let resolved = self.resolve_serving(&self.settings(), entry, opts);
+    /// The server program a load with `r` runs.
+    fn server_for(&self, r: &Resolved) -> Option<PathBuf> {
+        if r.flags.is_prism() {
+            self.prism_server()
+        } else if r.flags.is_rigel() {
+            self.rigel_server()
+        } else {
+            self.llama_server()
+        }
+    }
+
+    /// Names the server program a placement was learned with (path, size, date): another program, or an update,
+    /// gets a new try on the GPU.
+    fn engine_key(&self, r: &Resolved) -> String {
+        let Some(p) = self.server_for(r) else {
+            return String::new();
+        };
+        let meta = std::fs::metadata(&p).ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let when = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{}|{len}|{when}", p.display())
+    }
+
+    /// Why this model goes to the CPU, if an earlier load of it crashed on the GPU with this same server program.
+    pub fn learned_why(&self, entry: &ModelEntry, r: &Resolved) -> Option<String> {
+        let key = self.engine_key(r);
+        self.learned
+            .lock()
+            .get(&entry.id)
+            .filter(|l| !key.is_empty() && l.engine == key)
+            .map(|l| l.why.clone())
+    }
+
+    fn learn(&self, entry: &ModelEntry, r: &Resolved, why: String) {
+        let mut all = self.learned.lock();
+        all.insert(
+            entry.id.clone(),
+            Learned {
+                engine: self.engine_key(r),
+                why,
+                at: now_s(),
+            },
+        );
+        save_learned(&self.home, &all);
+    }
+
+    fn forget(&self, id: &str) {
+        let mut all = self.learned.lock();
+        if all.remove(id).is_some() {
+            save_learned(&self.home, &all);
+        }
+    }
+
+    /// Starts the server for a load. When the GPU is what stops it (out of memory, or a driver crash that kills the
+    /// server) and `gpu_fallback` is on, it tries again: with more room kept free, then on the CPU. A crash is
+    /// remembered, so that the next load of that model goes straight to the CPU (`retry_gpu` tries the GPU again).
+    async fn load_with_fallback(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        devices: &[serving::Device],
+    ) -> Result<Instance> {
+        let s = self.settings();
+        let r = self.resolve_serving(&s, entry, opts);
+        let counted = !devices.is_empty();
+        let mut how = Try::Asked;
+        let mut note: Option<String> = None;
+        if r.is_auto() && s.gpu_fallback && !opts.retry_gpu {
+            if let Some(why) = self.learned_why(entry, &r) {
+                how = Try::Cpu;
+                note = Some(format!(
+                    "on the CPU: {why}. Load it with retry_gpu: true to try the GPU again"
+                ));
+            }
+        }
+        let mut history: Vec<String> = vec![];
+        let mut crash_why: Option<String> = None;
+        loop {
+            match self.spawn(entry, opts, &how, counted).await {
+                Ok(inst) => {
+                    if let (Some(why), Try::Cpu) = (&crash_why, &how) {
+                        self.learn(entry, &r, why.clone());
+                    } else if opts.retry_gpu && how != Try::Cpu {
+                        self.forget(&entry.id);
+                    }
+                    if !history.is_empty() {
+                        let tail = if how == Try::Cpu { "; it runs on the CPU" } else { "" };
+                        note = Some(format!("{}{tail}", history.join("; ")));
+                    }
+                    if note.is_some() {
+                        inst.serving.write().placement_note = note;
+                    }
+                    return Ok(inst);
+                }
+                Err(mut f) => {
+                    let Some((next, why, crash)) = self.after_failure(&s, &r, entry, &how, &f).await else {
+                        if !history.is_empty() {
+                            f.message = format!("{} (before this: {})", f.message, history.join("; "));
+                        }
+                        return Err(f);
+                    };
+                    if crash {
+                        crash_why = Some(why.clone());
+                    }
+                    history.push(why);
+                    how = next;
+                }
+            }
+        }
+    }
+
+    /// What to try after a failed load: None = the failure is the answer. Only a failure that the GPU caused is
+    /// retried, and on the CPU only when the CPU's memory can hold the model. The last field says the server crashed.
+    async fn after_failure(
+        &self,
+        s: &Settings,
+        r: &Resolved,
+        entry: &ModelEntry,
+        how: &Try,
+        f: &Fail,
+    ) -> Option<(Try, String, bool)> {
+        if !s.gpu_fallback || r.gpu_layers == 0 || *how == Try::Cpu {
+            return None;
+        }
+        let kind = f.fields["gpu_failure"].as_str()?;
+        if kind == "memory" && *how == Try::Asked && r.is_auto() && self.fits_itself(r).await {
+            let target = s.vram_margin_mib.max(512) + 2048;
+            return Some((
+                Try::Roomier(target),
+                format!("the GPU ran out of memory, so llama-server was asked to keep {target} MiB free"),
+                false,
+            ));
+        }
+        // the CPU has to hold the weights it is given: if it cannot, the GPU's error is the answer
+        if entry.size_bytes / (1024 * 1024) + 1024 > free_ram_mib() {
+            return None;
+        }
+        let crash = kind == "crash";
+        let cause = if crash {
+            let code = f.fields["exit_code"]
+                .as_i64()
+                .map(|c| format!(" (exit {:#X})", c as i32 as u32));
+            format!("its load on the GPU crashed llama-server{}", code.unwrap_or_default())
+        } else {
+            "the GPU ran out of memory".to_string()
+        };
+        Some((Try::Cpu, cause, crash))
+    }
+
+    async fn spawn(&self, entry: &ModelEntry, opts: &LoadOpts, how: &Try, gpu_counted: bool) -> Result<Instance> {
+        let mut resolved = self.resolve_serving(&self.settings(), entry, opts);
         resolved
             .validate()
             .map_err(|e| Fail::invalid(format!("{}: {e}", entry.id)))?;
+        if *how == Try::Cpu {
+            resolved.gpu_layers = 0;
+        }
         let rigel = resolved.flags.is_rigel();
         if !resolved.flags.is_prism() && !rigel {
             // ternary weights on a llama.cpp that predates their kernels load without an error and answer wrongly
@@ -1517,6 +1834,14 @@ impl Engine {
             })?
         };
         let s = self.settings();
+        // llama-server chooses the number of GPU layers itself where it can: it measures what is free on each device,
+        // which is more exact than a header-based estimate, and it moves experts of a mixture-of-experts model to RAM.
+        if resolved.is_auto() && self.fits_itself(&resolved).await {
+            resolved.fit_target_mib = Some(match how {
+                Try::Roomier(mib) => *mib,
+                _ => s.vram_margin_mib.max(512),
+            });
+        }
         let port = free_port().map_err(|e| Fail::new(500, "io", format!("no free port: {e}")))?;
         let key = crate::hub::new_token();
         let extras = self.extras(&entry.id);
@@ -1531,6 +1856,15 @@ impl Engine {
             entry.id.clone(),
         ];
         args.extend(resolved.args());
+        // nothing on the GPU: leave the GPU backend out altogether, so a driver that crashes the server is not touched
+        // (`-ngl 0` alone still starts it)
+        if resolved.gpu_layers == 0
+            && !rigel
+            && !resolved.flags.is_prism()
+            && self.server_has_flag(&exe, "--device").await
+        {
+            args.extend(["-dev".into(), "none".into()]);
+        }
         args.push("--metrics".into());
         if let Some(t) = opts.threads {
             args.extend(["-t".into(), t.to_string()]);
@@ -1623,17 +1957,22 @@ impl Engine {
         let url = format!("http://127.0.0.1:{port}/health");
         let estimate = self.estimate_for(entry, opts, &resolved).map(|e| e.total_mib);
         loop {
-            if let Some(status) = inst.child.lock().as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+            // The status is read into a variable first. With the lock in the `if let` itself its guard would live through
+            // the body, and `stop()` locks `child` again: a server that exited while loading (a GPU out of memory, a
+            // driver crash, a file it cannot read) then froze this worker thread for good, and with it the hub.
+            let exited = inst.child.lock().as_mut().and_then(|c| c.try_wait().ok().flatten());
+            if let Some(status) = exited {
                 inst.stop();
-                return Err(Fail::new(
+                let text = tail(&log, 15);
+                let mut f = Fail::new(
                     500,
                     "load_failed",
-                    format!(
-                        "llama-server exited ({status}) while loading {}:\n{}",
-                        entry.id,
-                        tail(&log, 15)
-                    ),
-                ));
+                    format!("llama-server exited ({status}) while loading {}:\n{text}", entry.id),
+                );
+                // what a retry can act on: the GPU ran out of memory, or the server died the way a driver crash kills it
+                f.fields = json!({"exit_code": status.code(),
+                                  "gpu_failure": gpu_failure(&text, &status).map(GpuFailure::name)});
+                return Err(f);
             }
             if let Ok(r) = self.http.get(&url).timeout(Duration::from_secs(2)).send().await {
                 if r.status().is_success() {
@@ -1642,6 +1981,22 @@ impl Engine {
                         return Err(f);
                     }
                     self.learn_serving(&inst, estimate).await;
+                    let layers = serving::shape_from_meta(&entry.meta, entry.size_bytes).map(|sh| sh.layers);
+                    let every_layer = Resolved {
+                        gpu_layers: 999,
+                        fit_target_mib: None,
+                        ..resolved.clone()
+                    };
+                    // what moves between the GPU and the CPU (not the compute buffers and the context's fixed cost: they
+                    // are most of a small model's memory and are on the GPU whichever layers are)
+                    let full = self
+                        .estimate_for(entry, opts, &every_layer)
+                        .map(|e| e.weights_mib + e.kv_mib + e.state_mib);
+                    {
+                        let mut sv = inst.serving.write();
+                        sv.placement =
+                            serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers);
+                    }
                     return Ok(inst);
                 }
             }
@@ -1920,6 +2275,89 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.unload_all();
     }
+}
+
+/// How one start of a model server is made (see `load_with_fallback`).
+#[derive(Debug, Clone, PartialEq)]
+enum Try {
+    /// As configured. Where llama-server can choose the GPU layers itself (`--fit`), it does.
+    Asked,
+    /// llama-server chooses again, keeping this many MiB free on each device (the first try ran out of memory).
+    Roomier(u64),
+    /// Nothing on the GPU.
+    Cpu,
+}
+
+/// What the GPU did to a load that failed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GpuFailure {
+    /// An allocation on the device failed.
+    Memory,
+    /// The server died the way a driver crash kills a process.
+    Crash,
+}
+
+impl GpuFailure {
+    fn name(self) -> &'static str {
+        match self {
+            GpuFailure::Memory => "memory",
+            GpuFailure::Crash => "crash",
+        }
+    }
+}
+
+/// Whether a server that exited while loading was stopped by the GPU: its log says an allocation on a device failed,
+/// or it died the way a driver crash kills a process (an access-violation or fail-fast exit code, or a signal).
+fn gpu_failure(log_tail: &str, status: &std::process::ExitStatus) -> Option<GpuFailure> {
+    let t = log_tail.to_ascii_lowercase();
+    let on_device = ["vulkan", "cuda", "rocm", "hip", "metal", "sycl", "device memory", "gpu"]
+        .iter()
+        .any(|k| t.contains(k));
+    let no_memory = [
+        "outofdevicememory",
+        "out of memory",
+        "failed to allocate",
+        "unable to allocate",
+        "cudamalloc",
+    ]
+    .iter()
+    .any(|k| t.contains(k));
+    if on_device && no_memory {
+        return Some(GpuFailure::Memory);
+    }
+    let crashed = match status.code() {
+        Some(c) => (c as u32) >= 0xC000_0000,
+        None => true,
+    };
+    crashed.then_some(GpuFailure::Crash)
+}
+
+/// A model that crashed on the GPU, and the server program it crashed with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Learned {
+    engine: String,
+    why: String,
+    at: u64,
+}
+
+fn load_learned(home: &Path) -> BTreeMap<String, Learned> {
+    std::fs::read(home.join("placements.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_learned(home: &Path, all: &BTreeMap<String, Learned>) {
+    let path = home.join("placements.json");
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(text) = serde_json::to_vec_pretty(all) {
+        let _ = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path));
+    }
+}
+
+/// RAM that programs can still get, in MiB (free memory and the file cache that gives way).
+fn free_ram_mib() -> u64 {
+    crate::misty::Misty::free_ram() / (1024 * 1024)
 }
 
 fn load_extras(home: &Path) -> HashMap<String, Extras> {
@@ -2212,6 +2650,26 @@ mod tests {
             assert!(!raise_to_normal_priority(), "already normal: nothing to change");
             SetPriorityClass(me, before);
         }
+    }
+
+    #[test]
+    fn a_model_measured_on_the_cpu_is_not_counted_as_vram_that_unloading_would_free() {
+        let home = crate::testing::temp_home();
+        let e = Engine::new(home.to_path_buf(), Settings::default());
+        e.adopt("on-gpu", 1, "k", None);
+        e.adopt("on-cpu", 1, "k", None);
+        for i in e.loaded() {
+            let mut sv = i.serving.write();
+            sv.estimated_vram_mib = Some(5000);
+            if i.model == "on-cpu" {
+                sv.placement = "cpu";
+            }
+        }
+        let held = e.residents("another");
+        let mib = |m: &str| held.iter().find(|r| r.model == m).unwrap().vram_mib;
+        assert_eq!((mib("on-gpu"), mib("on-cpu")), (5000, 0));
+        // a model that is being loaded is not its own neighbour
+        assert!(e.residents("on-gpu").iter().all(|r| r.model != "on-gpu"));
     }
 
     #[tokio::test]
@@ -2766,6 +3224,519 @@ parallel = 1
             .unwrap_err();
         assert!(f.status == 501 && f.message.contains("llama-quantize"), "{}", f.message);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A llama-server stand-in that ends with an error as soon as it starts (what a GPU out of memory or a driver crash
+    /// looks like to the hub: the process is gone before it answers `/health`).
+    fn exiting_server(dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("llama-server.cmd");
+            std::fs::write(&p, "@echo off\r\nexit /b 3\r\n").unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("llama-server");
+            std::fs::write(&p, "#!/bin/sh\nexit 3\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    /// A llama-server that exits while it loads must end the load with an error. It once froze the worker thread that
+    /// ran the load (`stop()` locks `child`, and the exit check still held that lock), and with that thread the whole
+    /// hub: nothing answered, not even /v1/health, until the process was restarted.
+    #[test]
+    fn a_server_that_exits_while_loading_fails_the_load_and_leaves_the_hub_running() {
+        let d = crate::testing::TestDir::new("mm-load-exit");
+        let stub = exiting_server(&d);
+        let home = d.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The runtime lives on a thread of its own so that this test's timeout does not depend on it: a stuck worker
+        // takes tokio's timers and its I/O with it, which is also why the hub went deaf.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async {
+                let e = Arc::new(Engine::new(
+                    home.clone(),
+                    Settings {
+                        llama_server: Some(stub),
+                        ollama_url: String::new(),
+                        ..Default::default()
+                    },
+                ));
+                let entry = ModelEntry {
+                    id: "m".into(),
+                    source: "test",
+                    path: home.join("m.gguf"),
+                    size_bytes: 1,
+                    mmproj: None,
+                    meta: Default::default(),
+                    native: None,
+                };
+                let first = tokio::spawn({
+                    let (e, entry) = (e.clone(), entry.clone());
+                    async move { e.ensure_loaded(&entry, &LoadOpts::default(), true).await.map(|_| ()) }
+                })
+                .await;
+                // the runtime still runs other work, and a second try ends the same way
+                let other = tokio::spawn(async { 7 }).await;
+                let again = e.ensure_loaded(&entry, &LoadOpts::default(), true).await.is_err();
+                (first, other, again, e.loaded().len())
+            });
+            let _ = tx.send(outcome);
+        });
+        let (first, other, again, loaded) = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the load never ended: a worker thread is stuck");
+        let f = first
+            .expect("the load task panicked")
+            .expect_err("a server that exits cannot be loaded");
+        assert_eq!((f.status, f.code), (500, "load_failed"), "{}", f.message);
+        assert_eq!(other.unwrap(), 7);
+        assert!(again, "a second load must fail the same way");
+        assert_eq!(loaded, 0);
+    }
+
+    fn exited(n: i32) -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(n as u32)
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(n << 8)
+        }
+    }
+
+    /// How a driver crash ends a process: a fail-fast / access-violation code on Windows, a signal elsewhere.
+    fn crashed() -> std::process::ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0xC000_0409)
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(11)
+        }
+    }
+
+    #[test]
+    fn a_failed_load_is_told_apart_by_what_the_gpu_did() {
+        let vulkan = "ggml_vulkan: Device memory allocation of size 17000000000 failed.\n\
+                      ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n\
+                      llama_model_load: error loading model";
+        let cuda = "CUDA error: out of memory\n  current device: 0, in function alloc at ggml-cuda.cu:420\n  cudaMalloc failed";
+        // the log says an allocation on a device failed: memory, whatever the exit code is
+        assert_eq!(gpu_failure(vulkan, &exited(1)), Some(GpuFailure::Memory));
+        assert_eq!(gpu_failure(cuda, &exited(1)), Some(GpuFailure::Memory));
+        assert_eq!(gpu_failure(vulkan, &crashed()), Some(GpuFailure::Memory));
+        // a server that is killed by the driver leaves nothing to read: the exit code says it
+        assert_eq!(gpu_failure("", &crashed()), Some(GpuFailure::Crash));
+        assert_eq!(
+            gpu_failure("ggml_vulkan: Found 1 Vulkan devices:", &crashed()),
+            Some(GpuFailure::Crash)
+        );
+        // anything else is the model's or the user's to fix: a retry on the CPU would not help
+        assert_eq!(gpu_failure("", &exited(3)), None);
+        assert_eq!(
+            gpu_failure("llama_model_load: unknown model architecture: 'x'", &exited(1)),
+            None
+        );
+        // running out of RAM is not the GPU's doing
+        assert_eq!(
+            gpu_failure("failed to allocate CPU buffer of size 99999", &exited(1)),
+            None
+        );
+        assert_eq!(GpuFailure::Memory.name(), "memory");
+        assert_eq!(GpuFailure::Crash.name(), "crash");
+    }
+
+    #[test]
+    fn the_gpu_settings_default_to_a_fallback_and_a_watchdog_and_are_read_from_config_toml() {
+        let s = Settings::default();
+        assert!(s.gpu_fallback);
+        assert_eq!(s.watchdog_s, 90);
+        let d = crate::testing::temp_home();
+        std::fs::write(d.join("config.toml"), "gpu_fallback = false\nwatchdog_s = 0\n").unwrap();
+        let s = Settings::load(&d).unwrap();
+        assert!(!s.gpu_fallback);
+        assert_eq!(s.watchdog_s, 0);
+    }
+
+    #[test]
+    fn a_remembered_crash_survives_a_restart_and_a_change_of_server_program() {
+        let d = crate::testing::TestDir::new("mm-learned");
+        let stub = gpu_crashing_server(&d);
+        let settings = Settings {
+            llama_server: Some(stub.clone()),
+            ollama_url: String::new(),
+            ..Default::default()
+        };
+        let entry = stand_in_entry(&d, 1);
+        let e = Engine::new(d.to_path_buf(), settings.clone());
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        assert!(e.learned_why(&entry, &r).is_none());
+        e.learn(&entry, &r, "its load crashed".into());
+        assert_eq!(e.learned_why(&entry, &r).as_deref(), Some("its load crashed"));
+        // written to disk: a new hub knows it
+        assert!(d.join("placements.json").is_file());
+        let again = Engine::new(d.to_path_buf(), settings.clone());
+        assert_eq!(again.learned_why(&entry, &r).as_deref(), Some("its load crashed"));
+        // another model is not affected
+        let other = ModelEntry {
+            id: "other".into(),
+            ..entry.clone()
+        };
+        assert!(again.learned_why(&other, &r).is_none());
+        // a different server program (an update, another build) gets a new try on the GPU
+        std::fs::write(&stub, "a different program, of another size\r\n").unwrap();
+        assert!(again.learned_why(&entry, &r).is_none());
+        // forgetting it removes it from the disk as well
+        e.forget("m");
+        assert!(load_learned(&d).is_empty());
+        // a damaged file is no reason to fail
+        std::fs::write(d.join("placements.json"), "{ not json").unwrap();
+        assert!(load_learned(&d).is_empty());
+    }
+
+    fn stand_in_entry(home: &Path, size_bytes: u64) -> ModelEntry {
+        ModelEntry {
+            id: "m".into(),
+            source: "test",
+            path: home.join("m.gguf"),
+            size_bytes,
+            mmproj: None,
+            meta: Default::default(),
+            native: None,
+        }
+    }
+
+    /// A llama-server stand-in for the placement ladder. It answers `--help` with the flags the hub looks for and
+    /// `--list-devices` with no devices; every other start is written to `calls.txt` and ends: with a driver-crash
+    /// code when it is started for the GPU, with 3 when it is started without one (`-dev none`). With a file named
+    /// `oom` beside it, a start for the GPU ends with the words of a Vulkan out-of-memory error instead.
+    fn gpu_crashing_server(dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("llama-server.cmd");
+            std::fs::write(
+                &p,
+                "@echo off\r\n\
+                 if \"%1\"==\"--help\" goto help\r\n\
+                 if \"%1\"==\"--list-devices\" exit /b 0\r\n\
+                 echo %* >>\"%~dp0calls.txt\"\r\n\
+                 echo %* | findstr /C:\"-dev none\" >nul\r\n\
+                 if not errorlevel 1 exit /b 3\r\n\
+                 if exist \"%~dp0oom\" (echo ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory& exit /b 1)\r\n\
+                 exit /b -1073740791\r\n\
+                 :help\r\n\
+                 echo --fit --device\r\n\
+                 exit /b 0\r\n",
+            )
+            .unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("llama-server");
+            std::fs::write(
+                &p,
+                "#!/bin/sh\n\
+                 case \"$1\" in --help) echo '--fit --device'; exit 0;; --list-devices) exit 0;; esac\n\
+                 here=$(dirname \"$0\")\n\
+                 echo \"$@\" >> \"$here/calls.txt\"\n\
+                 case \"$*\" in *'-dev none'*) exit 3;; esac\n\
+                 if [ -e \"$here/oom\" ]; then echo 'ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory'; exit 1; fi\n\
+                 kill -SEGV $$\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    /// The starts the stand-in has seen, one line each.
+    fn starts(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn ladder_engine(d: &Path, gpu_fallback: bool) -> Arc<Engine> {
+        Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(gpu_crashing_server(d)),
+                ollama_url: String::new(),
+                gpu_fallback,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A load that crashes the server on the GPU is tried again on the CPU, with the GPU backend left out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gpu_crash_on_load_is_retried_on_the_cpu() {
+        let d = crate::testing::TestDir::new("mm-ladder-crash");
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let f = e
+            .ensure_loaded(&entry, &LoadOpts::default(), true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        // its CPU start fails too (it exits with 3), and that is the error: with the GPU's story in front of it
+        assert_eq!((f.status, f.code), (500, "load_failed"), "{}", f.message);
+        assert!(
+            f.message.contains("exit code: 3") || f.message.contains("exit status: 3"),
+            "{}",
+            f.message
+        );
+        assert!(
+            f.message
+                .contains("(before this: its load on the GPU crashed llama-server (exit 0xC0000409))")
+                || cfg!(not(windows)),
+            "{}",
+            f.message
+        );
+        let seen = starts(&d);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        // first as asked: llama-server fits the layers itself, keeping the margin free
+        let margin = e.settings().vram_margin_mib.max(512);
+        assert!(
+            seen[0].contains(&format!("--fit on --fit-target {margin}")),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            !seen[0].contains("-ngl") && !seen[0].contains("-dev none"),
+            "{}",
+            seen[0]
+        );
+        // then nothing on the GPU, and no GPU backend either
+        assert!(
+            seen[1].contains("-ngl 0") && seen[1].contains("-dev none"),
+            "{}",
+            seen[1]
+        );
+        assert!(!seen[1].contains("--fit"), "{}", seen[1]);
+        // a crash is remembered only when the CPU start worked, and here it did not
+        assert!(!d.join("placements.json").exists());
+        assert_eq!(e.loaded().len(), 0);
+    }
+
+    /// An out-of-memory error first gets more room on the GPU, and only then the CPU.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gpu_out_of_memory_gets_more_room_before_the_cpu() {
+        let d = crate::testing::TestDir::new("mm-ladder-oom");
+        std::fs::write(d.join("oom"), "").unwrap();
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let f = e
+            .ensure_loaded(&entry, &LoadOpts::default(), true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        assert!(
+            f.message
+                .contains("the GPU ran out of memory, so llama-server was asked to keep"),
+            "{}",
+            f.message
+        );
+        assert!(
+            f.message.contains("the GPU ran out of memory;") || f.message.contains("the GPU ran out of memory)"),
+            "{}",
+            f.message
+        );
+        let seen = starts(&d);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        let margin = e.settings().vram_margin_mib.max(512);
+        let roomier = margin + 2048;
+        assert!(seen[0].contains(&format!("--fit-target {margin} ")), "{}", seen[0]);
+        assert!(seen[1].contains(&format!("--fit-target {roomier} ")), "{}", seen[1]);
+        assert!(seen[2].contains("-dev none"), "{}", seen[2]);
+        // running out of memory is about the load, not about the driver: nothing is remembered
+        assert!(!d.join("placements.json").exists());
+    }
+
+    /// With the fallback off, a failed load stays a failed load (one start, the GPU's own error).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_the_fallback_off_a_gpu_failure_is_reported_as_it_is() {
+        let d = crate::testing::TestDir::new("mm-ladder-off");
+        let e = ladder_engine(&d, false);
+        let entry = stand_in_entry(&d, 1);
+        let f = e
+            .ensure_loaded(&entry, &LoadOpts::default(), true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        assert_eq!(f.code, "load_failed");
+        assert!(!f.message.contains("before this"), "{}", f.message);
+        assert_eq!(starts(&d).len(), 1);
+    }
+
+    /// A model that crashed the GPU before starts on the CPU at once, until a load asks for the GPU again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_that_crashed_the_gpu_before_starts_on_the_cpu_until_asked_to_retry() {
+        let d = crate::testing::TestDir::new("mm-ladder-learned");
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        e.learn(
+            &entry,
+            &r,
+            "its load on the GPU crashed llama-server (exit 0xC0000409)".into(),
+        );
+        assert!(e.ensure_loaded(&entry, &LoadOpts::default(), true).await.is_err());
+        let seen = starts(&d);
+        assert_eq!(seen.len(), 1, "no start on the GPU: {seen:?}");
+        assert!(
+            seen[0].contains("-ngl 0") && seen[0].contains("-dev none"),
+            "{}",
+            seen[0]
+        );
+        // retry_gpu: the GPU first (it crashes again), then the CPU
+        let opts = LoadOpts {
+            retry_gpu: true,
+            ..Default::default()
+        };
+        assert!(e.ensure_loaded(&entry, &opts, true).await.is_err());
+        let seen = starts(&d);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[1].contains("--fit on"), "{}", seen[1]);
+        assert!(seen[2].contains("-dev none"), "{}", seen[2]);
+    }
+
+    /// A tool (speech, images) that failed on the GPU for the GPU's reasons is run again on the CPU, once.
+    #[test]
+    fn a_tool_that_the_gpu_stopped_is_run_again_on_the_cpu() {
+        let d = crate::testing::TestDir::new("mm-tool-retry");
+        let on = Engine::new(d.to_path_buf(), Settings::default());
+        let off = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                gpu_fallback: false,
+                ..Default::default()
+            },
+        );
+        let fail = |code: &'static str, kind: Option<&str>| {
+            let mut f = Fail::new(500, code, "x");
+            f.fields = json!({"gpu_failure": kind});
+            f
+        };
+        let crash = fail("tool_failed", Some("crash"));
+        let oom = fail("tool_failed", Some("memory"));
+        assert_eq!(on.cpu_retry_for_tool(999, &crash).as_deref(), Some("the tool crashed"));
+        assert_eq!(
+            on.cpu_retry_for_tool(20, &oom).as_deref(),
+            Some("the GPU ran out of memory")
+        );
+        // nothing to gain: it never had the GPU, the failure was not the GPU's, it was cancelled or timed out
+        assert!(on.cpu_retry_for_tool(0, &crash).is_none());
+        assert!(on.cpu_retry_for_tool(999, &fail("tool_failed", None)).is_none());
+        assert!(on.cpu_retry_for_tool(999, &fail("cancelled", Some("crash"))).is_none());
+        // the fallback is off
+        assert!(off.cpu_retry_for_tool(999, &crash).is_none());
+    }
+
+    /// What `after_failure` makes of a failed start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_failure_the_gpu_caused_is_retried_and_only_where_it_can_help() {
+        let d = crate::testing::TestDir::new("mm-ladder-rules");
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let s = e.settings();
+        let r = e.resolve_serving(&s, &entry, &LoadOpts::default());
+        let fail = |kind: Option<&str>, code: i32| {
+            let mut f = Fail::new(500, "load_failed", "x");
+            f.fields = json!({"exit_code": code, "gpu_failure": kind});
+            f
+        };
+        let roomier = s.vram_margin_mib.max(512) + 2048;
+        // out of memory: more room first, then the CPU
+        let (next, _, crash) = e
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("memory"), 1))
+            .await
+            .unwrap();
+        assert_eq!((next, crash), (Try::Roomier(roomier), false));
+        let (next, why, crash) = e
+            .after_failure(&s, &r, &entry, &Try::Roomier(roomier), &fail(Some("memory"), 1))
+            .await
+            .unwrap();
+        assert_eq!((next, crash), (Try::Cpu, false));
+        assert_eq!(why, "the GPU ran out of memory");
+        // a crash goes to the CPU at once, and is the kind that is remembered
+        let (next, why, crash) = e
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(Some("crash"), -1_073_740_791))
+            .await
+            .unwrap();
+        assert_eq!((next, crash), (Try::Cpu, true));
+        assert_eq!(why, "its load on the GPU crashed llama-server (exit 0xC0000409)");
+        // layers somebody fixed are not left to --fit: out of memory goes straight to the CPU
+        let fixed = e.resolve_serving(
+            &s,
+            &entry,
+            &LoadOpts {
+                gpu_layers: Some(20),
+                ..Default::default()
+            },
+        );
+        let (next, _, _) = e
+            .after_failure(&s, &fixed, &entry, &Try::Asked, &fail(Some("memory"), 1))
+            .await
+            .unwrap();
+        assert_eq!(next, Try::Cpu);
+        // nothing to retry: the CPU start failed, no layers were on the GPU, or the failure was not the GPU's
+        assert!(e
+            .after_failure(&s, &r, &entry, &Try::Cpu, &fail(Some("crash"), 1))
+            .await
+            .is_none());
+        let cpu = e.resolve_serving(
+            &s,
+            &entry,
+            &LoadOpts {
+                gpu_layers: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(e
+            .after_failure(&s, &cpu, &entry, &Try::Asked, &fail(Some("crash"), 1))
+            .await
+            .is_none());
+        assert!(e
+            .after_failure(&s, &r, &entry, &Try::Asked, &fail(None, 3))
+            .await
+            .is_none());
+        // the fallback is off
+        let off = Settings {
+            gpu_fallback: false,
+            ..s.clone()
+        };
+        assert!(e
+            .after_failure(&off, &r, &entry, &Try::Asked, &fail(Some("crash"), 1))
+            .await
+            .is_none());
+        // the CPU cannot hold it either: the GPU's error is the answer
+        let huge = stand_in_entry(&d, u64::MAX / 4);
+        assert!(e
+            .after_failure(&s, &r, &huge, &Try::Asked, &fail(Some("crash"), 1))
+            .await
+            .is_none());
     }
 
     /// Runs the real llama-quantize that is built in: a failure carries the program's own words, and a cancel kills it.

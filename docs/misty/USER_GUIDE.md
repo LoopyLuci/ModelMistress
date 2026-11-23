@@ -189,6 +189,52 @@ failing during load. `misty status` shows which engines are present.
 A model that does not fit in free memory minus `ram_margin_mib` (2 GiB) is marked `unfit` in `misty status` and not
 used for that role; she falls back to a smaller one when there is one.
 
+## The model router: `auto`, in any chat
+
+Her router is also available without her. The model name **`auto`** is a plain chat that goes to the model that suits
+each message: short, simple turns to the `fast` model, most requests to `main`, hard reasoning and long inputs to `deep`.
+A model that is already loaded is preferred, so it does not load a bigger one for a greeting. `auto` has no tools, files
+or index; for those use `misty`.
+
+Where you can use it:
+
+- **Chat page** (dashboard and desktop app) and the **Qt window**: choose "Auto: the router picks the model for each
+  message", the first entry of the model list. It is the default for a new chat once a role has a model that can answer.
+  Each reply says which role and model answered and, under "Why the router chose...", what decided it.
+- **Any OpenAI client**: `model: "auto"` on `/v1/chat/completions`. The answer's headers say what happened:
+  `x-mm-routed-model`, `x-mm-routed-role` and `x-mm-routed-why`.
+- **Your own choice for one message**: put `@fast`, `@main` or `@deep` in it. The tag is removed before the model sees
+  the message.
+
+A conversation with a picture goes only to a model that has a projector (`mmproj`). If none does, the answer is
+409 `no_model_ready` with the reason (the chat page shows it); the same when no role has a model that is installed,
+fits the free memory and has its engine.
+
+**Choosing the models.** Open the Models page, **Router** tab (the chat's "Choose models" link goes there). Each role
+has a menu: Automatic (a model the router prefers by name, or an installed chat model of the right size that fits the
+free memory) or any suitable installed model. The same choice is the `roles` setting of `misty config` (it is one
+setting, so the dashboard, the Qt window and the CLI agree). The embedding and reranking models are chosen in the same
+table. **Try the router** shows where a message would go and the score of each role, without sending it.
+
+**Managing models** (Models page, Installed tab):
+
+- Each model shows its router roles; the "Use for" menu gives it one.
+- **Settings** edits that model's serving profile (`[profiles."<id>"]` in `config.toml`): engine, GPU layers, context
+  size, parallel requests, batch sizes, flash attention, KV cache types, prompt cache, Jinja. The hub checks the values
+  and says what is wrong. A profile wins over the global setting, whoever loads the model (a chat, the router, another
+  program), and applies the next time the model loads ("Save and reload the model" does that now). "Reset" removes it.
+  This is how an embedding model gets the batch sizes and `engine = "prism"` it needs (see An embedding model).
+- **Load...** checks the fit as you type (`model.plan`): fits, fits after the hub unloads something, or does not fit,
+  with the memory it needs and what is free. The check does not load anything.
+- **Delete** works only for models ModelMistress downloaded (the hub refuses files other programs put there, and the
+  button says so).
+- Filter by name, family or quantisation; show only loaded models, models with a router role, models with custom
+  settings or models that can be deleted; sort by name, size or loaded first.
+
+**Peers.** A peer key may use `auto` only if its allow-list names it, and then the router considers only the models
+that key may use, so a key limited to one model can never be sent to another. A catalog model that is itself called
+`auto` wins over the router.
+
 ## How fast is she on a CPU
 
 Measured with `llama-bench` and `misty bench` on one machine: a Ryzen 9 5900X (12 cores, 12 threads used), Windows 10,

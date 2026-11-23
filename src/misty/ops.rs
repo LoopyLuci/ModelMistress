@@ -611,7 +611,7 @@ pub fn virtual_models(hub: &Hub) -> Vec<Value> {
         .collect()
 }
 
-fn content_text(c: &Value) -> String {
+pub(super) fn content_text(c: &Value) -> String {
     match c {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts

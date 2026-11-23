@@ -116,6 +116,37 @@ class Hub:
     def unload(self, model: str) -> dict:
         return self.call("model.unload", {"model": model})
 
+    # ---- the model router: the model `auto` and the router.* operations (src/misty/auto.rs) -----------------------
+
+    def router_status(self) -> dict:
+        """The roles (fast, main, deep, and the retrieval models), the model each has and whether it can answer."""
+        return self.call("router.status")
+
+    def router_status_or_none(self) -> dict | None:
+        """router.status, or None on a hub that has no router (an older one, or one without Misty)."""
+        try:
+            status = self.router_status()
+        except HubError:
+            return None
+        return status if isinstance(status, dict) and status.get("enabled") is not False else None
+
+    def router_pick(self, messages: list[dict]) -> dict:
+        """Which model the router would send this conversation to. Nothing is sent to it."""
+        return self.call("router.pick", {"messages": messages})
+
+    def set_role(self, role: str, model: str | None) -> Any:
+        """Choose the model for a role, or None to go back to the router's own choice (a JSON merge patch)."""
+        return self.call("misty.config.set", {"patch": {"roles": {role: model}}})
+
+    def chat_models(self) -> list[dict]:
+        """The models a chat can choose from: the router first when this hub has one, then the models."""
+        models = self.models()
+        status = self.router_status_or_none()
+        if status is None:
+            return models
+        ready = any(r.get("status") == "ready" for r in status.get("roles") or [])
+        return [{"id": "auto", "source": "router", "router": True, "ready": ready}, *models]
+
     def config(self) -> dict:
         return self.call("config.get")
 

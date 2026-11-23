@@ -79,6 +79,22 @@ export interface ReplyStats {
   tps: number | null
 }
 
+/** The messages in the OpenAI shape: a user message with pictures becomes text and `image_url` parts. */
+export function toWire(messages: ChatMessage[]): unknown[] {
+  return messages.map((m) => {
+    if (m.role === 'user' && m.images?.length) {
+      return {
+        role: 'user',
+        content: [
+          ...(m.content ? [{ type: 'text', text: m.content }] : []),
+          ...m.images.map((url) => ({ type: 'image_url', image_url: { url } })),
+        ],
+      }
+    }
+    return { role: m.role, content: m.content }
+  })
+}
+
 export interface StreamHandlers {
   onContent: (delta: string) => void
   onReasoning: (delta: string) => void
@@ -96,19 +112,7 @@ export async function streamChat(
   signal: AbortSignal,
   h: StreamHandlers,
 ): Promise<ReplyStats> {
-  const wire = messages.map((m) => {
-    if (m.role === 'user' && m.images?.length) {
-      return {
-        role: 'user',
-        content: [
-          ...(m.content ? [{ type: 'text', text: m.content }] : []),
-          ...m.images.map((url) => ({ type: 'image_url', image_url: { url } })),
-        ],
-      }
-    }
-    return { role: m.role, content: m.content }
-  })
-  const body: Record<string, unknown> = { model, messages: wire, stream: true, stream_options: { include_usage: true } }
+  const body: Record<string, unknown> = { model, messages: toWire(messages), stream: true, stream_options: { include_usage: true } }
   if (p.temperature != null) body.temperature = p.temperature
   if (p.top_p != null) body.top_p = p.top_p
   if (p.max_tokens > 0) body.max_tokens = p.max_tokens

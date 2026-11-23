@@ -112,6 +112,34 @@ A peer key reaches these models only if its allow-list names them; a key with no
 model. A peer's request has no tools, no files and no index, and the owner-only operations are closed to it. Without that
 allow-list entry the route answers 403.
 
+## The model router (`auto`)
+
+The router that chooses her role is also a model of its own, for chats that do not need her: `auto`. These are hub
+operations (`POST /v1/call/<id>`, also MCP tools; they change nothing) and one OpenAI model.
+
+| Operation | What it does |
+| --- | --- |
+| `router.status` | `{model: "auto", enabled, roles, support, overrides, free_ram_mb}`. `roles` are `fast`, `main` and `deep`: `{role, model, status, source, loaded, vision, usable, note, score}` where `status` is `ready`, `missing`, `unfit`, `unavailable` or `not_allowed`, and `source` is `config` (your `roles` choice), `preferred` or `fallback`. `support` is the same for the other roles (`embed`, `rerank`, `reflex`, `ear`, `eye`). `enabled` is false when the catalog has a model named `auto` |
+| `router.pick` | `{input}` (and `has_image`) or `{messages}` (a conversation in chat format, pictures as `image_url` parts): `{role, model, forced, reasons, candidates}`; `model` is null when nothing can answer. Nothing is sent to a model |
+
+To choose the model of a role, `misty.config.set` with `{patch: {roles: {main: "model-id"}}}`; `null` instead of an id
+goes back to the router's own choice.
+
+`POST /v1/chat/completions` with `model: "auto"` (listed by `GET /v1/models`, unless the catalog has a model of that
+name, which wins):
+
+- the router scores the last user message and the conversation, picks the role (`@fast`, `@main` or `@deep` in the
+  message force it, and are removed before the model sees it), and forwards the chat to that role's model; streaming and
+  the usual fields work as for any model;
+- the response carries `x-mm-routed-model`, `x-mm-routed-role` and `x-mm-routed-why`; the body is the model's;
+- a conversation with a picture goes only to a role whose model has an `mmproj`;
+- nothing ready: 409 `no_model_ready`, with the reasons in the message;
+- there are no tools, files or index here; her tools are on the `misty` models.
+
+A peer key may use `auto` only when its allow-list names it (otherwise 403 `model_not_allowed`), and the router then
+considers only the models the key allows. `model.list` also says `deletable` for each model: true when ModelMistress
+downloaded the file, so `model.delete` accepts it.
+
 ## Settings file
 
 `<home>/misty/config.toml` (see the table in the user guide). Other files under `<home>/misty/`: `state.db` (sessions and

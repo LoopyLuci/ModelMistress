@@ -356,9 +356,22 @@ pub struct Resolved {
     pub slots: u32,
     pub gpu_layers: i32,
     pub flags: ServeFlags,
+    /// Set when llama-server is to choose how many layers go to the GPU (`--fit on`, with this many MiB left free on
+    /// each device) instead of being told with `-ngl`. Only for a `gpu_layers` that means "as many as fit".
+    pub fit_target_mib: Option<u64>,
+}
+
+/// `gpu_layers` values that mean "as many layers as fit": the default 999 (all of them) and a negative number.
+pub fn is_auto_layers(n: i32) -> bool {
+    !(0..999).contains(&n)
 }
 
 impl Resolved {
+    /// Whether the number of GPU layers is the hub's and llama-server's to choose.
+    pub fn is_auto(&self) -> bool {
+        is_auto_layers(self.gpu_layers)
+    }
+
     /// Merges load request > the model's profile > `[serving]` > the old top-level settings.
     pub fn new(
         load: (Option<u32>, Option<i32>, Option<u32>, &ServeFlags),
@@ -409,6 +422,7 @@ impl Resolved {
             slots,
             gpu_layers,
             flags: merged,
+            fit_target_mib: None,
         }
     }
 
@@ -440,16 +454,15 @@ impl Resolved {
         }
     }
 
-    /// The llama-server arguments. `-c`, `-ngl` and `-np` always; the rest only for what is set.
+    /// The llama-server arguments. `-c`, `-ngl` (or `--fit`, see `fit_target_mib`) and `-np` always; the rest only for
+    /// what is set.
     pub fn args(&self) -> Vec<String> {
-        let mut a: Vec<String> = vec![
-            "-c".into(),
-            self.ctx_total.to_string(),
-            "-ngl".into(),
-            self.gpu_layers.to_string(),
-            "-np".into(),
-            self.slots.to_string(),
-        ];
+        let mut a: Vec<String> = vec!["-c".into(), self.ctx_total.to_string()];
+        match self.fit_target_mib.filter(|_| self.is_auto()) {
+            Some(target) => a.extend(["--fit".into(), "on".into(), "--fit-target".into(), target.to_string()]),
+            None => a.extend(["-ngl".into(), self.gpu_layers.to_string()]),
+        }
+        a.extend(["-np".into(), self.slots.to_string()]);
         let f = &self.flags;
         let mut kv = |flag: &str, v: &Option<String>| {
             if let Some(v) = v {
@@ -522,6 +535,12 @@ pub struct Serving {
     pub vram_mib: Option<f64>,
     /// What the planner expected before the load, for comparison.
     pub estimated_vram_mib: Option<u64>,
+    /// Where the weights went: "gpu" (all on the GPU), "partial" (some layers on the GPU, the rest on the CPU), "cpu",
+    /// or "unknown" (not measured: no GPU counters, or not loaded yet).
+    pub placement: &'static str,
+    /// Why it is where it is, when that is not what was asked for (a retry on the CPU after the GPU failed, a
+    /// remembered failure).
+    pub placement_note: Option<String>,
     /// Where `n_ctx` came from: "server" (asked /props) or "requested".
     pub source: &'static str,
 }
@@ -553,6 +572,8 @@ impl Serving {
             ubatch_size: r.flags.ubatch_size,
             vram_mib: None,
             estimated_vram_mib: None,
+            placement: if r.gpu_layers == 0 { "cpu" } else { "unknown" },
+            placement_note: None,
             source: "requested",
         }
     }
@@ -797,7 +818,8 @@ pub fn plan(need_mib: u64, free_mib: u64, margin_mib: u64, resident: &[Resident]
     if free_mib >= want {
         return Plan::Fits;
     }
-    let mut idle: Vec<&Resident> = resident.iter().filter(|r| !r.busy).collect();
+    // a model that holds no VRAM (it runs on the CPU) frees none: leave it loaded
+    let mut idle: Vec<&Resident> = resident.iter().filter(|r| !r.busy && r.vram_mib > 0).collect();
     idle.sort_by_key(|r| std::cmp::Reverse(r.idle_s));
     let mut have = free_mib;
     let mut evict = vec![];
@@ -814,6 +836,68 @@ pub fn plan(need_mib: u64, free_mib: u64, margin_mib: u64, resident: &[Resident]
         Plan::Refuse {
             reclaimable_mib: idle.iter().map(|r| r.vram_mib).sum(),
         }
+    }
+}
+
+/// Where a load of `est`'s size can go, for a model whose number of GPU layers is for the hub and llama-server to
+/// choose (`gpu_layers` 999: every layer that fits).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fit {
+    /// Every layer fits on the GPU as it is.
+    Gpu,
+    /// Every layer fits after these idle models are unloaded (the MiB to be free is the second field).
+    GpuAfter(Vec<String>, u64),
+    /// Part of it fits: the GPU takes that share, the CPU the rest.
+    Split { gpu_share: f64 },
+    /// Next to nothing fits on the GPU: it runs on the CPU.
+    Cpu,
+    /// The CPU's part does not fit in the memory that is available either.
+    No { need_ram_mib: u64, free_ram_mib: u64 },
+}
+
+/// Memory the server program itself and its buffers take on the CPU side, beyond the model.
+const RAM_OVERHEAD_MIB: u64 = 768;
+
+/// Chooses between the GPU, a split and the CPU. Unlike [`plan`] it never refuses for want of VRAM alone: what does not
+/// fit on the GPU runs from RAM, and only a model that fits neither is turned down.
+pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: &[Resident], free_ram_mib: u64) -> Fit {
+    match plan(est.total_mib, free_vram_mib, margin_mib, resident) {
+        Plan::Fits => Fit::Gpu,
+        Plan::Evict(models) => Fit::GpuAfter(models, est.total_mib + margin_mib),
+        Plan::Refuse { .. } => {
+            let movable = (est.weights_mib + est.kv_mib + est.state_mib).max(1);
+            let usable = free_vram_mib.saturating_sub(margin_mib + est.compute_mib);
+            let on_gpu = usable.min(movable);
+            let need_ram_mib = movable - on_gpu + RAM_OVERHEAD_MIB;
+            if need_ram_mib > free_ram_mib {
+                Fit::No {
+                    need_ram_mib,
+                    free_ram_mib,
+                }
+            } else if (on_gpu as f64 / movable as f64) < 0.1 {
+                Fit::Cpu
+            } else {
+                Fit::Split {
+                    gpu_share: on_gpu as f64 / movable as f64,
+                }
+            }
+        }
+    }
+}
+
+/// A JSON view of a placement for the API (`model.plan`).
+pub fn fit_json(f: &Fit) -> Value {
+    match f {
+        Fit::Gpu => json!({"where": "gpu"}),
+        Fit::GpuAfter(models, want) => {
+            json!({"where": "gpu_after_unloading", "unload": models, "free_mib_needed": want})
+        }
+        Fit::Split { gpu_share } => json!({"where": "split", "gpu_share": (gpu_share * 100.0).round() / 100.0}),
+        Fit::Cpu => json!({"where": "cpu"}),
+        Fit::No {
+            need_ram_mib,
+            free_ram_mib,
+        } => json!({"where": "none", "need_ram_mib": need_ram_mib, "free_ram_mib": free_ram_mib}),
     }
 }
 
@@ -883,6 +967,38 @@ pub fn adapter_used_mib(typeperf: &str) -> Option<u64> {
 pub fn process_used_mib(typeperf: &str) -> Option<u64> {
     let v = parse_typeperf(typeperf);
     (!v.is_empty()).then(|| (v.iter().map(|(_, b)| b).sum::<f64>() / MIB).round() as u64)
+}
+
+/// Where a loaded model's weights are. `vram_mib` is the GPU memory its server holds (None: none was found), `counted`
+/// says whether the machine's GPU counters work (then "none found" means none is held), `full_mib` is the weights, KV
+/// cache and state of a load of every layer onto the GPU (what moves with the layers), and `layers` the model's layer
+/// count.
+pub fn placement_of(
+    vram_mib: Option<f64>,
+    counted: bool,
+    full_mib: Option<u64>,
+    gpu_layers: i32,
+    layers: Option<u64>,
+) -> &'static str {
+    if gpu_layers == 0 {
+        return "cpu";
+    }
+    let Some(v) = vram_mib else {
+        return if counted { "cpu" } else { "unknown" };
+    };
+    if v < 128.0 {
+        return "cpu";
+    }
+    if !is_auto_layers(gpu_layers) {
+        return match layers {
+            Some(l) if (gpu_layers as u64) < l => "partial",
+            _ => "gpu",
+        };
+    }
+    match full_mib {
+        Some(f) if f > 0 && v < f as f64 * 0.85 => "partial",
+        _ => "gpu",
+    }
 }
 
 /// A one-line JSON view of the estimate for the API.
@@ -1142,6 +1258,125 @@ Exiting, please wait...
         let load = Resolved::new((Some(16384), None, Some(2), &none), Some(&model), &all, (8192, 999, 2));
         assert_eq!((load.ctx_total, load.slots), (16384, 2));
         assert_eq!(load.ctx_per_slot(), 8192);
+    }
+
+    fn auto(fit: Option<u64>, layers: i32) -> Resolved {
+        let mut r = Resolved::new(
+            (None, None, None, &ServeFlags::default()),
+            None,
+            &ServeProfile::default(),
+            (8192, layers, 2),
+        );
+        r.fit_target_mib = fit;
+        r
+    }
+
+    #[test]
+    fn automatic_layers_are_chosen_by_llama_server_when_it_can() {
+        // 999 (all) and a negative number both mean "as many as fit"
+        for n in [999, 1000, -1] {
+            assert!(auto(None, n).is_auto(), "{n}");
+        }
+        for n in [0, 1, 40, 998] {
+            assert!(!auto(None, n).is_auto(), "{n}");
+        }
+        // told to fit: --fit on with the room to keep free, and no -ngl
+        assert_eq!(
+            auto(Some(768), 999).args().join(" "),
+            "-c 8192 --fit on --fit-target 768 -np 2"
+        );
+        // not told (a server that cannot): the layers are passed as they were
+        assert_eq!(auto(None, 999).args().join(" "), "-c 8192 -ngl 999 -np 2");
+        // a number of layers somebody chose is never handed to --fit, whatever the target says
+        assert_eq!(auto(Some(768), 20).args().join(" "), "-c 8192 -ngl 20 -np 2");
+        assert_eq!(auto(Some(768), 0).args().join(" "), "-c 8192 -ngl 0 -np 2");
+    }
+
+    fn est(weights: u64, kv: u64, compute: u64) -> VramEstimate {
+        VramEstimate {
+            weights_mib: weights,
+            kv_mib: kv,
+            state_mib: 0,
+            compute_mib: compute,
+            total_mib: weights + kv + compute + CONTEXT_OVERHEAD_MIB as u64,
+        }
+    }
+
+    #[test]
+    fn a_load_goes_to_the_gpu_a_split_the_cpu_or_nowhere() {
+        let e = est(8000, 1000, 300); // 9500 on the GPU
+                                      // everything fits as it is
+        assert_eq!(super::place(&e, 20_000, 512, &[], 32_000), Fit::Gpu);
+        // after idle models leave
+        let held = [res("a", 100, 6000, false), res("b", 900, 9000, false)];
+        assert_eq!(
+            super::place(&e, 4000, 512, &held, 32_000),
+            Fit::GpuAfter(vec!["b".into()], e.total_mib + 512)
+        );
+        // not even then: part on the GPU, the rest from RAM (a busy model stays where it is)
+        let busy = [res("a", 100, 20_000, true)];
+        match super::place(&e, 6000, 512, &busy, 32_000) {
+            Fit::Split { gpu_share } => assert!(gpu_share > 0.3 && gpu_share < 0.7, "{gpu_share}"),
+            other => panic!("{other:?}"),
+        }
+        // next to no VRAM: the CPU
+        assert_eq!(super::place(&e, 700, 512, &busy, 32_000), Fit::Cpu);
+        // RAM cannot take the rest: refused, with the numbers
+        assert_eq!(
+            super::place(&e, 700, 512, &busy, 4000),
+            Fit::No {
+                need_ram_mib: 9768, // all 9000 of weights and KV, and 768 for the server itself
+                free_ram_mib: 4000
+            }
+        );
+    }
+
+    #[test]
+    fn a_resident_model_that_runs_on_the_cpu_is_not_unloaded_for_vram() {
+        let loaded = [res("cpu-model", 9999, 0, false), res("gpu-model", 10, 8000, false)];
+        assert_eq!(plan(8000, 1000, 512, &loaded), Plan::Evict(vec!["gpu-model".into()]));
+    }
+
+    #[test]
+    fn where_the_weights_went_is_told_from_the_memory_the_server_holds() {
+        // nothing asked of the GPU
+        assert_eq!(placement_of(Some(5000.0), true, Some(9000), 0, Some(32)), "cpu");
+        // a server that holds no VRAM: on the CPU when the counters work, unknown when they do not
+        assert_eq!(placement_of(None, true, Some(9000), 999, Some(32)), "cpu");
+        assert_eq!(placement_of(None, false, Some(9000), 999, Some(32)), "unknown");
+        // a GPU context alone is not the weights
+        assert_eq!(placement_of(Some(90.0), true, Some(9000), 999, Some(32)), "cpu");
+        // automatic layers: about all of the estimate is on the GPU, or part of it
+        assert_eq!(placement_of(Some(9100.0), true, Some(9000), 999, Some(32)), "gpu");
+        assert_eq!(placement_of(Some(4000.0), true, Some(9000), 999, Some(32)), "partial");
+        assert_eq!(placement_of(Some(4000.0), true, None, 999, None), "gpu");
+        // a number of layers: fewer than the model has is a partial offload
+        assert_eq!(placement_of(Some(4000.0), true, Some(9000), 20, Some(32)), "partial");
+        assert_eq!(placement_of(Some(4000.0), true, Some(9000), 40, Some(32)), "gpu");
+    }
+
+    #[test]
+    fn a_placement_is_shown_to_the_api_by_where_it_goes() {
+        assert_eq!(fit_json(&Fit::Gpu)["where"], "gpu");
+        assert_eq!(fit_json(&Fit::Cpu)["where"], "cpu");
+        let split = fit_json(&Fit::Split { gpu_share: 0.4567 });
+        assert_eq!(
+            (split["where"].as_str(), split["gpu_share"].as_f64()),
+            (Some("split"), Some(0.46))
+        );
+        let after = fit_json(&Fit::GpuAfter(vec!["x".into()], 9000));
+        assert_eq!(
+            (after["where"].as_str(), after["unload"][0].as_str()),
+            (Some("gpu_after_unloading"), Some("x"))
+        );
+        let no = fit_json(&Fit::No {
+            need_ram_mib: 10,
+            free_ram_mib: 5,
+        });
+        assert_eq!(
+            (no["where"].as_str(), no["need_ram_mib"].as_u64()),
+            (Some("none"), Some(10))
+        );
     }
 
     #[test]
