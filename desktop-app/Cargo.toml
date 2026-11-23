@@ -1,6 +1,6 @@
 [package]
 name = "model-mistress-desktop"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "ModelMistress desktop shell; all server logic lives in model-mistress."
 license = "Apache-2.0"

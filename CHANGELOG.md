@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 — 2026-11-23
 
 - **A CPU model and a GPU model work at once without fighting for cores; loads show their progress; the starter set
   takes the GPU engine build** (`src/serving.rs`, `src/engine.rs`, `src/misty/setup.rs`; [serving](docs/serving.md)).
