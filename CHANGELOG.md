@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-22
 
 - **The hub no longer wedges after a failed GPU load, restarts itself if it ever does, and places each model on the GPU or
   the CPU by what it can run on** (`src/engine.rs`, `src/serving.rs`, `src/watchdog.rs`,
