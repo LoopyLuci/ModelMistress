@@ -12,3 +12,5 @@ ci/.pipeline.lock
 __pycache__/
 .pytest_cache/
 .venv/
+# the live hub's own folder: owner token, config, binaries, models, logs
+/home/
