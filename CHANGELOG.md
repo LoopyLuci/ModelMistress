@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **The tests no longer depend on the machine they run on** (`src/engine.rs`).
+  - *Why nine tests failed.* `Engine::roots` added the folders found from the environment: `OLLAMA_MODELS`, the home
+  folder's `.ollama` and the Hugging Face caches. On a machine with its own models (here `OLLAMA_MODELS` points at a
+  store of models) those models were listed first, so tests that expect their own `tiny` model or no model got the
+  host's instead.
+  - *The fix.* A test build gets no machine folders; a test names the folders it needs in its settings. A test checks
+  that a fresh engine's folders are all under its own home.
+
 ## 0.4.2 — 2026-11-23
 
 - **A CPU model and a GPU model work at once without fighting for cores; loads show their progress; the starter set
