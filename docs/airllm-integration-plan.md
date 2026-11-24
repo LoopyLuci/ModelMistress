@@ -1,6 +1,7 @@
 # AirLLM integration plan
 
-Status: a plan. Nothing is built and no source file was changed. Written 2026-11-23 for ModelMistress 0.4.0 on branch
+Status: a plan. **Phase 0 was partly run on 2026-11-24: see [airllm-spike-results.md](airllm-spike-results.md)** (T3 and T4
+pass on a 1.7B model; AirLLM was 38 times slower; T2 and T5 still open). Nothing is built and no source file was changed. Written 2026-11-23 for ModelMistress 0.4.0 on branch
 `feat/misty`. The owner reviews it and decides; section 11 lists the decisions.
 
 AirLLM (https://github.com/lyogavin/airllm) runs a model that is bigger than GPU memory by keeping only one transformer

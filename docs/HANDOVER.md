@@ -15,9 +15,10 @@ agent memory of the project (`project_hardware_loading.md`).
 6. **A hard rule (mid-session): the GPU keeps 2 GB unused for the system; the most models may use of the 24 GB card is
    22 GB.** Implemented as `vram_reserve_mib` (default 2048).
 7. **"Use the new AirLLM integration to reduce the model sizes loaded, for any and all models in ModelMistress and
-   Misty."** There is no AirLLM integration: only the plan, `docs/airllm-integration-plan.md`, which recommends against
-   an AirLLM engine (it reads the whole model from disk for every token). Nothing was installed or built. See item 7 of
-   the plan below for what can be done, and the question the owner has to answer.
+   Misty."** There is no AirLLM integration, and the plan (`docs/airllm-integration-plan.md`) recommends against an
+   AirLLM engine. On 2026-11-24 the owner said yes to the Phase 0 download; a partial spike ran (T3 and T4 pass, AirLLM
+   was 38 times slower than the whole model): see `docs/airllm-spike-results.md` and item 7 below. Nothing in the hub or
+   the Forge changed.
 8. Keep this handover, a TODO and a plan up to date for the next agent (this file).
 
 Standing rules from the owner: do not commit, push, build the installer or release unless asked; temp files only in the
@@ -125,11 +126,20 @@ the owner saying yes to the exact file.
    vocabulary; `Qwen3.5-0.8B` is the likely draft for the Qwen3.5-family 27B. Earlier tests (`docs/STATUS.md`) made a
    mixture-of-experts target slower; a dense target was never tried. The draft runs on the CPU with `-ngld 0`/`-devd
    none` and `-td`. Do not ship it on by default unless it wins by a clear margin on this machine.
-7. **AirLLM.** Needs the owner's answer first (see below). What can reduce the size of what is loaded without AirLLM:
-   keep CPU-side layers memory-mapped (already so), the split loads above, KV cache at `q8_0` when a load does not fit
-   (near lossless; `q4_0` only on request), a context that matches the use, and a smaller quantisation on offer. The
-   AirLLM spike of the plan (Phase 0) means installing AirLLM and PyTorch into the Forge environment: a large download
-   that needs the owner's approval.
+7. **AirLLM (Phase 0 partly done 2026-11-24; the verdict stands: no AirLLM engine).** Results in
+   `docs/airllm-spike-results.md`. A throwaway venv (Python 3.12, the Forge's pinned ROCm torch 2.9.1, `airllm==4.0.1`
+   by hash) sits in `<drive>:\ClaudeCodeTemp\ModelMistress\airllm-spike\` (about 11 GB, on `D:`, the drive with the most
+   free space; `spike.py` is there). On `Qwen3-1.7B` (already in the owner's Hugging Face cache): the GPU is used (peak
+   VRAM 729 MiB against 3,322 MiB for the whole model), the 32 greedy tokens are identical, but 3.64 s per token against
+   0.096. **Not done, and the next agent's choices:** (a) T2 and T5 need a model bigger than RAM plus VRAM, which means a
+   download the owner must approve by name, size and drive (the plan suggests a GGUF over the memory limit for llama.cpp
+   paging, and Qwen3-8B or 32B for AirLLM); (b) M10 (llama.cpp baselines) was not run; (c) Phase 1 (opt-in paged GGUF
+   load, plan section 5.1) is the only build the plan recommends, and only after T2; (d) delete the spike folder when it
+   is no longer needed. Never install AirLLM into the Forge environment. Local Hugging Face models AirLLM can read: only
+   `Qwen3-0.6B` and `Qwen3-1.7B`; `Dusty-1.0` is a Qwen3.5 MoE with linear attention, not tried. What can reduce the size
+   of what is loaded without AirLLM: keep CPU-side layers memory-mapped (already so), the split loads above, KV cache at
+   `q8_0` when a load does not fit (near lossless; `q4_0` only on request), a context that matches the use, and a smaller
+   quantisation on offer.
 8. **PrismML GPU build for Misty (done 2026-11-23; left: Linux, a 9B-on-both measurement, the owner's answer below).**
    New setup component `prism-gpu` (`src/misty/setup.rs`, `model-mistress misty setup --install prism-gpu`, not in the
    starter set): `llama-prism-b12128-d7b2896-bin-win-vulkan-x64.zip` from
@@ -150,15 +160,31 @@ the owner saying yes to the exact file.
    ignored by git); the owner's running hub is an older binary and does not use it until it restarts on this build. Left:
    Linux (`ubuntu-vulkan-x64.tar.gz`, SHA-256 `a73a76f2...cca4`, 33,757,914 bytes, no asset coded and untested), and a
    9B measurement against the CPU build with nothing else on the card.
-9. **Finish.** Whole library suite, clippy, fmt, the frontend (`npm run check` in `frontend/`), a real run against a
+9. **Phase 1: loading a model bigger than the memory, on purpose (code done 2026-11-24, uncommitted, not measured on a real model).**
+   `Fit::Paged`, `serving::place_with`, `Settings.allow_paged_load` (default off), `ServeFlags.paged`, `Engine::is_paged`, the
+   `needs_explicit_load` 409 in `ensure_loaded`, a 30-minute minimum load deadline, the Models page advice, the profile field and the
+   Settings switch; tests in `serving.rs`, `engine.rs`, `misty/roster.rs` and `ModelsView.test.ts` (library suite 581 passed,
+   frontend 128, clippy clean). Docs: `docs/serving.md`, CHANGELOG "Unreleased". **Left:** (a) run a real GGUF bigger than free RAM plus
+   VRAM through it (needs a model; ask the owner) and write the measured rate to STATUS; (b) check what `--fit on` does for such a model
+   and pass `-ngl` if it refuses; (c) the `"paged"` value of `Serving.placement` for a loaded model (the Models page labels it from the
+   plan only); (d) the plan's T2 gate before the prefetch ring of `docs/rigel-hybrid-plan.md`.
+10. **Rigel and the AirLLM-style hybrid (owner's instruction 2026-11-24: make Rigel ModelMistress's own engine, replacing Betelgeuse as
+   a dependency, with AirLLM's method woven in).** Plan and findings: `docs/rigel-hybrid-plan.md`. Done: the submodule was fetched (on the
+   owner's yes), the build was fixed for this machine (`MM_RIGEL_MSVC_TOOLSET=14.44.35207`) and **verified end to end** (30B MoE on the RX 7900 XTX,
+   12 tokens/s warm). **R1 is done (own repository `LoopyLuci/Rigel`, fresh history, commit `0ae9e6f5c`; the patch is gone; see the plan). ****Hybrid, built and measured 2026-11-24:** `layer_readahead` (Rigel `--layer-readahead N`, source in `LoopyLuci/Rigel` `src/llama-readahead.h`; the Rigel commit is local and **not pushed**, ask the owner). Result: read-ahead gains at most about 10% (the faults of a multi-threaded matmul already read at disk speed, 1.8 GB/s), so the prefetch ring is not worth more. **Pinned resident set built and measured (2026-11-24):** `layer_resident_mib` (Rigel `--layer-resident-mib`); under a hard working-set cap a 3500 MiB set ran about 2 to 3 times faster than none (noisy single runs; plan section 'Pinned resident set'). Rigel's own `--fit` is now used for the GPU/CPU split and the setting `vram_extends_ram` (default on) lets a CPU load that does not fit the RAM use the card's free memory (`serving::spill_layers`). A memory-pressure run was done on 2026-11-24 with the owner's hubs stopped (a process held 15 to 20 GB of the 64 GB, leaving 3.3 then 1.6 GB available) and was **inconclusive**: the 5.5 GB model stayed in memory (Windows took room from other cached pages), so it ran at 6.0 to 6.3 tokens/s with read-ahead 0, 4 or 8; only cold first reads were slow (2.1, and one 1.06). Plan section 'Layer read-ahead built and measured' has the table. A proper test needs a dense GGUF clearly bigger than RAM (about 40 GB or more) or a hard memory cap on the server process. **Not done:** R2 setup component and
+   Models page work, the hybrid itself (only after the T2 measurement). Rigel is **not** in releases 0.4.1/0.4.2. Note: the user's link
+   named `RechargedIdeas/ModelMistress`; the repository this checkout pushes to is `LoopyLuci/ModelMistress`, and Rigel's upstream is
+   `Betelgeuse-AI/Betelgeuse`. Ask which one is meant before changing any remote.
+11. **Finish.** Whole library suite, clippy, fmt, the frontend (`npm run check` in `frontend/`), a real run against a
    scratch hub, docs, CHANGELOG. Do not commit unless the owner asks.
 
 ## Open questions for the owner
 
 - May Misty install the PrismML Vulkan build by default (item 8: wired and checked on the card; today it is opt-in with
   `--install prism-gpu` and the starter set is unchanged)?
-- AirLLM: the plan says no engine. Does the owner still want it after reading the plan's numbers, and may AirLLM and
-  PyTorch be installed into the Forge environment for the Phase 0 benchmark? (item 7)
+- AirLLM: the spike confirmed the plan (it works and is correct, but 38 times slower). Is there a model bigger than RAM
+  plus VRAM the owner wants to run, or a batch job (scoring, distillation)? Without one, stop after Phase 1. May the
+  spike's ~11 GB folder stay? (item 7; AirLLM must still never go into the Forge environment.)
 - The commit headroom is the limit on this machine: should the page file be larger (a Windows setting, the owner's
   call), and should the models move off the hard drive?
 - Two hubs run at once (the desktop app's own and the Scheduled Task's). Which should stay?

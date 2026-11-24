@@ -47,8 +47,13 @@ set MM_RIGEL_GPU_TARGETS=gfx1100          # default; a list such as gfx1100,gfx1
 cargo build --release -p model-mistress --features rigel-engine
 ```
 
-`build.rs` applies `engines/patches/rigel.patch` to the `engines/rigel` submodule (the submodule stays pinned; the
-patch is skipped when it is already applied), configures it with the HIP SDK's clang, Ninja and Visual Studio's
+If the build stops with errors such as `__device__ function 'isless' cannot overload __host__ __device__ function`, HIP's clang 21
+does not like the newest MSVC headers (toolset 14.51). Install an older toolset beside it and pin it:
+`set MM_RIGEL_MSVC_TOOLSET=14.44.35207` (the folder name under `VC\Tools\MSVC`). That built on 2026-11-24.
+The submodule must be checked out first: `git submodule update --init engines/rigel`.
+
+`engines/rigel` is ModelMistress's own repository (https://github.com/LoopyLuci/Rigel, a standalone snapshot of Betelgeuse with
+this port applied, with its own history and a `NOTICE.md` that credits its origin). `build.rs` configures it with the HIP SDK's clang, Ninja and Visual Studio's
 libraries, and builds `rigel-server`. The build needs the HIP SDK, CMake, Ninja and Visual Studio's C++ tools. It can
 be combined with `bundled-engine`.
 
@@ -58,6 +63,57 @@ What the patch does:
 - `src/rigel-port.cpp` and `rigel-gpu.h` supply io_uring and the other POSIX pieces on Windows.
 - It draws a plain-text logo, so the build needs neither rsvg-convert nor ImageMagick.
 - It names the programs `rigel-server` and `rigel-cli`.
+
+## Layer read-ahead (`layer_readahead`, `--layer-readahead N`)
+
+For a **dense** model whose weights the operating system pages in from the memory-mapped file because they do not all fit in
+memory. While layer *i* computes, a worker thread asks the system to read layers *i+1* to *i+N* (`PrefetchVirtualMemory` on
+Windows, `madvise(WILLNEED)` elsewhere), and the next token's first layers wrap round at the end. This is AirLLM's "read the next
+layer while this one computes", built on the existing memory map, so the weights keep their place and the GGUF is unchanged.
+
+```toml
+[profiles."<model id>"]
+engine = "rigel"
+gpu_layers = 0          # or the number of layers that fit the card
+layer_readahead = 4     # 0 or unset: off
+```
+
+- Off by default. On a model that fits in memory it only costs: 6.45 against 6.27 tokens/s (3%) with a 9B Q4_K_M model on the CPU, with
+  identical output.
+- It watches the end of each layer (`l_out-<il>`), which splits the graph there; it is off while paged experts (`--moe-direct-io`) are on.
+- **It does not make a model that is bigger than memory fast.** Measured on 2026-11-24 on a cold 3 GB region of a GGUF, 12 threads
+  (disk: the model drive): plain page faults read 1.7 to 1.8 GB/s, a prefetch of the whole range 1.85 GB/s, and a pipeline that prefetches
+  four 128 MB chunks ahead 2.0 GB/s. So the faults of a multi-threaded matrix multiply already read sequentially and nearly saturate the
+  disk; read-ahead gains at most about 10%. A dense model of *S* GB bigger than memory still costs about *S* divided by the disk rate
+  per token. A run with 15 to 20 GB of the machine's RAM held back (1.6 GB left available) showed no effect either way (6.0 to 6.3
+  tokens/s, read-ahead 0, 4 or 8) because the 5.5 GB test model stayed cached; a model clearly bigger than RAM is still untested.
+  Results and what is left: [rigel-hybrid-plan.md](rigel-hybrid-plan.md).
+
+## Pinned resident set (`layer_resident_mib`, `--layer-resident-mib N`)
+
+For a **dense** model bigger than the memory it may use. Instead of letting the system evict and re-read every layer on every token, the first
+layers whose weights sit in host memory are **locked in memory** up to N MiB (`VirtualLock` on Windows, which grows the process's working set
+to fit; `mlock` elsewhere), and only the rest streams from the file. Bytes read per token fall from S to S minus the locked part, which neither
+llama.cpp's paging nor AirLLM does.
+
+```toml
+[profiles."<model id>"]
+engine = "rigel"
+layer_resident_mib = -1   # MiB to lock; -1: what is free (less 2 GB or a tenth of the RAM); 0 or unset: off
+```
+
+- Never more than 85% of the RAM; layers are locked whole, in order. Layers on the GPU are not host memory and are not counted.
+- Off with paged experts; it combines with `layer_readahead` (locked layers are not prefetched). If the system refuses a lock (commit limit),
+  the server logs a warning and runs with what it got.
+- Measured with a hard working-set cap (4096 MiB for a 5.5 GB model): a 3500 MiB set read about 2 to 3 times faster than none; single runs,
+  noisy. Details: [rigel-hybrid-plan.md](rigel-hybrid-plan.md).
+
+## GPU and CPU together
+
+`gpu_layers` left at its default lets Rigel's own `--fit` choose how many layers go to the card (ModelMistress passes `--fit on --fit-target`
+as for llama.cpp; with paged experts it keeps `-ngl`). The rest runs on the CPU from RAM, and with `layer_resident_mib` the part of that
+which does not fit RAM is streamed. The setting `vram_extends_ram` (default on) also moves layers to a card that has room for a load that was to
+run on the CPU but does not fit the free RAM. Measured: a 9B model with 3.9 GB of the card usable ran at 19.3 tokens/s, on the CPU alone 6.3.
 
 ## Paged decoding speed
 

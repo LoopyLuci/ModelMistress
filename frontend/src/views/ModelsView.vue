@@ -564,12 +564,13 @@ function describeFit(r: any): { text: string; tone: string } | null {
   const need = r.estimate?.total_mib as number | undefined
   const free = r.free_mib as number | undefined
   const sizes = need != null && free != null ? ` It needs about ${gb(need)}; ${gb(free)} of video memory is free.` : ''
-  const p = r.placement as { where?: string; gpu_share?: number; need_ram_mib?: number; free_ram_mib?: number } | null | undefined
+  const p = r.placement as { where?: string; gpu_share?: number; need_ram_mib?: number; free_ram_mib?: number; paged_mib?: number } | null | undefined
   // layers the hub and llama-server choose (the default): what does not fit on the GPU runs from RAM
   if (r.learned_cpu) return { tone: 'warn', text: `It starts on the CPU: ${r.learned_cpu}. Tick "Try the GPU again" to give the GPU another go.` }
   if (p?.where === 'split') return { tone: 'warn', text: `About ${Math.round((p.gpu_share ?? 0) * 100)}% of it goes on the GPU and the rest runs from system memory, which is slower.${sizes}` }
   if (p?.where === 'cpu') return { tone: 'warn', text: `Next to no video memory is free, so it runs on the CPU.${sizes}` }
-  if (p?.where === 'none') return { tone: 'bad', text: `This does not fit this machine: it needs about ${gb(p.need_ram_mib ?? 0)} of system memory and ${gb(p.free_ram_mib ?? 0)} are free. A smaller context, fewer parallel requests or a smaller quantisation helps.${sizes}` }
+  if (p?.where === 'paged') return { tone: 'bad', text: `Too big for this machine's memory: about ${gb(p.paged_mib ?? 0)} of it is read from disk as the model runs. Expect seconds per token, and a slow start.${sizes}` }
+  if (p?.where === 'none') return { tone: 'bad', text: `This does not fit this machine: it needs about ${gb(p.need_ram_mib ?? 0)} of system memory and ${gb(p.free_ram_mib ?? 0)} are free. A smaller context, fewer parallel requests or a smaller quantisation helps. To try it from disk (very slow), turn on the setting for it and the model's "Load from disk" option.${sizes}` }
   switch (r.verdict) {
     case 'fits': return { tone: 'ok', text: `This fits.${sizes}` }
     case 'fits_after_unloading': return { tone: 'warn', text: `This fits after unloading ${(r.unload || []).join(', ') || 'another model'}; the hub does that when you load.${sizes}` }

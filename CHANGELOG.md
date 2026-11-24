@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **A model bigger than the memory can be loaded from disk, on purpose** (`src/serving.rs`, `src/engine.rs`; [serving](docs/serving.md)).
+  New setting `allow_paged_load` (default off) and profile field `paged`: with both, a model that fits neither the GPU nor
+  RAM is placed as `paged` (`model.plan` says `where: paged`) instead of refused, and `model.load` starts it with a
+  30-minute minimum load deadline. A request, Misty and `auto` never load it (`409 needs_explicit_load`). With either
+  switch off nothing changes. Rigel now lives in its own repository, `LoopyLuci/Rigel` (a standalone snapshot; the patch is gone). The Rigel build can pin an older MSVC toolset (`MM_RIGEL_MSVC_TOOLSET`), which the newest one needs.
+  Rigel option `layer_readahead` (`--layer-readahead N`, off by default): reads the next layers of a memory-mapped dense model while the
+  current one computes (3% cost on a model that fits, at most about 10% gain on a cold read; a test with most of the RAM held back
+  was inconclusive because the model stayed cached; see docs/rigel.md).
+  Rigel option `layer_resident_mib` (`--layer-resident-mib N`, off by default; -1 = what is free): locks the first layers of a dense model in memory
+  and streams the rest (measured under a hard working-set cap: about 2 to 3 times the speed of none; noisy single runs).
+  Rigel now uses its own `--fit` for the GPU/CPU split (it passed `-ngl 999`), and new setting `vram_extends_ram` (default on) puts layers on a
+  card that has room when a load meant for the CPU does not fit the free RAM.
+  A Prism (Bonsai) model wholly on the card is loaded with `-lm none`, so its weights are in VRAM only (RAM 0.45 GB against 2.2 GB).
+  AirLLM Phase 0 results: [airllm-spike-results](docs/airllm-spike-results.md).
+
 ## 0.4.2 — 2026-11-23
 
 - **A CPU model and a GPU model work at once without fighting for cores; loads show their progress; the starter set

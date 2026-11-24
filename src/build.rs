@@ -165,7 +165,7 @@ fn rigel_gpu_targets(var: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// With the `rigel-engine` feature: builds Rigel (engines/rigel with engines/patches/rigel.patch) with the HIP
+/// With the `rigel-engine` feature: builds Rigel (engines/rigel, ModelMistress's own repository) with the HIP
 /// SDK's clang and embeds its `rigel-server` (MM_BUNDLED_RIGEL). Needs HIP_PATH, CMake, Ninja and Visual Studio's
 /// libraries; MM_RIGEL_GPU_TARGETS picks the GPUs.
 fn build_rigel() {
@@ -178,9 +178,6 @@ fn build_rigel() {
     if !src.join("CMakeLists.txt").is_file() {
         panic!("rigel-engine: engines/rigel is empty; run `git submodule update --init --recursive engines/rigel`");
     }
-    let patch = engines.join("patches").join("rigel.patch");
-    println!("cargo:rerun-if-changed={}", patch.display());
-    apply_patch(&src, &patch);
     let hip = std::env::var("HIP_PATH")
         .ok()
         .filter(|p| !p.is_empty())
@@ -238,6 +235,14 @@ fn build_rigel() {
         let cl = cc::windows_registry::find_tool(&target, "cl.exe")
             .unwrap_or_else(|| panic!("rigel-engine: Visual Studio's C++ tools were not found"));
         env.extend(cl.env().iter().cloned());
+        // HIP's clang 21 cannot compile against the newest MSVC headers (14.51: "__device__ function 'isless' cannot
+        // overload __host__ __device__ function"). MM_RIGEL_MSVC_TOOLSET=14.44.35207 builds against an older toolset
+        // that is installed beside it.
+        if let Ok(ver) = std::env::var("MM_RIGEL_MSVC_TOOLSET") {
+            for (_, val) in env.iter_mut() {
+                *val = pin_msvc_toolset(&val.to_string_lossy(), &ver).into();
+            }
+        }
     }
     run(
         Command::new("cmake").args(&cfg).envs(env.iter().cloned()),
@@ -256,14 +261,40 @@ fn build_rigel() {
     );
     let exe = find_exe(&build, "rigel-server").unwrap_or_else(|| panic!("rigel-engine: rigel-server was not built"));
     println!("cargo:rustc-env=MM_BUNDLED_RIGEL={}", exe.display());
+    // (safe.directory: the checkout may belong to another user, and then git would say nothing and the version "unknown")
     let commit = Command::new("git")
-        .args(["-C", &src.display().to_string(), "rev-parse", "--short", "HEAD"])
+        .args([
+            "-c",
+            "safe.directory=*",
+            "-C",
+            &src.display().to_string(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=MM_BUNDLED_RIGEL_VERSION={commit} (hip {targets})");
+}
+
+/// `value` (a PATH, INCLUDE or LIB list) with the MSVC toolset folder in every path (`...\VC\Tools\MSVC\<version>\...`)
+/// changed to `version`.
+fn pin_msvc_toolset(value: &str, version: &str) -> String {
+    const KEY: &str = "\\VC\\Tools\\MSVC\\";
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(i) = rest.find(KEY) {
+        let after = i + KEY.len();
+        out.push_str(&rest[..after]);
+        out.push_str(version);
+        let tail = &rest[after..];
+        rest = &tail[tail.find(['\\', ';']).unwrap_or(tail.len())..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The deepest file stable-diffusion.cpp's nested vulkan-shaders-gen sub-build writes, below OUT_DIR (the part of

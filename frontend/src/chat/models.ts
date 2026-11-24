@@ -29,7 +29,7 @@ export interface HubModel {
   hardware?: {
     engine: string
     can_run_on: ('gpu' | 'cpu')[]
-    runs_on: 'gpu' | 'split' | 'cpu' | 'none' | 'unknown'
+    runs_on: 'gpu' | 'split' | 'cpu' | 'none' | 'paged' | 'unknown'
     /** true: loaded, `runs_on` is measured; false: where a load would go. */
     now: boolean
     gpu_share?: number | null

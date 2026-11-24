@@ -177,6 +177,15 @@ describe('where a model goes', () => {
     expect(card(w, 'llama-3b').text()).toContain('39.1 GB of system memory')
   })
 
+  it('warns that a model set to load from disk will be very slow', async () => {
+    answer({ 'model.plan': plan({ placement: { where: 'paged', paged_mib: 30000, need_ram_mib: 80000 } }) })
+    const w = await openLoadForm('llama-3b')
+    const t = card(w, 'llama-3b').text()
+    expect(t).toContain('about 29.3 GB of it is read from disk as the model runs')
+    expect(t).toContain('seconds per token')
+    expect(t).not.toContain('This does not fit this machine')
+  })
+
   it('starts a model that crashed the GPU on the CPU, and lets the owner try the GPU again', async () => {
     answer({ 'model.plan': plan({ verdict: 'fits', learned_cpu: 'its load on the GPU crashed llama-server (exit 0xC0000409)' }) })
     const w = await openLoadForm('llama-3b')

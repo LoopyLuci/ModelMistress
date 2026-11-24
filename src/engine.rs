@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use crate::catalog::{self, ModelEntry, Roots};
 use crate::serving::{self, Plan, Resident, Resolved, ServeFlags, ServeProfile, Serving};
 
+/// The least a load that runs from disk (`paged`) is given to start, in seconds: it reads the whole file once.
+const PAGED_LOAD_TIMEOUT_S: u64 = 1800;
+
 /// An error with the HTTP status the hub should answer with.
 #[derive(Debug)]
 pub struct Fail {
@@ -126,6 +129,14 @@ pub struct Settings {
     /// MiB of each GPU's memory that models never use, left for the system (the desktop, the driver): the models
     /// together hold at most the card's total minus this (24,560 MiB card, 2048 reserved: 22,512 MiB, about 22 GB).
     pub vram_reserve_mib: u64,
+    /// Let a model that is bigger than the free RAM plus the VRAM models may use be loaded anyway, with its weights read
+    /// from disk as it runs (very slow), when the model's own `paged` flag is set too and someone loads it with
+    /// `model.load`. Off by default: such a load is refused with `insufficient_memory`, as it always was.
+    pub allow_paged_load: bool,
+    /// A model that was to run on the CPU, but whose weights do not fit in the free RAM, puts as many layers on a card
+    /// that has room as it takes to fit (the free VRAM extends the RAM, and those layers run on the GPU too). A model
+    /// that fits in RAM stays on the CPU. Off: it is read from disk as it runs, as before.
+    pub vram_extends_ram: bool,
     /// Give each llama-server a thread count (`-t`) that leaves the cores a CPU model and a GPU model both need (see
     /// [`serving::thread_budget`]). A thread setting of a profile, a load or `extra_args` wins. Off: llama-server's own
     /// default (all physical cores) for every server.
@@ -212,6 +223,8 @@ impl Default for Settings {
             vram_guard: true,
             vram_margin_mib: 768,
             vram_reserve_mib: 2048,
+            allow_paged_load: false,
+            vram_extends_ram: true,
             thread_budget: true,
             autoload: true,
             load_timeout_s: 300,
@@ -1171,6 +1184,18 @@ impl Engine {
                 format!("{} is not loaded (autoload is off)", entry.id),
             ));
         }
+        // a model that would run from disk (very slow, and it loads for minutes) is never loaded by a request: peers,
+        // Misty and `auto` reach it only through this path, so someone has to load it on purpose
+        if !explicit && self.is_paged(entry, opts).await {
+            return Err(Fail::new(
+                409,
+                "needs_explicit_load",
+                format!(
+                    "{} is bigger than the memory available and is set to run from disk, which is very slow; load it with model.load first",
+                    entry.id
+                ),
+            ));
+        }
         let _guard = self.load_lock.lock().await;
         if !reload {
             if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
@@ -1192,6 +1217,20 @@ impl Engine {
         mm.loads += 1;
         mm.last_load_ms = t0.elapsed().as_millis() as u64;
         Ok(inst)
+    }
+
+    /// Whether a load of this model would be placed as [`serving::Fit::Paged`] (needs `allow_paged_load` and the model's
+    /// `paged` flag, and a model that fits neither the GPU nor RAM).
+    pub async fn is_paged(&self, entry: &ModelEntry, opts: &LoadOpts) -> bool {
+        let s = self.settings();
+        if !s.allow_paged_load || self.resolve_serving(&s, entry, opts).flags.paged != Some(true) {
+            return false;
+        }
+        let devices = self.gpu_devices_recent().await;
+        matches!(
+            self.placement_for(entry, opts, &devices),
+            Some(serving::Fit::Paged { .. })
+        )
     }
 
     /// Put an instance into service as its model's one. One already there is retired: it takes no new requests
@@ -1518,6 +1557,7 @@ impl Engine {
                 ),
                 Some(serving::Fit::Cpu) => ("cpu", Some(0.0), Some(0), Some(file_mib)),
                 Some(serving::Fit::No { .. }) => ("none", None, est.map(|e| e.total_mib), None),
+                Some(serving::Fit::Paged { .. }) => ("paged", None, est.map(|e| e.total_mib), None),
                 // no estimate (the header lacks the shape): the GPU is tried first, as a load would
                 None => ("gpu", None, None, None),
             }
@@ -1528,6 +1568,7 @@ impl Engine {
             ("gpu", _) => "GPU".to_string(),
             ("cpu", _) => "CPU".to_string(),
             ("none", _) => "does not fit".to_string(),
+            ("paged", _) => "from disk (slow)".to_string(),
             _ => "?".to_string(),
         };
         json!({
@@ -1777,12 +1818,13 @@ impl Engine {
         if let Some(b) = self.learned_budget_mib(devices, &r) {
             free = free.min(b.saturating_add(s.vram_margin_mib));
         }
-        Some(serving::place(
+        Some(serving::place_with(
             &est,
             free,
             s.vram_margin_mib,
             &self.residents(&entry.id),
             free_ram_mib(),
+            s.allow_paged_load && r.flags.paged == Some(true),
         ))
     }
 
@@ -1795,7 +1837,11 @@ impl Engine {
         devices: &[serving::Device],
     ) -> Result<Option<(Vec<String>, u64)>> {
         match self.placement_for(entry, opts, devices) {
-            None | Some(serving::Fit::Gpu) | Some(serving::Fit::Split { .. }) | Some(serving::Fit::Cpu) => Ok(None),
+            None
+            | Some(serving::Fit::Gpu)
+            | Some(serving::Fit::Split { .. })
+            | Some(serving::Fit::Cpu)
+            | Some(serving::Fit::Paged { .. }) => Ok(None),
             Some(serving::Fit::GpuAfter(models, want)) => Ok(Some((models, want))),
             Some(serving::Fit::No {
                 need_ram_mib,
@@ -1806,7 +1852,7 @@ impl Engine {
                     503,
                     "insufficient_memory",
                     format!(
- "{} does not fit this machine as asked: with the {free} MiB of VRAM that models may use it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization.",
+ "{} does not fit this machine as asked: with the {free} MiB of VRAM that models may use it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization. To try it from disk, which is very slow, turn on allow_paged_load in the settings, set paged on the model's profile, and load it with model.load.",
                         entry.id
                     ),
                 ))
@@ -1834,13 +1880,51 @@ impl Engine {
 
     /// Whether llama-server can choose the GPU layers itself (`--fit`): the stock llama.cpp, in a build that has it.
     async fn fits_itself(&self, r: &Resolved) -> bool {
-        if r.flags.is_rigel() || r.flags.is_prism() {
+        if r.flags.is_prism() {
             return false;
+        }
+        if r.flags.is_rigel() {
+            // Rigel's own `--fit` (measured: it splits the layers between the card and the CPU). With paged experts the
+            // experts are Rigel's to place, so the layer count stays what was asked for.
+            if r.flags.moe_direct_io == Some(true) {
+                return false;
+            }
+            let Some(exe) = self.rigel_server() else {
+                return false;
+            };
+            return self.server_has_flag(&exe, "--fit").await;
         }
         let Some(exe) = self.llama_server() else {
             return false;
         };
         self.server_has_flag(&exe, "--fit").await
+    }
+
+    /// Layers to put on the card for a load that was to run on the CPU but does not fit the free RAM (see
+    /// [`Settings::vram_extends_ram`] and [`serving::spill_layers`]). None: it fits, or no card can take any.
+    async fn vram_spill(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<i32> {
+        let s = self.settings();
+        let file_mib = entry.size_bytes / (1024 * 1024);
+        if !s.vram_extends_ram || file_mib + serving::RAM_OVERHEAD_MIB <= free_ram_mib() {
+            return None;
+        }
+        let devices = self.gpu_devices_recent().await;
+        if !self.can_use_gpu(r, &devices) {
+            return None;
+        }
+        let shape = serving::shape_from_meta(&entry.meta, entry.size_bytes)?;
+        let every = Resolved {
+            gpu_layers: 999,
+            fit_target_mib: None,
+            ..r.clone()
+        };
+        let est = self.estimate_for(entry, opts, &every)?;
+        let mut free = self.plannable_free(&devices, &s, &entry.id);
+        if let Some(b) = self.learned_budget_mib(&devices, &every) {
+            free = free.min(b.saturating_add(s.vram_margin_mib));
+        }
+        let n = serving::spill_layers(&est, shape.layers, file_mib, free_ram_mib(), free, s.vram_margin_mib);
+        (n > 0).then_some(n as i32)
     }
 
     /// Whether `exe --help` lists `flag`. Only a real answer is remembered.
@@ -1853,6 +1937,15 @@ impl Engine {
         cmd.arg("--help").stdin(std::process::Stdio::null()).kill_on_drop(true);
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
+        }
+        // a HIP build cannot even print its help without the runtime on PATH
+        if exe
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("rigel"))
+        {
+            if let Some(path) = hip_runtime_path(std::env::var_os("HIP_PATH"), std::env::var_os("PATH")) {
+                cmd.env("PATH", path);
+            }
         }
         no_window(&mut cmd);
         let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await else {
@@ -2325,6 +2418,16 @@ impl Engine {
             })?
         };
         let s = self.settings();
+        // a CPU load that does not fit the free RAM borrows the card's free memory for the layers that do not fit
+        let mut spill_note = None;
+        if resolved.gpu_layers == 0 && *how != Try::Cpu && !opts.embeddings && !opts.reranking {
+            if let Some(n) = self.vram_spill(entry, opts, &resolved).await {
+                spill_note = Some(format!(
+                    "the weights do not fit the free RAM: {n} layers went to the GPU's free memory (vram_extends_ram)"
+                ));
+                resolved.gpu_layers = n;
+            }
+        }
         // llama-server chooses the number of GPU layers itself where it can: it measures what is free on each device,
         // which is more exact than a header-based estimate, and it moves experts of a mixture-of-experts model to RAM.
         if resolved.is_auto() && self.fits_itself(&resolved).await {
@@ -2356,6 +2459,16 @@ impl Engine {
             && self.server_has_flag(&exe, "--device").await
         {
             args.extend(["-dev".into(), "none".into()]);
+        }
+        // A Prism (Bonsai) model wholly on the card keeps its weights in VRAM only: the default memory map would also keep
+        // the file in the server's working set (measured, 9B ternary: 2.2 GB of RAM against 0.45 GB with `-lm none`, the
+        // same 131 tokens/s on the card).
+        if resolved.flags.is_prism()
+            && resolved.gpu_layers >= 999
+            && !args.iter().any(|a| a == "-lm" || a == "--load-mode")
+            && self.server_has_flag(&exe, "--load-mode").await
+        {
+            args.extend(["-lm".into(), "none".into()]);
         }
         args.push("--metrics".into());
         let user_threads =
@@ -2461,7 +2574,13 @@ impl Engine {
             on_stop: Mutex::new(None),
         };
         // Wait until it answers /health with 200 (it answers 503 while loading).
-        let deadline = Instant::now() + Duration::from_secs(s.load_timeout_s.max(5));
+        // a model that runs from disk touches every page once before it answers
+        let timeout_s = if self.is_paged(entry, opts).await {
+            s.load_timeout_s.max(PAGED_LOAD_TIMEOUT_S)
+        } else {
+            s.load_timeout_s.max(5)
+        };
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
         let url = format!("http://127.0.0.1:{port}/health");
         let estimate = self.estimate_for(entry, opts, &resolved).map(|e| e.total_mib);
         loop {
@@ -2504,6 +2623,9 @@ impl Engine {
                         let mut sv = inst.serving.write();
                         sv.placement =
                             serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers);
+                        if sv.placement_note.is_none() {
+                            sv.placement_note = spill_note;
+                        }
                     }
                     return Ok(inst);
                 }
@@ -2516,7 +2638,7 @@ impl Engine {
                     format!(
                         "{} did not finish loading in {} s:\n{}",
                         entry.id,
-                        s.load_timeout_s,
+                        timeout_s,
                         tail(&log, 15)
                     ),
                 ));
@@ -4167,6 +4289,75 @@ parallel = 1
         assert_eq!(targets[0], Some(1_648), "{targets:?}");
         // when that run out of memory too, the next try keeps more free still
         assert!(targets[1].is_some_and(|t| t > 1_648), "{targets:?}");
+    }
+
+    /// A model of 4 PiB fits no memory this machine has, so it is "bigger than RAM plus VRAM" whatever the machine is.
+    fn paged_engine(d: &Path, allow: bool) -> (Arc<Engine>, ModelEntry, LoadOpts) {
+        let e = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(gpu_crashing_server(d)),
+                ollama_url: String::new(),
+                allow_paged_load: allow,
+                ..Default::default()
+            },
+        );
+        *e.fake_devices.lock() = Some(card(24_000, 23_000));
+        let mut entry = sized_entry(d);
+        entry.size_bytes = 1 << 52;
+        let opts = LoadOpts {
+            serve: ServeFlags {
+                paged: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (e, entry, opts)
+    }
+
+    /// With paging off (the default) a model bigger than the memory is refused as it always was, even when its own
+    /// `paged` flag is set, and the refusal says how to try it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_model_is_refused_unless_paging_is_allowed() {
+        let d = crate::testing::TestDir::new("mm-paged-off");
+        let (e, entry, opts) = paged_engine(&d, false);
+        assert!(!e.is_paged(&entry, &opts).await);
+        let f = e.ensure_loaded(&entry, &opts, true).await.err().expect("refused");
+        assert_eq!(f.code, "insufficient_memory", "{}", f.message);
+        assert!(f.message.contains("allow_paged_load"), "{}", f.message);
+        assert!(starts(&d).is_empty());
+    }
+
+    /// With both switches on, a request never loads the model (409), `model.load` does, and the load is allowed the
+    /// longer deadline. Without the model's own flag nothing changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paged_model_is_loaded_on_purpose_only() {
+        let d = crate::testing::TestDir::new("mm-paged-on");
+        let (e, entry, opts) = paged_engine(&d, true);
+        assert!(e.is_paged(&entry, &opts).await);
+        assert!(
+            !e.is_paged(&entry, &LoadOpts::default()).await,
+            "the model's flag is needed too"
+        );
+        let f = e
+            .ensure_loaded(&entry, &opts, false)
+            .await
+            .err()
+            .expect("not by a request");
+        assert_eq!((f.status, f.code), (409, "needs_explicit_load"), "{}", f.message);
+        assert!(starts(&d).is_empty(), "a request must not start a server");
+        // on purpose: it is placed (not refused) and the server is started; the stand-in then crashes
+        let f = e
+            .ensure_loaded(&entry, &opts, true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        assert_ne!(f.code, "insufficient_memory", "{}", f.message);
+        assert!(!starts(&d).is_empty(), "the load was started");
+        // the model's plan says where it goes
+        let devices = e.gpu_devices().await;
+        let fit = e.placement_for(&entry, &opts, &devices).unwrap();
+        assert_eq!(serving::fit_json(&fit)["where"], "paged");
     }
 
     /// An out-of-memory error is answered with a split held lower each time, then the CPU; what failed is kept, and the

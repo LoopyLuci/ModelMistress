@@ -137,7 +137,18 @@ for two things: unloading idle models to make room (a model that holds no VRAM i
 a load that cannot run at all, `503 insufficient_memory`: the part that does not fit the GPU would have to fit in free
 RAM, and it does not. Where `model.plan` can estimate, it adds `placement`: `{"where": "gpu"}`,
 `{"where": "gpu_after_unloading", "unload": [...]}`, `{"where": "split", "gpu_share": 0.57}`, `{"where": "cpu"}` or
-`{"where": "none", "need_ram_mib": ..., "free_ram_mib": ...}`.
+`{"where": "none", "need_ram_mib": ..., "free_ram_mib": ...}` or, only when paging is allowed (below), `{"where": "paged",
+"paged_mib": ..., "need_ram_mib": ...}`.
+
+**Loading from disk (`paged`, off by default).** A model bigger than the free RAM plus the VRAM models may use is refused
+(`insufficient_memory`). To try it anyway, turn on the setting `allow_paged_load` **and** set `paged = true` in the model's
+profile (or pass `paged` to `model.load`), then load it with `model.load`. The weights that do not fit are read from disk
+by the operating system as the model runs (llama.cpp memory-maps the file): expect seconds per token, a slow start (the
+load deadline is at least 30 minutes) and a machine that may stall while it pages. It still needs the KV cache, the state
+and the server's buffers to fit in RAM, else it is refused. A request never loads such a model: it gets 409
+`needs_explicit_load`, so peers, Misty and `auto` cannot start one (the roster also keeps it `unfit`). The Models page shows
+"from disk (slow)". Only for the stock llama.cpp with `--fit` and automatic GPU layers; other engines ignore `paged`. Not
+yet measured on a real over-memory model: see the HANDOVER.
 
 **What was measured.** Each loaded model reports `serving.placement`: `gpu` (the weights are on the GPU), `partial`
 (some are), `cpu`, or `unknown` (no GPU counters on this machine, or not measured yet). It comes from the dedicated

@@ -82,6 +82,25 @@ pub struct ServeFlags {
     /// Rigel: pinned host memory (MiB) that keeps evicted experts (the `MOE_CACHE_MIB` variable); 0 = off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moe_cache_mib: Option<u32>,
+    /// Rigel: dense layers to read ahead from the memory-mapped file while the current layer computes
+    /// (`--layer-readahead`; 0 = off). For a dense model bigger than the free memory, whose weights the operating system
+    /// pages in: the next layers are read in large ordered requests instead of one page fault at a time. Costs a few
+    /// percent on a model that fits, so leave it off for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_readahead: Option<u32>,
+    /// Rigel: MiB of dense layer weights to lock in memory so the operating system never evicts them, the rest being
+    /// streamed from the memory-mapped file (`--layer-resident-mib`; -1 = what is free minus a margin, 0 = off). For a
+    /// dense model bigger than the free memory: a walk over every layer for every token makes least-recently-used
+    /// eviction throw out each page just before it is needed, so the whole model is read from disk for every token;
+    /// with the first layers locked only the rest is. Works with `layer_readahead`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_resident_mib: Option<i32>,
+    /// Allow this model to be loaded although it is bigger than the free RAM plus the VRAM models may use: the weights
+    /// that do not fit are read from disk by the operating system as the model runs (llama.cpp memory-maps the file).
+    /// Slow: every token may read from disk. It also needs the hub's `allow_paged_load` setting, and the model is only
+    /// ever loaded on purpose (`model.load`), never by a request, Misty or `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged: Option<bool>,
 }
 
 /// The engines a model can be served by (`engine` in a serving profile).
@@ -116,6 +135,12 @@ impl ServeFlags {
         if self.moe_cache_mib.is_some() {
             v.push("moe_cache_mib");
         }
+        if self.layer_readahead.is_some() {
+            v.push("layer_readahead");
+        }
+        if self.layer_resident_mib.is_some() {
+            v.push("layer_resident_mib");
+        }
         v
     }
 }
@@ -145,6 +170,9 @@ impl ServeFlags {
             moe_pack_dir: self.moe_pack_dir.clone().or_else(|| base.moe_pack_dir.clone()),
             moe_profile: self.moe_profile.clone().or_else(|| base.moe_profile.clone()),
             moe_cache_mib: self.moe_cache_mib.or(base.moe_cache_mib),
+            layer_readahead: self.layer_readahead.or(base.layer_readahead),
+            layer_resident_mib: self.layer_resident_mib.or(base.layer_resident_mib),
+            paged: self.paged.or(base.paged),
         }
     }
 }
@@ -268,6 +296,13 @@ impl ServeProfile {
                 drop("ubatch_size", format!("{ub} is larger than batch_size {b}"));
             }
         }
+        if f.layer_resident_mib.is_some_and(|n| n < -1) {
+            f.layer_resident_mib = None;
+            drop(
+                "layer_resident_mib",
+                "must be -1 (what is free), 0 (off) or a size in MiB".into(),
+            );
+        }
         if f.cache_ram_mib.is_some_and(|n| n < -1) {
             f.cache_ram_mib = None;
             drop(
@@ -333,6 +368,9 @@ pub fn validate_flags(f: &ServeFlags, parallel: Option<u32>) -> Result<(), Strin
         if ub > b {
             return Err(format!("ubatch_size {ub} is larger than batch_size {b}"));
         }
+    }
+    if f.layer_resident_mib.is_some_and(|n| n < -1) {
+        return Err("layer_resident_mib must be -1 (what is free), 0 (off) or a size in MiB".into());
     }
     if f.cache_ram_mib.is_some_and(|n| n < -1) {
         return Err("cache_ram_mib must be -1 (no limit), 0 (off) or a size in MiB".into());
@@ -508,6 +546,12 @@ impl Resolved {
             }
             if let Some(p) = &f.moe_profile {
                 a.extend(["--moe-profile".into(), p.display().to_string()]);
+            }
+            if let Some(n) = f.layer_readahead.filter(|n| *n > 0) {
+                a.extend(["--layer-readahead".into(), n.to_string()]);
+            }
+            if let Some(n) = f.layer_resident_mib.filter(|n| *n != 0) {
+                a.extend(["--layer-resident-mib".into(), n.to_string()]);
             }
         }
         a
@@ -853,6 +897,10 @@ pub enum Fit {
     Cpu,
     /// The CPU's part does not fit in the memory that is available either.
     No { need_ram_mib: u64, free_ram_mib: u64 },
+    /// More than the RAM and the GPU hold, and paging was allowed: `paged_mib` of the weights are read from disk as the
+    /// model runs (slow: expect seconds per token). What cannot be paged (the KV cache, the state, the server's buffers)
+    /// does fit in RAM. `need_ram_mib` is what the load would need if it all fitted.
+    Paged { paged_mib: u64, need_ram_mib: u64 },
 }
 
 /// Memory the server program itself and its buffers take on the CPU side, beyond the model.
@@ -861,6 +909,18 @@ pub const RAM_OVERHEAD_MIB: u64 = 768;
 /// Chooses between the GPU, a split and the CPU. Unlike [`plan`] it never refuses for want of VRAM alone: what does not
 /// fit on the GPU runs from RAM, and only a model that fits neither is turned down.
 pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: &[Resident], free_ram_mib: u64) -> Fit {
+    place_with(est, free_vram_mib, margin_mib, resident, free_ram_mib, false)
+}
+
+/// [`place`], where a model that fits neither the GPU nor RAM may be placed as [`Fit::Paged`] when `allow_paged`.
+pub fn place_with(
+    est: &VramEstimate,
+    free_vram_mib: u64,
+    margin_mib: u64,
+    resident: &[Resident],
+    free_ram_mib: u64,
+    allow_paged: bool,
+) -> Fit {
     match plan(est.total_mib, free_vram_mib, margin_mib, resident) {
         Plan::Fits => Fit::Gpu,
         Plan::Evict(models) => Fit::GpuAfter(models, est.total_mib + margin_mib),
@@ -869,7 +929,14 @@ pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: 
             let usable = free_vram_mib.saturating_sub(margin_mib + est.compute_mib);
             let on_gpu = usable.min(movable);
             let need_ram_mib = movable - on_gpu + RAM_OVERHEAD_MIB;
-            if need_ram_mib > free_ram_mib {
+            // the weights can be paged from disk; the cache, the state and the server's own buffers cannot
+            let fixed_mib = est.kv_mib + est.state_mib + RAM_OVERHEAD_MIB;
+            if need_ram_mib > free_ram_mib && allow_paged && fixed_mib <= free_ram_mib {
+                Fit::Paged {
+                    paged_mib: need_ram_mib - free_ram_mib,
+                    need_ram_mib,
+                }
+            } else if need_ram_mib > free_ram_mib {
                 Fit::No {
                     need_ram_mib,
                     free_ram_mib,
@@ -885,6 +952,30 @@ pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: 
     }
 }
 
+/// Layers a load that was to run on the CPU should put on the card because its weights do not fit the free RAM: the
+/// fewest that leave the rest in RAM, and no more than the free VRAM holds (what still does not fit is read from disk, as
+/// a CPU load always was). 0 when the file fits in RAM, or when the card has no room for even one layer. `est` is the
+/// estimate with every layer on the card (weights, cache, state and the compute buffers, which a card load needs once).
+pub fn spill_layers(
+    est: &VramEstimate,
+    layers: u64,
+    file_mib: u64,
+    free_ram_mib: u64,
+    free_vram_mib: u64,
+    margin_mib: u64,
+) -> u64 {
+    let need_ram = file_mib + RAM_OVERHEAD_MIB;
+    if layers == 0 || need_ram <= free_ram_mib {
+        return 0;
+    }
+    let ram_per_layer = (file_mib / layers).max(1);
+    let wanted = (need_ram - free_ram_mib).div_ceil(ram_per_layer).min(layers);
+    let movable = est.weights_mib + est.kv_mib + est.state_mib;
+    let vram_per_layer = movable.div_ceil(layers).max(1);
+    let usable = free_vram_mib.saturating_sub(margin_mib + est.compute_mib);
+    wanted.min(usable / vram_per_layer)
+}
+
 /// A JSON view of a placement for the API (`model.plan`).
 pub fn fit_json(f: &Fit) -> Value {
     match f {
@@ -898,6 +989,12 @@ pub fn fit_json(f: &Fit) -> Value {
             need_ram_mib,
             free_ram_mib,
         } => json!({"where": "none", "need_ram_mib": need_ram_mib, "free_ram_mib": free_ram_mib}),
+        Fit::Paged {
+            paged_mib,
+            need_ram_mib,
+        } => json!({
+            "where": "paged", "paged_mib": paged_mib, "need_ram_mib": need_ram_mib,
+            "note": "disk-bound: part of the weights is read from disk as the model runs; expect seconds per token"}),
     }
 }
 
@@ -1599,6 +1696,55 @@ Exiting, please wait...
     }
 
     #[test]
+    fn the_cards_free_memory_takes_what_the_ram_cannot() {
+        // 40 layers, a 40,000 MiB file (1,000 per layer), 32 GB of cache and state besides the weights
+        let e = est(40_000, 2_000, 500);
+        // fits in RAM: nothing moves
+        assert_eq!(spill_layers(&e, 40, 40_000, 50_000, 24_000, 512), 0);
+        // 10,000 MiB short (plus the server's own 768): 11 layers, the card has room for far more
+        assert_eq!(spill_layers(&e, 40, 40_000, 30_768, 24_000, 512), 10);
+        // the card holds fewer than are wanted: it takes what fits (20 of 1,050 MiB), the rest stays on disk
+        assert_eq!(spill_layers(&e, 40, 40_000, 10_000, 23_000, 512), 20);
+        // no room for one layer, or no layers known: stays on the CPU
+        assert_eq!(spill_layers(&e, 40, 40_000, 10_000, 900, 512), 0);
+        assert_eq!(spill_layers(&e, 0, 40_000, 10_000, 24_000, 512), 0);
+        // never more layers than the model has
+        assert_eq!(spill_layers(&e, 40, 40_000, 0, 200_000, 512), 40);
+    }
+
+    #[test]
+    fn a_model_bigger_than_the_memory_is_paged_only_when_allowed() {
+        let e = est(8000, 1000, 300);
+        let busy = [res("a", 100, 20_000, true)];
+        // not allowed: refused, exactly as place() says
+        assert_eq!(
+            super::place_with(&e, 700, 512, &busy, 4000, false),
+            super::place(&e, 700, 512, &busy, 4000)
+        );
+        // allowed: the weights beyond what RAM holds are paged
+        assert_eq!(
+            super::place_with(&e, 700, 512, &busy, 4000, true),
+            Fit::Paged {
+                paged_mib: 9768 - 4000,
+                need_ram_mib: 9768
+            }
+        );
+        // the cache, the state and the server's buffers cannot be paged: too little RAM for them is still a refusal
+        assert!(matches!(
+            super::place_with(&e, 700, 512, &busy, 1000, true),
+            Fit::No { .. }
+        ));
+        // a model that fits is placed as before, whatever is allowed
+        assert_eq!(super::place_with(&e, 20_000, 512, &[], 4000, true), Fit::Gpu);
+        let j = fit_json(&Fit::Paged {
+            paged_mib: 5768,
+            need_ram_mib: 9768,
+        });
+        assert_eq!(j["where"], "paged");
+        assert_eq!(j["paged_mib"], 5768);
+    }
+
+    #[test]
     fn a_resident_model_that_runs_on_the_cpu_is_not_unloaded_for_vram() {
         let loaded = [res("cpu-model", 9999, 0, false), res("gpu-model", 10, 8000, false)];
         assert_eq!(plan(8000, 1000, 512, &loaded), Plan::Evict(vec!["gpu-model".into()]));
@@ -1659,6 +1805,85 @@ Exiting, please wait...
     }
 
     #[test]
+    fn layer_readahead_is_a_rigel_option_and_zero_means_off() {
+        let on = ServeFlags {
+            engine: Some("rigel".into()),
+            layer_readahead: Some(4),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &on), None, &ServeProfile::default(), (0, 999, 1));
+        r.validate().unwrap();
+        assert!(r.args().join(" ").ends_with("--layer-readahead 4"), "{:?}", r.args());
+        let off = ServeFlags {
+            layer_readahead: Some(0),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &off), None, &ServeProfile::default(), (0, 999, 1));
+        assert!(!r.args().join(" ").contains("readahead"));
+        // llama.cpp does not have it
+        let plain = ServeFlags {
+            layer_readahead: Some(4),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &plain), None, &ServeProfile::default(), (0, 999, 1));
+        assert!(r.validate().unwrap_err().contains("layer_readahead is a Rigel option"));
+    }
+
+    #[test]
+    fn layer_resident_mib_is_a_rigel_option_where_zero_is_off_and_minus_one_is_what_is_free() {
+        let on = ServeFlags {
+            engine: Some("rigel".into()),
+            layer_readahead: Some(4),
+            layer_resident_mib: Some(2048),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &on), None, &ServeProfile::default(), (0, 0, 1));
+        r.validate().unwrap();
+        assert!(
+            r.args()
+                .join(" ")
+                .ends_with("--layer-readahead 4 --layer-resident-mib 2048"),
+            "{:?}",
+            r.args()
+        );
+        let auto = ServeFlags {
+            layer_resident_mib: Some(-1),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &auto), None, &ServeProfile::default(), (0, 0, 1));
+        r.validate().unwrap();
+        assert!(
+            r.args().join(" ").ends_with("--layer-resident-mib -1"),
+            "{:?}",
+            r.args()
+        );
+        let off = ServeFlags {
+            layer_resident_mib: Some(0),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &off), None, &ServeProfile::default(), (0, 0, 1));
+        assert!(!r.args().join(" ").contains("resident"));
+        // below -1 means nothing
+        let bad = ServeFlags {
+            layer_resident_mib: Some(-5),
+            ..on.clone()
+        };
+        assert!(validate_flags(&bad, Some(1))
+            .unwrap_err()
+            .contains("layer_resident_mib"));
+        // llama.cpp does not have it
+        let plain = ServeFlags {
+            layer_resident_mib: Some(2048),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &plain), None, &ServeProfile::default(), (0, 0, 1));
+        assert!(r
+            .validate()
+            .unwrap_err()
+            .contains("layer_resident_mib is a Rigel option"));
+    }
+
+    #[test]
     fn rigel_gets_one_slot_its_flags_and_its_cache_variable() {
         let rigel = ServeFlags {
             engine: Some("rigel".into()),
@@ -1667,6 +1892,7 @@ Exiting, please wait...
             moe_pack_dir: Some(PathBuf::from("bundle")),
             moe_profile: Some(PathBuf::from("bundle/profile.bin")),
             moe_cache_mib: Some(4096),
+            layer_readahead: Some(4),
             ..Default::default()
         };
         // the engine in [serving], the options in the model's profile: they still meet
@@ -1696,7 +1922,7 @@ Exiting, please wait...
         r.validate().unwrap();
         assert_eq!(
             r.args().join(" "),
-            "-c 8192 -ngl 999 -np 1 --moe-direct-io --moe-slots 5000 --moe-pack-dir bundle --moe-profile bundle/profile.bin"
+            "-c 8192 -ngl 999 -np 1 --moe-direct-io --moe-slots 5000 --moe-pack-dir bundle --moe-profile bundle/profile.bin --layer-readahead 4"
         );
         assert_eq!(r.env(), [("MOE_CACHE_MIB".to_string(), "4096".to_string())]);
         assert_eq!(Serving::from_resolved(&r).engine, "rigel");
@@ -1750,6 +1976,7 @@ Exiting, please wait...
     #[test]
     fn every_flag_is_built() {
         let f = ServeFlags {
+            paged: None,
             ctx_per_slot: None,
             cache_type_k: Some("q8_0".into()),
             cache_type_v: Some("q4_0".into()),
@@ -1768,6 +1995,8 @@ Exiting, please wait...
             moe_pack_dir: None,
             moe_profile: None,
             moe_cache_mib: None,
+            layer_readahead: None,
+            layer_resident_mib: None,
         };
         let r = Resolved::new(
             (Some(65536), Some(20), Some(3), &f),
