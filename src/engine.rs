@@ -955,6 +955,15 @@ impl Engine {
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
+        // stable-diffusion.cpp's Vulkan cooperative-matrix kernels abort the process (0xC0000409, no message) on the
+        // RX 7900 XTX with the MOSS-Image and Qwen3.5 graphs; the plain kernels render them. A value the owner set wins.
+        if name == "sd-cli" {
+            for var in ["GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2"] {
+                if std::env::var_os(var).is_none() {
+                    cmd.env(var, "1");
+                }
+            }
+        }
         no_window(&mut cmd);
         #[cfg(target_os = "linux")]
         unsafe {

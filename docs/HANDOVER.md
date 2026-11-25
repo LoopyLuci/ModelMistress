@@ -86,7 +86,31 @@ the owner saying yes to the exact file.
   32k context, 1 slot: 20.5 GB held) and `--fit-target` was checked as a lever. The retry ladder itself has **not**
   been seen to run on the real card, because the failures did not recur (the commit headroom was 25 GB at the time).
 
+## Inkling-2-Mini and Qwen3.8-27B BF16 (2026-11-25)
+
+Tried through a scratch hub on the RX 7900 XTX (23280 MiB usable VRAM, about 17 GB free RAM):
+
+- `Inkling-2-Mini-UD-Q8_K_XL.gguf` (22.9 GB, root of unsloth/Inkling-2-Mini-GGUF): **does not load**. The bundled llama.cpp stops with `unknown model architecture: 'inkling2_loop'`. It needs a newer llama.cpp; the repo also has Mainline_Support / Old_Support variants, which were not tried.
+- `Qwen3.8-27B-BF16` (two parts, 54.7 GB, saved in `C:/AIModels/Qwen3.8-27B-BF16`): the hub refuses it with `insufficient_memory`: 23 GB VRAM plus about 27 GB RAM would be needed. Not run from disk (`allow_paged_load` plus a paged profile and `model.load`), because a dense 55 GB model would be far too slow to tell us anything. A Q4/Q5/Q6 quant would fit and has not been downloaded.
+- The `/v1/videos/generations` request with LTX hit the hub's 6 h limit because the machine slept; the direct `sd-cli` LTX run still stands.
+
+## Media models and the chat canvas (2026-11-24)
+
+- Images: MOSS-Image-Base BF16 and MiniMax-H3-Image (UD-Q4_K_XL) render through `sd-cli` of the new
+  `engines/stable-diffusion.cpp` (master-1127-79dc7ca); models and companions live under `D:\cold\x-models\images\`.
+  Details and timings: CHANGELOG (Unreleased) and `docs/images.md`.
+- **Vulkan gotcha:** this card's cooperative-matrix kernels abort `sd-cli` silently (0xC0000409) on these graphs; the hub
+  now sets `GGML_VK_DISABLE_COOPMAT`/`COOPMAT2` for `sd-cli`. If a render dies with no message, run it by hand through
+  PowerShell (`Start-Process`, read `.ExitCode`): the Bash tool shows 127 for it.
+- `--offload-to-cpu` made the compute buffer fail to allocate on the 24 GB card for MOSS; do not add it back for these.
+- The owner's `imageGen/sdxl_*.gguf` files do not load in the new engine **or the old one** (version not detected /
+  wrong tensor shapes); not a regression.
+- Chat canvas: `docs/chat-canvas.md`. Browser check of the canvas against a live hub: see the state of the checks below.
+
 ## State of the checks (update this when you run them)
+
+- 2026-11-24: `npm run check` (typecheck, tests, build) passes. Library tests with the default thread count: 574 passed,
+  12 failed, all in `factory::` ("did not stop") while a 26 GB model load ran; use `--test-threads=3`.
 
 - Full library suite (`cargo test -p model-mistress --lib -- --test-threads=3`) on the finished tree: **577 passed,
   0 failed, 6 ignored** (about 4 minutes). Send its output to a file: through a `grep` pipe it shows nothing until the end.

@@ -18,6 +18,26 @@
   New setting `auto_rigel` (default on): a mixture-of-experts model too big for the card is served by Rigel with paged experts (22 GB model: 65.7 tokens/s in 19 GB of VRAM against 53.7 with llama.cpp's fit);
   a Rigel load wholly on the card gets `-lm none` (RAM 1.8 GB instead of 22.7 GB).
   AirLLM Phase 0 results: [airllm-spike-results](docs/airllm-spike-results.md).
+- **MOSS-Image, MiniMax-H3-Image and LTX-2.5 work in ModelMistress, and the chat has a media canvas** (`src/image.rs`,
+  `src/hub.rs`, `src/engine.rs`, `src/build.rs`, `frontend/src/chat/media.ts`, `frontend/src/components/MediaCanvas.vue`,
+  `ModelViewer.vue`; [images](docs/images.md), [chat-canvas](docs/chat-canvas.md)).
+  - *Engine.* `engines/stable-diffusion.cpp` is at master-1127-79dc7ca. The bundled build turns on WebP and WebM.
+  - *Models.* Companion files are found by name: the MOSS tokenizer (`tokenizer.json`), a Qwen3.5 / Qwen3-VL / Gemma encoder
+  and an audio VAE (`--tokenizer`, `--llm`, `--audio-vae`). MOSS-Image takes 50 steps, guidance 3, shift 5; MiniMax-H3-Image takes
+  6 steps, guidance 1, euler, its own sigma schedule and `--rng cpu` (the request's own values win).
+  Measured on the RX 7900 XTX: MOSS BF16 768 px, 30 steps, 232 s of sampling; MiniMax UD-Q4_K_XL 1024 px, 6 steps, 2.9 s a step.
+  - *Vulkan.* `sd-cli` is started with `GGML_VK_DISABLE_COOPMAT=1` and `GGML_VK_DISABLE_COOPMAT2=1` (unless set): with the
+  cooperative-matrix kernels it aborts without a message (0xC0000409) on the MOSS and Qwen3.5 graphs. `--offload-to-cpu` is no longer
+  passed for these two models (a 1 GB compute buffer failed to allocate with it).
+  - *Video.* `POST /v1/videos/generations` (and `frames`, `fps` on the image request) runs `sd-cli -M vid_gen` and returns a `.webm`
+  with its sound; the file is served as `video/webm`.
+  - *Canvas.* The chat has a Canvas pane: pictures, video, audio, 3D (GLB, glTF, OBJ, STL with three.js, loaded only when one is
+  shown), drawings, PDF, sandboxed pages and text, taken from the messages (markdown pictures, links, bare URLs, fenced
+  `svg` / `html`). Only http(s), data: and hub paths are accepted; pages run with scripts off. The page policy now allows `blob:` for
+  pictures, media, fetches and frames (the canvas shows hub files from blob URLs; it was blocked before), and a file on another site
+  is offered as a link, not loaded. LTX-2.x has sampling presets (distilled: 8 steps, guidance 1; dev: 20 steps, guidance 3).
+  Measured LTX-2.5 distilled Q4_K_M, 25 frames at 512x320 with sound: 387 s of sampling; the Gemma 12B BF16 encoder (26 GB) took 19.7 minutes
+  to encode the prompt on its first run, because it streams through the card in 50 segments.
 
 ## 0.4.2 — 2026-11-23
 

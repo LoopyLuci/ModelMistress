@@ -22,6 +22,14 @@
     <div v-else-if="parts.answer" class="md" @click="onClick" v-html="html"></div>
     <p v-else-if="streaming && !msg.error" class="muted wait">{{ waiting }}</p>
 
+    <div v-if="assets.length" class="assets" aria-label="Media in this reply">
+      <button v-for="a in assets" :key="a.id" class="asset" type="button" :title="`Open ${a.title} in the canvas`" @click="emit('open-asset', a.id)">
+        <img v-if="a.kind === 'image' && !isHubPath(a.src)" :src="a.src" :alt="a.title" loading="lazy" />
+        <span v-else class="glyph" aria-hidden="true">{{ glyph(a.kind) }}</span>
+        <span class="aname">{{ a.title }}</span>
+      </button>
+    </div>
+
     <p v-if="msg.error" class="error-box" role="alert">{{ msg.error }}</p>
     <p v-if="msg.stopped" class="muted small">Stopped.</p>
 
@@ -48,9 +56,13 @@
 import { computed, ref } from 'vue'
 import { renderMarkdown, splitThink } from '@/chat/markdown'
 import type { Msg } from '@/chat/store'
+import { extractAssets, isHubPath, type AssetKind } from '@/chat/media'
 
-const props = defineProps<{ msg: Msg; streaming?: boolean; canRetry?: boolean; waiting?: string }>()
-const emit = defineEmits<{ (e: 'retry'): void }>()
+const props = defineProps<{ msg: Msg; streaming?: boolean; canRetry?: boolean; waiting?: string; index?: number }>()
+const emit = defineEmits<{ (e: 'retry'): void; (e: 'open-asset', id: string): void }>()
+// the same ids the canvas uses: `<message index>-<n>`
+const assets = computed(() => (props.msg.role === 'assistant' ? extractAssets(props.msg.content || '', String(props.index ?? 0)) : []))
+const glyph = (k: AssetKind) => ({ image: 'IMG', video: 'VID', audio: 'AUD', model: '3D', svg: 'SVG', html: 'WEB', pdf: 'PDF', text: 'TXT', file: 'FILE' })[k]
 
 const parts = computed(() => {
   const m = props.msg
@@ -103,6 +115,12 @@ async function onClick(e: MouseEvent) {
 .mini { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font-size: 0.75rem; color: var(--muted); }
 .mini:hover { border-color: var(--accent); color: var(--text); }
 .usertext { white-space: pre-wrap; word-break: break-word; }
+.assets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.asset { display: flex; align-items: center; gap: 6px; max-width: 220px; padding: 3px 8px 3px 3px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; font-size: 0.8rem; color: var(--text); }
+.asset:hover { border-color: var(--accent); }
+.asset img { height: 44px; width: 44px; object-fit: cover; border-radius: 5px; }
+.glyph { display: inline-flex; align-items: center; justify-content: center; height: 44px; width: 44px; border-radius: 5px; background: var(--bg); font-size: 0.7rem; color: var(--muted); }
+.aname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .imgs img { max-height: 140px; max-width: 100%; border-radius: 8px; border: 1px solid var(--border); }
 .think { margin: 4px 0 8px; border: 1px dashed var(--border); border-radius: 8px; padding: 4px 10px; color: var(--muted); }

@@ -136,6 +136,7 @@ fn peer_route(path: &str) -> bool {
             | "/v1/audio/transcriptions"
             | "/v1/audio/translations"
             | "/v1/images/generations"
+            | "/v1/videos/generations"
             | "/v1/images/edits"
             | "/v1/vision/classify"
             | "/v1/vision/detect"
@@ -1255,9 +1256,13 @@ async fn run_image(
         Some(s) if s >= 0 => s,
         _ => rand::random::<u32>() as i64,
     };
-    let pattern = std::path::absolute(&dir)
-        .unwrap_or(dir)
-        .join(format!("image-{}_%d.png", uuid::Uuid::new_v4().simple()));
+    // a video is one WebM file (with its sound); images are numbered PNGs
+    let name = if req.frames.is_some() {
+        format!("video-{}.webm", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("image-{}_%d.png", uuid::Uuid::new_v4().simple())
+    };
+    let pattern = std::path::absolute(&dir).unwrap_or(dir).join(name);
     let args_for = |cpu: bool| image::tool_args(&model, req, seed, &pattern, cpu);
     let _one_at_a_time = e.tool_lock.lock().await;
     let t0 = Instant::now();
@@ -1308,7 +1313,7 @@ fn sweep_generated(dir: &std::path::Path) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > day);
-        if old && f.path().extension().is_some_and(|x| x == "png") {
+        if old && f.path().extension().is_some_and(|x| x == "png" || x == "webm") {
             let _ = std::fs::remove_file(f.path());
         }
     }
@@ -2000,12 +2005,32 @@ async fn image_generations(
 
 /// `GET /v1/images/files/{name}`: an image that a `url` answer points to (they are removed after a day).
 async fn image_file(State(hub): State<Hub>, Path(name): Path<String>) -> ApiResult<Response> {
-    let ok = name.ends_with(".png") && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    let video = name.ends_with(".webm");
+    let ok = (name.ends_with(".png") || video) && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
     if !ok || name.contains("..") {
         return Err(Fail::not_found("no such image").into());
     }
     let bytes = std::fs::read(hub.engine.generated_dir().join(&name)).map_err(|_| Fail::not_found("no such image"))?;
-    Ok(([("content-type", "image/png")], bytes).into_response())
+    Ok((
+        [("content-type", if video { "video/webm" } else { "image/png" })],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /v1/videos/generations`: like the image route, for a video model: `frames` (default 49) and `fps` (default 24) in,
+/// a WebM with sound out (as base64 or as a url of `/v1/images/files/`).
+async fn video_generations(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> ApiResult<Response> {
+    if let Some(o) = body.as_object_mut() {
+        o.entry("frames").or_insert(json!(49));
+        o.entry("n").or_insert(json!(1));
+    }
+    image_generations(State(hub), Extension(who), headers, Json(body)).await
 }
 
 /// `POST /v1/images/edits`: not available. sd.cpp's image-to-image and inpainting exist, but OpenAI's mask marks the
@@ -2165,6 +2190,7 @@ pub fn router(hub: Hub) -> Router {
         .route("/rerank", post(rerank))
         .route("/v1/audio/speech", post(speech))
         .route("/v1/images/generations", post(image_generations))
+        .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))
         .route("/v1/images/files/:name", get(image_file))
         .route(

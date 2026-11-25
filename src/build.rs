@@ -109,15 +109,15 @@ fn main() {
     }
 
     // stable-diffusion.cpp: a CMake project of its own, with its own copy of ggml (it patches it), so the two never
-    // share a library or a symbol. Only the command line program is built; WebP and WebM output are off (PNG only).
+    // share a library or a symbol. Only the command line program is built; WebP and WebM output are on (PNG images, WebM video with sound).
     let build = out.join("stable-diffusion.cpp-build");
     check_path_depth(&out);
     let mut flags: Vec<String> = vec![
         "-DGGML_NATIVE=OFF".into(),
         "-DGGML_OPENMP=OFF".into(),
         "-DSD_BUILD_EXAMPLES=ON".into(),
-        "-DSD_WEBP=OFF".into(),
-        "-DSD_WEBM=OFF".into(),
+        "-DSD_WEBP=ON".into(),
+        "-DSD_WEBM=ON".into(),
         "-DSD_SERVER_BUILD_FRONTEND=OFF".into(), // sd-server's web UI needs pnpm and a download; only sd-cli is used
     ];
     flags.extend(match backend.as_str() {

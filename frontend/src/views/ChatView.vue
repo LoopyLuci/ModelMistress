@@ -1,5 +1,5 @@
 <template>
-  <div class="chat" :class="{ side: sideOpen }">
+  <div class="chat" :class="{ side: sideOpen, withcanvas: canvasOpen }">
     <aside class="list" aria-label="Conversations">
       <div class="row lh">
         <button class="btn primary grow" type="button" @click="startNew">New chat</button>
@@ -40,6 +40,7 @@
         <span v-if="cur?.vision" class="pill">vision</span>
         <span class="grow"></span>
         <label class="row small" title="Record every token and its alternatives for this chat's replies"><input v-model="conv.trace" type="checkbox" /> trace replies</label>
+        <button class="btn" type="button" :aria-pressed="canvasOpen" :title="assets.length ? 'Pictures, video, audio, 3D and files from this chat' : 'Nothing to show yet'" @click="canvasOpen = !canvasOpen">Canvas<span v-if="assets.length" class="count"> {{ assets.length }}</span></button>
         <button class="btn" type="button" :aria-expanded="showSettings" @click="showSettings = !showSettings">Settings</button>
       </header>
 
@@ -81,7 +82,9 @@
           :streaming="busy && i === conv.messages.length - 1 && m.role === 'assistant'"
           :waiting="waiting"
           :can-retry="!busy && i === conv.messages.length - 1 && m.role === 'assistant'"
+          :index="i"
           @retry="retry"
+          @open-asset="openAsset"
         />
       </div>
 
@@ -100,6 +103,8 @@
       </form>
     </section>
 
+    <MediaCanvas v-if="conv && canvasOpen" class="canvaspane" :assets="assets" :active-id="activeAsset" @close="canvasOpen = false" @select="activeAsset = $event" />
+
     <ConfirmDialog :open="!!askDelete" title="Delete this conversation?" action="Delete" @confirm="doDelete" @cancel="askDelete = ''">
       It is removed from this browser; nothing else is affected.
     </ConfirmDialog>
@@ -110,7 +115,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import MessageView from '@/components/MessageView.vue'
+import MediaCanvas from '@/components/MediaCanvas.vue'
 import RouterStrip from '@/components/RouterStrip.vue'
+import { conversationAssets } from '@/chat/media'
 import { useRoute, useRouter } from 'vue-router'
 import { call } from '@/transport'
 import { splitThink } from '@/chat/markdown'
@@ -132,6 +139,27 @@ const busy = ref(false)
 const error = ref('')
 const sideOpen = ref(false)
 const showSettings = ref(false)
+const canvasOpen = ref(false)
+const activeAsset = ref('')
+/** Everything in the conversation that is not text; the canvas shows it, whichever model made it. */
+const assets = computed(() => conversationAssets(conv.value?.messages || []))
+function openAsset(id: string) {
+  activeAsset.value = id
+  canvasOpen.value = true
+}
+// a new picture, video, sound or model that a reply produces opens in the canvas by itself, once
+let seenAssets = 0
+watch(
+  () => assets.value.length,
+  (n) => {
+    if (n > seenAssets && !busy.value) {
+      activeAsset.value = assets.value[n - 1].id
+      canvasOpen.value = true
+    }
+    seenAssets = n
+  },
+)
+watch(() => conv.value?.id, () => { seenAssets = assets.value.length; activeAsset.value = '' })
 const askDelete = ref('')
 const renaming = ref('')
 const renameText = ref('')
@@ -470,6 +498,9 @@ watch(
 
 <style scoped>
 .chat { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100%; min-height: 0; }
+.chat.withcanvas { grid-template-columns: 260px minmax(0, 1fr) minmax(320px, 42%); }
+.canvaspane { min-height: 0; }
+.count { color: var(--accent); font-weight: 600; }
 .list { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
 .lh { padding: 10px; flex: none; }
 .closer, .menu { display: none; }
@@ -502,7 +533,8 @@ watch(
 .thumb img { height: 56px; border-radius: 6px; border: 1px solid var(--border); display: block; }
 .thumb button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); background: var(--panel); line-height: 1; font-size: 0.7rem; }
 @media (max-width: 800px) {
-  .chat { grid-template-columns: minmax(0, 1fr); }
+  .chat, .chat.withcanvas { grid-template-columns: minmax(0, 1fr); }
+  .canvaspane { position: fixed; inset: 8% 0 0 0; z-index: 30; border-top: 1px solid var(--border); box-shadow: 0 -2px 14px rgba(0, 0, 0, 0.3); }
   .list { position: fixed; inset: 0 25% 0 0; z-index: 20; transform: translateX(-102%); transition: transform 0.15s; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.3); }
   .chat.side .list { transform: none; }
   .closer, .menu { display: inline-block; }
