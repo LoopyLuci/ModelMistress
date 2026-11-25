@@ -2076,11 +2076,24 @@ impl Engine {
         self.learned
             .lock()
             .get(&entry.id)
-            .filter(|l| !key.is_empty() && l.engine == key)
+            .filter(|l| !key.is_empty() && l.engine == key && !l.safe_kernels)
             .map(|l| l.why.clone())
     }
 
+    /// Whether an earlier load of this model crashed on the GPU and worked with the cooperative-matrix kernels off.
+    fn learned_safe_kernels(&self, entry: &ModelEntry, r: &Resolved) -> bool {
+        let key = self.engine_key(r);
+        self.learned
+            .lock()
+            .get(&entry.id)
+            .is_some_and(|l| !key.is_empty() && l.engine == key && l.safe_kernels)
+    }
+
     fn learn(&self, entry: &ModelEntry, r: &Resolved, why: String) {
+        self.learn_as(entry, r, why, false);
+    }
+
+    fn learn_as(&self, entry: &ModelEntry, r: &Resolved, why: String, safe_kernels: bool) {
         let mut all = self.learned.lock();
         all.insert(
             entry.id.clone(),
@@ -2088,6 +2101,7 @@ impl Engine {
                 engine: self.engine_key(r),
                 why,
                 at: now_s(),
+                safe_kernels,
             },
         );
         save_learned(&self.home, &all);
@@ -2313,11 +2327,27 @@ impl Engine {
         }
         let mut history: Vec<String> = vec![];
         let mut crash_why: Option<String> = None;
+        // Vulkan's cooperative-matrix kernels crash some graphs in the driver (measured: MOSS-Image, Qwen3.5 and
+        // Inkling 2 on an RX 7900 XTX abort with 0xC0000409 and no message). A GPU crash gets one more try on the GPU
+        // with them off before the CPU; it is remembered, so the next load starts that way.
+        let mut safe_kernels = false;
+        let mut safe_from_crash: Option<String> = None;
+        if how == Try::Asked && r.is_auto() && s.gpu_fallback && !opts.retry_gpu && self.learned_safe_kernels(entry, &r)
+        {
+            safe_kernels = true;
+            note = Some(
+                "on the GPU with Vulkan's cooperative-matrix kernels off: an earlier load crashed with them on. Load it \
+                 with retry_gpu: true to try them again"
+                    .into(),
+            );
+        }
         loop {
-            match self.spawn(entry, opts, &how, counted).await {
+            match self.spawn(entry, opts, &how, counted, safe_kernels).await {
                 Ok(inst) => {
                     if let (Some(why), Try::Cpu) = (&crash_why, &how) {
                         self.learn(entry, &r, why.clone());
+                    } else if let (Some(why), true) = (&safe_from_crash, how != Try::Cpu) {
+                        self.learn_as(entry, &r, why.clone(), true);
                     } else if opts.retry_gpu && how != Try::Cpu {
                         self.forget(&entry.id);
                     }
@@ -2336,6 +2366,24 @@ impl Engine {
                     return Ok(inst);
                 }
                 Err(mut f) => {
+                    if !safe_kernels
+                        && s.gpu_fallback
+                        && how != Try::Cpu
+                        && r.gpu_layers != 0
+                        && f.fields["gpu_failure"].as_str() == Some("crash")
+                    {
+                        let code = f.fields["exit_code"]
+                            .as_i64()
+                            .map(|c| format!(" (exit {:#X})", c as i32 as u32))
+                            .unwrap_or_default();
+                        let why = format!("its load on the GPU crashed llama-server{code}");
+                        history.push(format!(
+                            "{why}, so it was tried again with Vulkan's cooperative-matrix kernels off"
+                        ));
+                        safe_kernels = true;
+                        safe_from_crash = Some(why);
+                        continue;
+                    }
                     let Some((next, why, crash)) = self
                         .after_failure(&s, &r, entry, &how, &f, &ground, history.len())
                         .await
@@ -2411,7 +2459,14 @@ impl Engine {
         Some((Try::Cpu, cause, crash))
     }
 
-    async fn spawn(&self, entry: &ModelEntry, opts: &LoadOpts, how: &Try, gpu_counted: bool) -> Result<Instance> {
+    async fn spawn(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        how: &Try,
+        gpu_counted: bool,
+        safe_kernels: bool,
+    ) -> Result<Instance> {
         let mut resolved = self.resolve_serving(&self.settings(), entry, opts);
         resolved
             .validate()
@@ -2597,6 +2652,15 @@ impl Engine {
         if rigel {
             if let Some(path) = hip_runtime_path(std::env::var_os("HIP_PATH"), std::env::var_os("PATH")) {
                 cmd.env("PATH", path);
+            }
+        }
+        // a GPU load that crashed the server once: Vulkan's cooperative-matrix kernels off (the variables mean nothing
+        // to a server built for another backend)
+        if safe_kernels && resolved.gpu_layers != 0 {
+            for var in ["GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2"] {
+                if std::env::var_os(var).is_none() {
+                    cmd.env(var, "1");
+                }
             }
         }
         no_window(&mut cmd);
@@ -3060,6 +3124,10 @@ struct Learned {
     engine: String,
     why: String,
     at: u64,
+    /// The load crashed on the GPU, and worked there with Vulkan's cooperative-matrix kernels off: the model stays on
+    /// the GPU, started that way, instead of going to the CPU.
+    #[serde(default)]
+    safe_kernels: bool,
 }
 
 fn load_learned(home: &Path) -> BTreeMap<String, Learned> {
@@ -4173,6 +4241,7 @@ parallel = 1
                  if \"%1\"==\"--help\" goto help\r\n\
                  if \"%1\"==\"--list-devices\" exit /b 0\r\n\
                  echo %* >>\"%~dp0calls.txt\"\r\n\
+                 echo coopmat=%GGML_VK_DISABLE_COOPMAT% >>\"%~dp0env.txt\"\r\n\
                  echo %* | findstr /C:\"-dev none\" >nul\r\n\
                  if not errorlevel 1 exit /b 3\r\n\
                  if exist \"%~dp0oom\" (echo ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory& exit /b 1)\r\n\
@@ -4194,6 +4263,7 @@ parallel = 1
                  case \"$1\" in --help) echo '--fit --device'; exit 0;; --list-devices) exit 0;; esac\n\
                  here=$(dirname \"$0\")\n\
                  echo \"$@\" >> \"$here/calls.txt\"\n\
+                 echo \"coopmat=$GGML_VK_DISABLE_COOPMAT\" >> \"$here/env.txt\"\n\
                  case \"$*\" in *'-dev none'*) exit 3;; esac\n\
                  if [ -e \"$here/oom\" ]; then echo 'ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory'; exit 1; fi\n\
                  kill -SEGV $$\n",
@@ -4207,6 +4277,16 @@ parallel = 1
     /// The starts the stand-in has seen, one line each.
     fn starts(dir: &Path) -> Vec<String> {
         std::fs::read_to_string(dir.join("calls.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// What each start of the stand-in saw of `GGML_VK_DISABLE_COOPMAT`, one line each (`coopmat=` when unset).
+    fn coopmat_seen(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("env.txt"))
             .unwrap_or_default()
             .lines()
             .map(|l| l.trim().to_string())
@@ -4245,14 +4325,25 @@ parallel = 1
             f.message
         );
         assert!(
-            f.message
-                .contains("(before this: its load on the GPU crashed llama-server (exit 0xC0000409))")
-                || cfg!(not(windows)),
+            f.message.contains(
+                concat!(
+                    "(before this: its load on the GPU crashed llama-server (exit 0xC0000409), so it was tried again ",
+                    "with Vulkan's cooperative-matrix kernels off; its load on the GPU crashed llama-server (exit 0xC0000409))"
+                )
+            ) || cfg!(not(windows)),
             "{}",
             f.message
         );
         let seen = starts(&d);
-        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        // the same GPU start twice, the second with the cooperative-matrix kernels off, then the CPU
+        assert_eq!(coopmat_seen(&d), ["coopmat=", "coopmat=1", "coopmat="]);
+        let without_port = |l: &str| {
+            l.split(" --port ")
+                .map(|p| p.split_once(' ').map_or("", |x| x.1).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_port(&seen[0]), without_port(&seen[1]), "{seen:?}");
         // first as asked: llama-server fits the layers itself, keeping the margin free
         let margin = e.settings().vram_margin_mib.max(512);
         assert!(
@@ -4267,14 +4358,35 @@ parallel = 1
         );
         // then nothing on the GPU, and no GPU backend either
         assert!(
-            seen[1].contains("-ngl 0") && seen[1].contains("-dev none"),
+            seen[2].contains("-ngl 0") && seen[2].contains("-dev none"),
             "{}",
-            seen[1]
+            seen[2]
         );
-        assert!(!seen[1].contains("--fit"), "{}", seen[1]);
+        assert!(!seen[2].contains("--fit"), "{}", seen[2]);
         // a crash is remembered only when the CPU start worked, and here it did not
         assert!(!d.join("placements.json").exists());
         assert_eq!(e.loaded().len(), 0);
+    }
+
+    /// A model that worked on the GPU only with the cooperative-matrix kernels off keeps starting that way, and is
+    /// not sent to the CPU; a CPU placement is a different thing and stays one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_that_needs_the_kernels_off_is_remembered_as_that_and_not_as_a_cpu_model() {
+        let d = crate::testing::TestDir::new("mm-ladder-safe");
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        assert!(!e.learned_safe_kernels(&entry, &r));
+        e.learn_as(&entry, &r, "crashed".into(), true);
+        assert!(e.learned_safe_kernels(&entry, &r));
+        assert_eq!(e.learned_why(&entry, &r), None);
+        e.learn(&entry, &r, "crashed".into());
+        assert!(!e.learned_safe_kernels(&entry, &r));
+        assert_eq!(e.learned_why(&entry, &r).as_deref(), Some("crashed"));
+        // a placements.json from before the field existed is a CPU placement
+        let old = r#"{"m": {"engine": "x", "why": "w", "at": 1}}"#;
+        std::fs::write(d.join("placements.json"), old).unwrap();
+        assert!(load_learned(&d).values().all(|l| !l.safe_kernels && l.why == "w"));
     }
 
     /// An out-of-memory error first gets more room on the GPU, and only then the CPU.
@@ -4682,16 +4794,19 @@ parallel = 1
             "{}",
             seen[0]
         );
-        // retry_gpu: the GPU first (it crashes again), then the CPU
+        // retry_gpu: the GPU first (it crashes), the GPU again with the cooperative-matrix kernels off (it crashes
+        // again), then the CPU
         let opts = LoadOpts {
             retry_gpu: true,
             ..Default::default()
         };
         assert!(e.ensure_loaded(&entry, &opts, true).await.is_err());
         let seen = starts(&d);
-        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen.len(), 4, "{seen:?}");
         assert!(seen[1].contains("--fit on"), "{}", seen[1]);
-        assert!(seen[2].contains("-dev none"), "{}", seen[2]);
+        assert!(seen[2].contains("--fit on"), "{}", seen[2]);
+        assert!(seen[3].contains("-dev none"), "{}", seen[3]);
+        assert_eq!(coopmat_seen(&d), ["coopmat=", "coopmat=", "coopmat=1", "coopmat="]);
     }
 
     /// A tool (speech, images) that failed on the GPU for the GPU's reasons is run again on the CPU, once.

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **llama.cpp b12726 (Inkling 2), and a GPU crash gets a second try with the Vulkan cooperative-matrix kernels off**
+  (`engines/llama.cpp`, `engines/patches/mm-routing.patch`, `src/engine.rs`). The pinned llama.cpp moved from 7fee17846 to
+  the tag b12726, which runs `inkling2_loop`; the routing patch was re-based. A load that crashes llama-server on the GPU
+  with 0xC0000409 is started once more on the GPU with `GGML_VK_DISABLE_COOPMAT` and `GGML_VK_DISABLE_COOPMAT2` set, and only
+  then goes to the CPU; a model that works that way is remembered (`placements.json`: `safe_kernels`) and stays on the GPU.
+  Measured on an RX 7900 XTX: Inkling-2-Mini-UD-Q8_K_XL 38.2 tokens/s on the GPU, 3.0 on the CPU it used to land on.
+
 - **A model bigger than the memory can be loaded from disk, on purpose** (`src/serving.rs`, `src/engine.rs`; [serving](docs/serving.md)).
   New setting `allow_paged_load` (default off) and profile field `paged`: with both, a model that fits neither the GPU nor
   RAM is placed as `paged` (`model.plan` says `where: paged`) instead of refused, and `model.load` starts it with a

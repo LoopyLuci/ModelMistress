@@ -1,9 +1,9 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fbfcbe5..8db7a22 100644
+index a9040260c..d41ba5e61 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -18,6 +18,9 @@
- #include "mtmd-helper.h"
+@@ -25,6 +25,9 @@
+ #include "base64.hpp"
  
  #include <algorithm>
 +#include <atomic>
@@ -11,8 +11,8 @@ index fbfcbe5..8db7a22 100644
 +#include <map>
  #include <cstddef>
  #include <cinttypes>
- #include <exception>
-@@ -38,6 +41,104 @@
+ #include <deque>
+@@ -46,6 +49,104 @@
  
  constexpr int HTTP_POLLING_SECONDS = 1;
  
@@ -115,9 +115,9 @@ index fbfcbe5..8db7a22 100644
 +};
 +
  static common_speculative_output_limits server_output_limits(const common_params & params) {
-     if (params.embedding ||
-             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-@@ -866,6 +967,8 @@ private:
+     if (!params.mmproj.path.empty()) {
+         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+@@ -1101,6 +1202,8 @@ private:
  
      server_batch batch;
  
@@ -126,7 +126,7 @@ index fbfcbe5..8db7a22 100644
      llama_model   * model_dft = nullptr;
      llama_context * ctx_dft   = nullptr;
  
-@@ -1077,6 +1180,9 @@ private:
+@@ -1323,6 +1426,9 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -136,7 +136,7 @@ index fbfcbe5..8db7a22 100644
          llama_init = common_init_from_params(params_base);
  
          model_tgt = llama_init->model();
-@@ -2055,8 +2161,8 @@ private:
+@@ -2360,8 +2466,8 @@ private:
          res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
  
          // populate res.probs_output
@@ -147,7 +147,7 @@ index fbfcbe5..8db7a22 100644
          }
  
          // populate timings if this is final response or timings_per_token is enabled
-@@ -2125,6 +2231,17 @@ private:
+@@ -2442,6 +2548,17 @@ private:
              }
          }
  
@@ -165,7 +165,7 @@ index fbfcbe5..8db7a22 100644
          res->generation_params = slot.task->params; // copy the parameters
  
          queue_results.send(std::move(res));
-@@ -3659,12 +3776,24 @@ private:
+@@ -4659,12 +4776,24 @@ private:
          // yield to the queue, so we can still handle metrics tasks while decoding
          // note: the sync is done here too, so that the wait is also covered by the yield
          int ret = 0;
@@ -190,7 +190,7 @@ index fbfcbe5..8db7a22 100644
  
          if (ret != 0) {
              {
-@@ -3863,6 +3992,20 @@ private:
+@@ -4872,6 +5001,20 @@ private:
                  populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
              }
  
@@ -212,10 +212,10 @@ index fbfcbe5..8db7a22 100644
                  // release slot because of stop condition
                  slot.print_timings();
 diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
-index 27ecafb..75f099a 100644
+index ccae2458b..c197fd1aa 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
-@@ -37,6 +37,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+@@ -39,6 +39,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
      add((new field_bool("return_progress", params.return_progress))
          ->set_desc("Include prompt processing progress events in stream mode"));
  
@@ -226,10 +226,10 @@ index 27ecafb..75f099a 100644
          ->set_hard_limits(-1, INT32_MAX)
          ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 0d3beb3..0d44311 100644
+index 595e57ffb..21e501a98 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
-@@ -261,6 +261,18 @@ static inline std::string stop_type_to_str(stop_type type) {
+@@ -253,6 +253,18 @@ static inline std::string stop_type_to_str(stop_type type) {
  // completion_token_output
  //
  
@@ -248,7 +248,7 @@ index 0d3beb3..0d44311 100644
  json completion_token_output::to_json(bool post_sampling_probs) const {
      json probs_for_token = json::array();
      for (const auto & p : probs) {
-@@ -436,6 +448,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
+@@ -428,6 +440,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
          };
      }
  
@@ -263,7 +263,7 @@ index 0d3beb3..0d44311 100644
      std::time_t t = std::time(0);
  
      json res = json {
-@@ -1142,10 +1162,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
+@@ -1145,10 +1165,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
          add_delta(server_chat_msg_diff_to_json_oaicompat(diff));
      }
  
@@ -283,10 +283,10 @@ index 0d3beb3..0d44311 100644
              last_json.at("choices").at(0)["logprobs"] = json {
                  {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143..b28dafe 100644
+index 234cd36e1..672d82694 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -53,6 +53,7 @@ struct task_params {
+@@ -80,6 +80,7 @@ struct task_params {
      bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
      bool return_tokens   = false;
      bool return_progress = false;
@@ -294,7 +294,7 @@ index 9c99143..b28dafe 100644
  
      int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
  
-@@ -307,6 +308,16 @@ struct completion_token_output {
+@@ -399,6 +400,16 @@ struct completion_token_output {
      };
      std::vector<prob_info> probs;
  
@@ -311,7 +311,7 @@ index 9c99143..b28dafe 100644
      json to_json(bool post_sampling_probs) const;
  
      static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
-@@ -337,6 +348,7 @@ struct server_task_result_cmpl_final : server_task_result {
+@@ -429,6 +440,7 @@ struct server_task_result_cmpl_final : server_task_result {
  
      bool post_sampling_probs;
      std::vector<completion_token_output> probs_output;
