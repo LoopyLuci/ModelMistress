@@ -92,6 +92,7 @@ Tried through a scratch hub on the RX 7900 XTX (23280 MiB usable VRAM, about 17 
 
 - `Inkling-2-Mini-UD-Q8_K_XL.gguf` (22.9 GB, root of unsloth/Inkling-2-Mini-GGUF): **does not load**. The bundled llama.cpp stops with `unknown model architecture: 'inkling2_loop'`. It needs a newer llama.cpp; the repo also has Mainline_Support / Old_Support variants, which were not tried.
 - `Qwen3.8-27B-BF16` (two parts, 54.7 GB, saved in `C:/AIModels/Qwen3.8-27B-BF16`): the hub refuses it with `insufficient_memory`: 23 GB VRAM plus about 27 GB RAM would be needed. Not run from disk (`allow_paged_load` plus a paged profile and `model.load`), because a dense 55 GB model would be far too slow to tell us anything. A Q4/Q5/Q6 quant would fit and has not been downloaded.
+- Replaced the BF16 with `Huihui-Qwen3.8-27B-abliterated-UD-Q8_K_XL.gguf` (31.5 GB, huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF, in `C:/AIModels/Huihui-Qwen3.8-27B-abliterated-UD-Q8_K_XL`; the BF16 files were deleted at the owner's say-so). It **loads and answers** through the hub with the bundled llama-server: the hub started it with `--fit on --fit-target 901 -c 8192 -np 2` (card plus RAM split). Measured: first load plus a 40-token reply 130 s; generation 3.6 tokens/s, prompt 17.5 tokens/s (199-token reply). It thinks before it answers (`reasoning_content`) unless `enable_thinking` is false.
 - The `/v1/videos/generations` request with LTX hit the hub's 6 h limit because the machine slept; the direct `sd-cli` LTX run still stands.
 
 ## Media models and the chat canvas (2026-11-24)
