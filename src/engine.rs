@@ -137,6 +137,10 @@ pub struct Settings {
     /// that has room as it takes to fit (the free VRAM extends the RAM, and those layers run on the GPU too). A model
     /// that fits in RAM stays on the CPU. Off: it is read from disk as it runs, as before.
     pub vram_extends_ram: bool,
+    /// A mixture-of-experts model that does not fit the card whole is served by Rigel with paged experts, when Rigel is
+    /// installed and neither the profile nor the load names an engine or where the experts go. Rigel's paging measured
+    /// 2 to 3 times the speed of llama.cpp's `--cpu-moe` at the same VRAM. Off: llama.cpp, as before.
+    pub auto_rigel: bool,
     /// Give each llama-server a thread count (`-t`) that leaves the cores a CPU model and a GPU model both need (see
     /// [`serving::thread_budget`]). A thread setting of a profile, a load or `extra_args` wins. Off: llama-server's own
     /// default (all physical cores) for every server.
@@ -225,6 +229,7 @@ impl Default for Settings {
             vram_reserve_mib: 2048,
             allow_paged_load: false,
             vram_extends_ram: true,
+            auto_rigel: true,
             thread_budget: true,
             autoload: true,
             load_timeout_s: 300,
@@ -1900,6 +1905,39 @@ impl Engine {
         self.server_has_flag(&exe, "--fit").await
     }
 
+    /// Whether a load should go to Rigel with paged experts, and with how many VRAM slots: a mixture-of-experts model
+    /// that does not fit the card whole, where nothing says where its experts go (see [`Settings::auto_rigel`]).
+    async fn auto_rigel(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<(u64, String)> {
+        if r.gpu_layers == 0 || opts.cpu_moe.is_some() || opts.n_cpu_moe.is_some() || self.rigel_server().is_none() {
+            return None;
+        }
+        let count = entry.experts()?;
+        let shape = serving::shape_from_meta(&entry.meta, entry.size_bytes)?;
+        if shape.expert_share <= 0.0 {
+            return None;
+        }
+        let devices = self.gpu_devices_recent().await;
+        if devices.is_empty()
+            || !matches!(
+                self.placement_for(entry, opts, &devices)?,
+                serving::Fit::Split { .. } | serving::Fit::Cpu
+            )
+        {
+            return None;
+        }
+        let mut paged = r.clone();
+        paged.flags.engine = Some("rigel".into());
+        paged.flags.moe_direct_io = Some(true);
+        paged.gpu_layers = 999;
+        let est = self.estimate_for(entry, opts, &paged)?;
+        let budget = self.plannable_free(&devices, &self.settings(), &entry.id);
+        let slots = serving::paged_slots(&shape, count, &est, budget)?;
+        Some((
+            slots,
+            format!("a mixture-of-experts model too big for the card: served by Rigel with {slots} expert slots in VRAM (auto_rigel)"),
+        ))
+    }
+
     /// Layers to put on the card for a load that was to run on the CPU but does not fit the free RAM (see
     /// [`Settings::vram_extends_ram`] and [`serving::spill_layers`]). None: it fits, or no card can take any.
     async fn vram_spill(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<i32> {
@@ -2372,6 +2410,17 @@ impl Engine {
         if *how == Try::Cpu {
             resolved.gpu_layers = 0;
         }
+        let mut spill_note = None;
+        // a mixture-of-experts model too big for the card goes to Rigel, which pages its experts through VRAM slots
+        if self.settings().auto_rigel && resolved.flags.engine.is_none() && !opts.embeddings && !opts.reranking {
+            if let Some((slots, note)) = self.auto_rigel(entry, opts, &resolved).await {
+                resolved.flags.engine = Some("rigel".into());
+                resolved.flags.moe_direct_io = Some(true);
+                resolved.flags.moe_slots = Some(slots as u32);
+                resolved.slots = 1;
+                spill_note = Some(note);
+            }
+        }
         let rigel = resolved.flags.is_rigel();
         if !resolved.flags.is_prism() && !rigel {
             // ternary weights on a llama.cpp that predates their kernels load without an error and answer wrongly
@@ -2419,7 +2468,6 @@ impl Engine {
         };
         let s = self.settings();
         // a CPU load that does not fit the free RAM borrows the card's free memory for the layers that do not fit
-        let mut spill_note = None;
         if resolved.gpu_layers == 0 && *how != Try::Cpu && !opts.embeddings && !opts.reranking {
             if let Some(n) = self.vram_spill(entry, opts, &resolved).await {
                 spill_note = Some(format!(
@@ -2470,6 +2518,26 @@ impl Engine {
         {
             args.extend(["-lm".into(), "none".into()]);
         }
+        // Rigel wholly on the card keeps its weights in VRAM only (measured, 22 GB MoE: 1.8 GB of RAM against 22.7 GB,
+        // 60.5 against 54.1 tokens/s). Not with paged experts: they need the memory map.
+        if rigel
+            && resolved.flags.moe_direct_io != Some(true)
+            && resolved.gpu_layers >= 999
+            && !s
+                .extra_args
+                .iter()
+                .chain(opts.extra_args.iter())
+                .any(|a| a == "-lm" || a == "--load-mode")
+            && self.server_has_flag(&exe, "--load-mode").await
+        {
+            let devices = self.gpu_devices_recent().await;
+            if matches!(
+                self.placement_for(entry, opts, &devices),
+                Some(serving::Fit::Gpu) | Some(serving::Fit::GpuAfter(..))
+            ) {
+                args.extend(["-lm".into(), "none".into()]);
+            }
+        }
         args.push("--metrics".into());
         let user_threads =
             opts.threads.is_some() || serving::sets_threads(&s.extra_args) || serving::sets_threads(&opts.extra_args);
@@ -2480,7 +2548,10 @@ impl Engine {
                 args.extend(["-t".into(), t.to_string()]);
             }
         }
-        args.extend(moe_args(entry, opts));
+        // paged Rigel places the experts itself: `--cpu-moe` on top would take them off the card for good
+        if !(rigel && resolved.flags.moe_direct_io == Some(true)) {
+            args.extend(moe_args(entry, opts));
+        }
         if opts.reranking {
             args.push("--reranking".into());
         } else if opts.embeddings {

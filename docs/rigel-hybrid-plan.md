@@ -168,6 +168,25 @@ system cache could take, and the interleaved three-round batch was stopped after
 down to 0.1 GB (one VirtualLock failed on 126 MiB with "paging file too small", and the first capped run timed out at 500 s). Everything was cleaned
 up. To repeat it: cap the server, keep the holder from taking more than the commit headroom allows (it must stop at 8 GB or more free commit).
 
+## Largest model on the machine, 2026-11-24: Dusty-1.0 Q8_0 (22.1 GB MoE) on the RX 7900 XTX
+4096 context, 64 tokens of a repetitive prompt (which probably flatters paging), single runs. Rigel unless marked.
+
+| Setup | tokens/s | VRAM | RAM (working set) |
+|---|---|---|---|
+| llama.cpp `--fit` | 53.7 | 21.6 GB | 22.2 GB |
+| `--fit` | 54.1 | 22.6 GB | 22.7 GB |
+| `--fit` with `-lm none` | 60.5 | 22.6 GB | 1.8 GB |
+| paged experts, 1536 slots | 65.7 | 19.0 GB | 8.7 GB |
+| paged experts, 1024 slots | 35.8 | 14.4 GB | 8.7 GB |
+| paged experts, 512 slots | 21.6 | 10.6 GB | 8.9 GB |
+| `--fit-target 12000` | 20.5 | 12.6 GB | 19.5 GB |
+| `--cpu-moe` (llama.cpp 16.3) | 15.1 | 5.0 GB | 16.7 GB |
+| paged 1536 slots with `-lm none` | 15.1 | 5.0 GB | 20.0 GB (paging is off: it needs the memory map) |
+
+Paged Rigel was the fastest and used less VRAM than the plain fit; `-lm none` is the smallest in RAM. The hub now uses both: `-lm none` for a Rigel load wholly on the
+card, and the setting `auto_rigel` (default on) serves a mixture-of-experts model that does not fit the card whole with Rigel's paged experts, `--moe-slots` sized by
+`serving::paged_slots` from the VRAM left (about 8.3 MiB a slot here), unless the profile names an engine or where the experts go. Misty gets this through the engine. **Checked through a scratch hub:** Dusty with no profile was started as `-ngl 999 --moe-direct-io --moe-slots 1775`, engine `rigel`, 21.4 GB of VRAM, 48 tokens in 0.9 s. Known gaps: the VRAM estimate of a paged load leaves the slots out (it said 2 GB, the load held 21 GB), so the planner under-counts a paged model, and the Models-page label (`hardware`) still says llama.cpp before the load.
+
 ## GPU and CPU together, 2026-11-24
 `--fit` works in Rigel (HIP): `Qwen3.5-9B-Q4_K_M`, with `--fit on --fit-target 20500` (3.9 GB of the 24 GB card usable) it ran at 19.3 tokens/s, with
 `--fit-target 23500` (almost nothing on the card) 6.3 tokens/s. ModelMistress used `-ngl 999` for Rigel; it now lets Rigel `--fit` unless paged

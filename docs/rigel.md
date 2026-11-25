@@ -110,6 +110,8 @@ layer_resident_mib = -1   # MiB to lock; -1: what is free (less 2 GB or a tenth 
 
 ## GPU and CPU together
 
+A mixture-of-experts model that does not fit the card whole goes to Rigel on its own (`auto_rigel`, default on) with paged experts and as many VRAM slots as the card has room for; a Rigel load that fits the card whole is started with `-lm none`. Measured numbers: [rigel-hybrid-plan.md](rigel-hybrid-plan.md).
+
 `gpu_layers` left at its default lets Rigel's own `--fit` choose how many layers go to the card (ModelMistress passes `--fit on --fit-target`
 as for llama.cpp; with paged experts it keeps `-ngl`). The rest runs on the CPU from RAM, and with `layer_resident_mib` the part of that
 which does not fit RAM is streamed. The setting `vram_extends_ram` (default on) also moves layers to a card that has room for a load that was to

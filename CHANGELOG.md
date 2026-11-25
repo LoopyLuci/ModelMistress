@@ -15,6 +15,8 @@
   Rigel now uses its own `--fit` for the GPU/CPU split (it passed `-ngl 999`), and new setting `vram_extends_ram` (default on) puts layers on a
   card that has room when a load meant for the CPU does not fit the free RAM.
   A Prism (Bonsai) model wholly on the card is loaded with `-lm none`, so its weights are in VRAM only (RAM 0.45 GB against 2.2 GB).
+  New setting `auto_rigel` (default on): a mixture-of-experts model too big for the card is served by Rigel with paged experts (22 GB model: 65.7 tokens/s in 19 GB of VRAM against 53.7 with llama.cpp's fit);
+  a Rigel load wholly on the card gets `-lm none` (RAM 1.8 GB instead of 22.7 GB).
   AirLLM Phase 0 results: [airllm-spike-results](docs/airllm-spike-results.md).
 
 ## 0.4.2 — 2026-11-23

@@ -976,6 +976,22 @@ pub fn spill_layers(
     wanted.min(usable / vram_per_layer)
 }
 
+/// VRAM expert slots (`--moe-slots`) a paged Rigel load of a mixture-of-experts model can afford in `budget_mib`: what is
+/// left after the non-expert weights, the cache and the compute buffers (`paged`: the estimate with the experts left out),
+/// at 90 %, divided by the size of one expert slot. Measured on a 22 GB Q8_0 MoE: 1536 slots 19 GB and 65.7 tokens/s,
+/// 1024 slots 14.4 GB and 35.8, 512 slots 10.6 GB and 21.6. None when fewer than 64 fit (paging would thrash), and never
+/// more than the model has experts (then nothing needs paging).
+pub fn paged_slots(shape: &ModelShape, expert_count: u64, paged: &VramEstimate, budget_mib: u64) -> Option<u64> {
+    let all = shape.layers.checked_mul(expert_count)?;
+    if all == 0 || shape.expert_share <= 0.0 {
+        return None;
+    }
+    let slot_mib = shape.file_bytes as f64 / MIB * shape.expert_share / all as f64;
+    let room = budget_mib.saturating_sub(paged.total_mib) as f64 * 0.9;
+    let slots = (room / slot_mib.max(0.01)) as u64;
+    (slots >= 64).then_some(slots.min(all))
+}
+
 /// A JSON view of a placement for the API (`model.plan`).
 pub fn fit_json(f: &Fit) -> Value {
     match f {
@@ -1693,6 +1709,35 @@ Exiting, please wait...
                 free_ram_mib: 4000
             }
         );
+    }
+
+    #[test]
+    fn paged_slots_follow_what_the_card_has_left() {
+        let sh = ModelShape {
+            file_bytes: 22_000 * 1_048_576,
+            layers: 40,
+            attn_layers: 10,
+            n_embd: 2048,
+            n_head_kv: 2,
+            key_len: 256,
+            val_len: 256,
+            state_bytes_per_slot: 0,
+            expert_share: 0.8,
+        };
+        // 40 layers of 256 experts: a slot is 17,600 / 10,240 MiB
+        let base = est(4_400, 600, 500);
+        let n = paged_slots(&sh, 256, &base, 22_000).unwrap();
+        assert!((7_000..9_000).contains(&n), "{n}");
+        // a small card leaves too little: no paging
+        assert_eq!(paged_slots(&sh, 256, &base, 5_800), None);
+        // never more slots than experts
+        assert_eq!(paged_slots(&sh, 2, &base, 90_000), Some(80));
+        // a dense model has none
+        let dense = ModelShape {
+            expert_share: 0.0,
+            ..sh
+        };
+        assert_eq!(paged_slots(&dense, 0, &base, 22_000), None);
     }
 
     #[test]
