@@ -40,7 +40,7 @@ class FakeHub(Hub):
             raise HubError(f"no operation {op}", 404)
         return self.replies[op]
 
-    def chat_stream(self, model, messages, on_text, cancel=None):
+    def chat_stream(self, model, messages, on_text, cancel=None, options=None):
         self.calls.append(("chat", model, list(messages)))
         for piece in self.pieces:
             on_text(piece)
@@ -369,8 +369,20 @@ def test_misty_refusal_reaches_the_hub(app, monkeypatch):
 
 
 def test_misty_stop_cancels_the_run(app):
-    hub = MistyFake([{"events": [{"type": "token", "text": "wor"}], "next": 1, "done": False, "pending": []}] * 3
-                    + [{"events": [{"type": "final", "text": "", "status": "cancelled"}], "next": 2, "done": True, "pending": []}])
+    class Quiet(MistyFake):
+        """After its first page the run is quiet, as a hub is between events: each poll waits, then finds nothing new,
+        until the run is cancelled, when it ends."""
+
+        def misty_page(self, run, start=0, wait_ms=0):
+            if self.pages:
+                return super().misty_page(run, start, wait_ms)
+            time.sleep(min(wait_ms, 50) / 1000)
+            if any(c[0] == "cancel" for c in self.misty_calls):
+                return {"events": [{"type": "final", "text": "", "status": "cancelled"}], "next": start + 1, "done": True, "pending": []}
+            self.misty_calls.append(("page", run, start))
+            return {"events": [], "next": start, "done": False, "pending": []}
+
+    hub = Quiet([{"events": [{"type": "token", "text": "wor"}], "next": 1, "done": False, "pending": []}])
     page = MistyPage()
     page.attach(hub)
     page.input.setPlainText("long task")
