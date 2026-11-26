@@ -427,7 +427,7 @@ Tested with unit and integration tests (scripted models, no real ones): the rout
 retries, citations, cancellation), retrieval, the policy and file/secret/SSRF guards, pipelines, the REST, SSE and
 OpenAI-virtual-model surfaces, peer rules, the setup planner (against pinned metadata), the ternary-engine guard, the
 CLI, the ABP client, tools and routes, environments and working folders (the policy, folder and variables a session
-gets from its environment, the folder browser), the ratings and what she learns from them (the store, the operations, the export), and the Qt page.
+gets from its environment, the folder browser), the ratings and what she learns from them (the store, the operations, the export), and the Qt page, including its queue, steering, ratings and "What she learns" dialog.
 
 **Run for real** (Windows 10, Ryzen 9 5900X, 2026-11-21, a separate hub and home): the starter set was installed with its
 size and SHA-256 checks; `misty doctor` passed; Bonsai 2B and 9B ran on the Prism engine; Needle3, Whistle and Mirage ran
@@ -438,8 +438,8 @@ once as `main`.
 **Not run:** the 27B (`deep`) and so the escalation up to it and its thinking mode; the `Q2_0` and `PTQ1_0` packings;
 other operating systems and CPUs; the Misty page of the dashboard and desktop app (type-checked, unit-tested and built,
 and the desktop app attaches to a running hub, but the page was opened only in a browser, against a scratch hub: the environment bar, the folder picker, the
-Environments page and Up/Down history on 2026-11-23, not in the desktop app, and no real model ran in an environment) and of the Qt window (written
-without PySide6, so not run); ABP's dashboard and CLI (only the client module under them ran). The ratings, the Learning tab and the export were not clicked through in the desktop app, and the export's file download was not checked in the desktop app's WebView2.
+Environments page and Up/Down history on 2026-11-23, not in the desktop app, and no real model ran in an environment) and of the Qt window (its pages and
+the Live, queue, steer and ratings paths run offscreen against a fake hub, in `gui/tests`; not clicked through on a screen, and no real microphone or camera); ABP's dashboard and CLI (only the client module under them ran). The ratings, the Learning tab and the export were not clicked through in the desktop app, and the export's file download was not checked in the desktop app's WebView2.
 
 **Known rough edges.** Needle chose the right tool for 15 of 21 test requests among fifteen tools and called none of
 the six requests that needed none; it is a shortcut for clear requests, not the decider. Mirage described a plain grey

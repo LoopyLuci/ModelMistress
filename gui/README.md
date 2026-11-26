@@ -19,13 +19,23 @@ platform's standard folder, the same rule the hub uses.
 ## Pages
 
 - **Status**: version, process, uptime, engine, models known, loaded models, memory.
-- **Models**: the models on this machine, a filter, load and unload for the selected model, and a disk rescan. A Router column says which role each model has, and a "Router: which model answers" box chooses the model for each role (fast, main, deep, embed, rerank) or leaves it Automatic. The box is hidden on a hub with no router.
+- **Models**: the models on this machine, a filter, load and unload for the selected model, a disk rescan, and Import model file..., which copies a `.gguf` into the hub's models folder with progress. A Router column says which role each model has, and a "Router: which model answers" box chooses the model for each role (fast, main, deep, embed, rerank) or leaves it Automatic. The box is hidden on a hub with no router. The Speed test box times this machine and each installed chat model (it takes minutes on a CPU), then suggests the fastest model, the one that keeps up with reading, and the best one that fits in memory.
 - **Chat**: streamed replies from a chat model, an optional system prompt. Ctrl+Enter sends, Stop (or Esc) stops. The first choice, Auto, lets the hub's router pick the model for each message; the reply is headed with the role and model that answered, and `@fast`, `@main` or `@deep` in a message choose the role. A
-  model's markup stays visible as text instead of being rendered.
+  model's markup stays visible as text instead of being rendered. Top-k (0 is off) and Seed (-1 is random) sit above the
+  transcript. Attach file... adds text, source, JSON, CSV or PDF files (each cut to 2000 characters; a PDF's text comes
+  from the hub). Picture... and Camera add pictures, for a model that can see. While a reply is written, Send queues the
+  next message, and Steer writes a note that cuts the reply after its next sentence; the note goes in next. Dictate
+  writes what you say into the box, and Read replies aloud, Read last reply and Stop speaking use the hub's voice.
+  **Live** (the button) is a conversation by voice: each sentence you say is written down and sent, the reply is read
+  aloud a sentence at a time, talking over it stops it, and a correction you start with "correction" or "that's wrong"
+  is saved for Misty. Use a headset with Live: this window has no echo cancellation.
 - **Misty**: chat with Misty, the agent inside the hub (see `docs/misty/`). The router picks the model, or you pick
   fast, main or deep; documents can be searched always, never, or when the router decides. Her answer streams in with
   notes about what she did (tool calls, retrieved passages) and the sources she cited. A tool that changes something
-  (a file write) opens a dialog and waits for your answer; Stop cancels the run. The top line says whether a language
+  (a file write) opens a dialog and waits for your answer; Stop cancels the run. While she answers, Send queues the next
+  message, and Steer cuts her reply after its next sentence (the note goes in next). Each reply can be rated (Good, Bad,
+  No tools, Needs tools, or Correct it...), and What she learns... shows the verdicts, forgets some of them, and exports
+  the training data. The No tools box answers one message without her tools. The top line says whether a language
   model is ready and, if not, what to install (`model-mistress misty setup`).
 - **Settings**: two parts. **Appearance** sets the theme (follow the system, light or dark), the style (Fusion, the
   default, which follows the theme on every platform, or another Qt style) and the text size. It is kept on this computer, applied at once, and never sent to the
@@ -34,7 +44,7 @@ platform's standard folder, the same rule the hub uses.
 
 Ctrl+1 to Ctrl+5 switch pages. The Status page refreshes when it is opened. The window remembers its size and place.
 
-Not in this window yet: pulling models, loading with options (context size, GPU layers), a model's serving settings and the fit check (the dashboard's Models page has them), peer keys and usage, and the
+Not in this window yet: pulling models from Hugging Face, loading with options (context size, GPU layers), a model's serving settings and the fit check (the dashboard's Models page has them), peer keys and usage, and the
 dashboard's other pages (traces, knowledge modules, factory, speech, images, vision). The dashboard at `/ui` has the
 pages it has; it has no page for peer keys or usage, which are on the command line (`keys`, `usage`) and in the API.
 
@@ -47,5 +57,7 @@ python -m pytest tests -q
 
 Run from this folder. The tests use an offscreen Qt platform and a local stand-in for the hub. The client test
 against a real hub runs when `MM_HUB_EXE` names a `model-mistress` binary (it starts that binary in a throwaway
-home). `python ci/pipeline.py --only gui` runs this suite and fails when the installed PySide6 or pytest differ from
+home). Live, the chat's extra controls, Misty's queue, steering and ratings, the model import and the speed test are
+tested with fake sound and fake hub calls; none of them has been run with a real microphone, camera or speaker.
+`python ci/pipeline.py --only gui` runs this suite and fails when the installed PySide6 or pytest differ from
 the pins in `requirements*.txt`.
