@@ -4,8 +4,10 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 const route = vi.hoisted(() => ({ query: {} as Record<string, string> }))
 vi.mock('vue-router', () => ({ useRoute: () => route }))
 vi.mock('@/transport', async (orig) => ({ ...(await orig<typeof import('@/transport')>()), call: vi.fn() }))
+vi.mock('@/modelImport', () => ({ importModel: vi.fn(async (f: File) => ({ name: f.name, bytes: f.size })) }))
 
 import { call } from '@/transport'
+import { importModel } from '@/modelImport'
 import ModelsView from './ModelsView.vue'
 
 const role = (r: string, model: string | null, over: Record<string, unknown> = {}) => ({
@@ -28,6 +30,19 @@ const PICK = {
   role: 'fast', model: 'llama-3b', forced: null, reasons: ['a short message'],
   candidates: [{ ...role('fast', 'llama-3b'), score: 0.8 }],
 }
+/** What system.bench answers: a machine held its speed; one model was loaded for the test, one failed. */
+const BENCH = {
+  cpu: { threads: 8, seconds: 10, first_speed: 100, last_speed: 96, steady: 0.96 },
+  memory_gbps: 14.2,
+  ram_gb: 16,
+  models: [
+    { model: 'llama-3b', size_gb: 2, tokens: 96, ms: 9000, tokens_per_s: 10.7, cold_start: false },
+    { model: 'qwen3-8b', size_gb: 5, tokens: 96, ms: 20000, tokens_per_s: 4.8, cold_start: true },
+    { model: 'broken', size_gb: 1, error: 'the engine did not start' },
+  ],
+  suggestions: { fastest: 'llama-3b', balanced: 'llama-3b', best: 'qwen3-8b', bandwidth_gbps: 21.4, reading_tokens_per_s: 8 },
+  note: 'A cold start includes loading the model, so its speed is left out of the suggestions.',
+}
 
 let profiles: Record<string, unknown>
 const sent = (op: string) => vi.mocked(call).mock.calls.filter((c) => c[0] === op).map((c) => c[1] as any)
@@ -48,6 +63,7 @@ beforeEach(() => {
       case 'misty.config.set': return {}
       case 'model.plan': return { verdict: 'fits', estimate: { total_mib: 5000 }, free_mib: 20000, unload: [] }
       case 'model.load': return { load_ms: 1500 }
+      case 'system.bench': return BENCH
       default: throw new Error(`no operation ${op}`)
     }
   })
@@ -337,5 +353,63 @@ describe('the router tab', () => {
     })
     const w = await open('router')
     expect(w.text()).toContain('not available on this hub')
+  })
+})
+
+describe('the speed test', () => {
+  const tabButton = (w: VueWrapper, text: string) => w.findAll('[role="tab"]').find((t) => t.text() === text)!
+
+  it('runs the test and shows the machine, each model and what suits it', async () => {
+    const w = await open()
+    await tabButton(w, 'Speed test').trigger('click')
+    await button(w, 'Run the speed test').trigger('click')
+    await flushPromises()
+    expect(sent('system.bench')).toEqual([{}])
+    const text = w.text()
+    expect(text).toContain('held its speed (96% at the end of the test)')
+    expect(text).toContain('Fastest: llama-3b')
+    expect(text).toContain('Best answers: qwen3-8b')
+    expect(text).toContain('Test again')
+    const rows = w.findAll('section[aria-label="Each model"] tbody tr')
+    expect(rows[0].text()).toContain('was already loaded')
+    expect(rows[1].text()).toContain('loaded for this test, so its speed includes loading')
+    expect(rows[2].text()).toContain('failed: the engine did not start')
+  })
+
+  it('says when the CPU slowed under the load', async () => {
+    const real = vi.mocked(call).getMockImplementation()!
+    vi.mocked(call).mockImplementation(async (op: string, args: any) =>
+      op === 'system.bench' ? { ...BENCH, cpu: { ...BENCH.cpu, steady: 0.5 } } : real(op, args),
+    )
+    const w = await open('speed')
+    await button(w, 'Run the speed test').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('slowed down (50% at the end): it may throttle under sustained load')
+  })
+})
+
+describe('importing a model file', () => {
+  const pick = (w: VueWrapper, file: File) => {
+    const input = w.find('input[aria-label="Model file to import"]')
+    Object.defineProperty(input.element, 'files', { value: [file], configurable: true })
+    return input.trigger('change')
+  }
+
+  it('copies the chosen file into the models folder and reads the list again', async () => {
+    vi.mocked(importModel).mockClear()
+    const w = await open('find')
+    await pick(w, new File(['GGUF'], 'tiny.gguf'))
+    await flushPromises()
+    expect(vi.mocked(importModel)).toHaveBeenCalledTimes(1)
+    expect(w.text()).toContain('tiny.gguf is in the models folder')
+    expect(sent('model.list').length).toBeGreaterThan(1)
+  })
+
+  it('says why a file was refused', async () => {
+    vi.mocked(importModel).mockRejectedValueOnce(new Error('not a GGUF model file (it does not start with GGUF)'))
+    const w = await open('find')
+    await pick(w, new File(['PK'], 'notes.gguf'))
+    await flushPromises()
+    expect(w.find('.error-box').text()).toContain('Could not import notes.gguf: not a GGUF model file')
   })
 })
