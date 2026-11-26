@@ -88,9 +88,9 @@ Status: **Present**: on the desktop already. **Added**: built, with tests. **Par
 - Rust: `cargo test` passed on every target: 649 library tests, 2 binary tests and 16 desktop-app tests, with 6 ignored
   and none failing. `cargo test --lib misty` (145 tests) covers the ratings, routing, correction notes, export, forgetting
   and the `misty.route` change.
-- Frontend: `vitest run` passed (25 files, 217 tests), `vue-tsc --noEmit` is clean and `vite build` passed.
-- Native window: `python -m pytest tests` in `gui/` passed 144 tests offscreen. With `MM_HUB_EXE` set to the debug hub
-  binary, `tests/test_real_hub.py` also passed, which makes 145. The Live rules are ports of the web's tests
+- Frontend: `vitest run` passed (26 files, 222 tests), `vue-tsc --noEmit` is clean and `vite build` passed.
+- Native window: `python -m pytest tests` in `gui/` passed 169 tests offscreen, with 1 skipped. With `MM_HUB_EXE` set to the debug hub
+  binary, `tests/test_real_hub.py` also passed, which makes 170. The Live rules are ports of the web's tests
   (`turns.test.ts`), and the Live panel, the chat page, Misty's queue, steering and ratings, the learn dialog, attachments,
   the model import and the speed test each have offscreen tests with fake sound and a fake hub.
 - Not run: the Tauri window; the native window and the web dashboard on a real microphone, camera or speaker; a real
@@ -98,13 +98,16 @@ Status: **Present**: on the desktop already. **Added**: built, with tests. **Par
 
 ## Open items
 
-1. **Echo.** The native window has no echo cancellation, so the computer's own voice can reach the microphone. The
-   echo rules (`turns.py`, ported from `turns.ts`) take out what sounds like the reply, but on a loud speaker a headset is
-   the reliable setup. Owner decision: accept this and recommend a headset, or add echo cancellation (a larger change).
+1. **Echo.** Both windows now take the reply out of the microphone where they can. The native window measures the delay from
+   its speaker to its microphone from the sound itself, then runs an adaptive echo filter (`gui/mm_gui/dsp.py`). The
+   offline tests remove at least 12 dB of a linear echo and keep the owner's own speech at 6 dB or better over the reply.
+   The web Live asks the browser for echo cancellation and says so when the browser does not apply it. Neither has been run
+   on a real microphone and speaker, and a loud or distorting speaker is harder for a linear filter. A headset remains the
+   reliable setup. Owner decision: confirm on a real machine, or keep the headset advice alone.
 2. **Steer and ratings.** A reply cut by a steering note has no rating, on both platforms, because the text is not the
    whole reply. Owner decision: keep that, or rate the cut text.
 3. **Live interrupt.** The native window can interrupt a reply early; the web Live cannot yet.
-4. **Real hardware.** The microphone, camera, speaker playback, a large GGUF import and the speed test on this machine
+4. **Real hardware.** The microphone, camera, speaker playback, echo cancellation (item 1), a large GGUF import and the speed test on this machine
    have not been run. These need a manual pass before the features are called verified on a device.
 5. **The native window.** The owner asked for a full native window as well as the web one, so it is counted in this
    audit and built to the same feature list.

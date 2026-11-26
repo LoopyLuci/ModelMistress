@@ -28,7 +28,7 @@ platform's standard folder, the same rule the hub uses.
   writes what you say into the box, and Read replies aloud, Read last reply and Stop speaking use the hub's voice.
   **Live** (the button) is a conversation by voice: each sentence you say is written down and sent, the reply is read
   aloud a sentence at a time, talking over it stops it, and a correction you start with "correction" or "that's wrong"
-  is saved for Misty. Use a headset with Live: this window has no echo cancellation.
+  is saved for Misty. Live takes the reply out of the microphone where it can: this window measures the delay from the speaker and runs an echo filter, and lowers steady background noise. A headset still avoids echo entirely; the filter is tested offline only, so check it on your own machine.
 - **Misty**: chat with Misty, the agent inside the hub (see `docs/misty/`). The router picks the model, or you pick
   fast, main or deep; documents can be searched always, never, or when the router decides. Her answer streams in with
   notes about what she did (tool calls, retrieved passages) and the sources she cited. A tool that changes something

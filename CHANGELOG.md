@@ -17,7 +17,9 @@
 - Chat, dashboard and native window: top-k and seed; text, source and PDF files attached to a message (a PDF's text comes
   from the hub); a camera button for photos; steering a reply mid-sentence (the text so far is kept, the note goes next);
   and Live, a conversation by voice (each sentence is written down and sent, the reply is read aloud a sentence at a time,
-  talking over it stops it, and a spoken correction is saved for Misty). Live on the native window has no echo cancellation.
+  talking over it stops it, and a spoken correction is saved for Misty). Live takes the reply out of the microphone where it can: the native window measures the delay from its speaker to its
+  microphone from the sound and runs an echo filter, and it lowers steady background noise; the web asks the browser for
+  echo cancellation and says so when the browser does not apply it. Not yet checked on a real microphone and speaker.
 - Misty page: a message written during a reply waits and is sent after it, on the dashboard and the native window.
 - Models, dashboard and native window: "Import model file" copies a `.gguf` into the models folder with progress; the
   speed test times this machine and each installed chat model, then suggests the fastest, the one that keeps up with
@@ -25,10 +27,10 @@
 - Native window (`gui/`): brought to the same features as the dashboard for these pages: the Chat page (Live, queue,
   steer, attachments, camera, dictation, read-aloud, top-k, seed), the Misty page (queue, steer, ratings, "No tools", What
   she learns) and the Models page (import, speed test). Its tests run offscreen with fake sound and a fake hub.
-- Parity with the Android app: `docs/android-parity.md`. Open: echo cancellation on the native window (a headset is
+- Parity with the Android app: `docs/android-parity.md`. Open: echo cancellation on a real microphone and speaker (checked offline only; a headset is
   advised), steering a reply gives no rating for the cut reply, and the web Live cannot interrupt a reply early.
-- Tests: `cargo test` passes on every target (649 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 217 tests; `vue-tsc` and `vite build` clean),
-  and the native window's pytest suite (144 tests, plus the real-hub test with `MM_HUB_EXE`). Not run on a real microphone,
+- Tests: `cargo test` passes on every target (649 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
+  and the native window's pytest suite (169 tests and 1 skipped; with `MM_HUB_EXE` set, the real-hub test runs too). Not run on a real microphone,
   camera, speaker or large model file.
 
 ### Android app (`android/`, version 0.1.0)
