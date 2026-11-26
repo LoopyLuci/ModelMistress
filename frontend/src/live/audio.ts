@@ -20,15 +20,25 @@ export class LiveMic {
   private recorder: MediaRecorder | null = null
   private chunks: Blob[] = []
   private enabled = false
+  /**
+   * Whether the browser says its echo cancellation is on for this microphone: the reply coming back out of the speakers is
+   * then taken out before the sound is heard. Null until the microphone is open, or when the browser does not say.
+   */
+  echoCancelling: boolean | null = null
 
   constructor(private readonly handlers: MicHandlers) {}
 
   /** Asks for the microphone and starts reading its level. Rejects when the owner does not allow it or there is none. */
   async open(): Promise<void> {
-    // The browser removes the phone's own voice from the microphone where it can (echo cancellation), so less of the reply
-    // comes back as the owner's talk.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    // The browser removes the reply from the microphone where it can (echo cancellation) and evens out the owner's
+    // loudness (automatic gain), so less of the reply comes back as the owner's talk.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
     this.stream = stream
+    // The constraints are a request. What the browser actually applied is in the track's settings.
+    const applied = stream.getAudioTracks()[0]?.getSettings().echoCancellation
+    this.echoCancelling = typeof applied === 'boolean' ? applied : null
     const ctx = new AudioContext()
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 2048

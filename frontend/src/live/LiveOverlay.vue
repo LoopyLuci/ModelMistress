@@ -30,6 +30,7 @@
 
     <p v-if="view.awaitingCorrection" class="muted small" role="status">Say the correction.</p>
     <p v-if="view.notice" class="muted small" role="status">{{ view.notice }}</p>
+    <p v-if="echoNote" class="muted small" role="status">{{ echoNote }}</p>
     <p v-if="view.error || problem" class="error-box" role="alert">{{ view.error || problem }}</p>
 
     <div class="row">
@@ -91,6 +92,8 @@ const view = reactive<{
 })
 /** Problems outside the conversation itself: the microphone, speech, saving a correction, the camera. */
 const problem = ref('')
+/** Set when the browser has not turned on echo cancellation: the reply can then come back into the microphone as talk. */
+const echoNote = ref('')
 const camOn = ref(false)
 const camError = ref('')
 const videoEl = ref<HTMLVideoElement | null>(null)
@@ -252,6 +255,9 @@ onMounted(async () => {
   dispatch({ kind: 'start' })
   try {
     await mic.open()
+    if (mic.echoCancelling === false) {
+      echoNote.value = 'This browser is not taking the reply out of the microphone, so the reply can come back as your talk. A headset avoids that.'
+    }
   } catch (err: any) {
     dispatch({ kind: 'failed', transient: false, message: micMessage(err) })
   }

@@ -6,12 +6,15 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 const rig = vi.hoisted(() => ({
   mics: [] as any[],
   speaks: [] as { sentence: string; done: (failure?: unknown) => void }[],
+  /** What the browser reports for echo cancellation on the microphone (null: it does not say). */
+  echoCancelling: null as boolean | null,
 }))
 vi.mock('@/live/audio', () => ({
   LiveMic: class {
     open = vi.fn(async () => undefined)
     setEnabled = vi.fn()
     close = vi.fn()
+    echoCancelling: boolean | null = rig.echoCancelling
     constructor(public handlers: { onUtterance: (clip: Blob, ms: number) => void }) {
       rig.mics.push(this)
     }
@@ -37,6 +40,7 @@ let stop: ReturnType<typeof vi.fn>
 beforeEach(() => {
   rig.mics.length = 0
   rig.speaks.length = 0
+  rig.echoCancelling = null
   vi.mocked(call).mockClear()
   vi.mocked(transcribeClip).mockReset()
   send = vi.fn(() => true)
@@ -130,5 +134,22 @@ describe('the Live conversation', () => {
     wrapper?.unmount()
     wrapper = undefined
     expect(rig.mics[0].close).toHaveBeenCalled()
+  })
+
+  it('says so when the browser is not taking the reply out of the microphone', async () => {
+    rig.echoCancelling = false
+    await open()
+    expect(wrapper!.text()).toContain('A headset avoids that.')
+  })
+
+  it('says nothing about echo when the browser reports it on, or does not say', async () => {
+    rig.echoCancelling = true
+    await open()
+    expect(wrapper!.text()).not.toContain('A headset avoids that.')
+    wrapper!.unmount()
+    wrapper = undefined
+    rig.echoCancelling = null
+    await open()
+    expect(wrapper!.text()).not.toContain('A headset avoids that.')
   })
 })
