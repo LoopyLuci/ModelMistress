@@ -1,37 +1,34 @@
-"""The pages of the window. Each one shows what the hub says and runs its calls on a worker thread."""
+"""The pages of the window. Each one shows what the hub says and runs its calls on a worker thread. The chat pages live in
+their own modules and are re-exported here, so the window imports them from one place."""
 
 from __future__ import annotations
 
 import json
-import threading
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QStyleFactory,
     QTableWidget,
     QTableWidgetItem,
-    QTextBrowser,
     QVBoxLayout,
-    QWidget,
 )
 
-from mm_gui.hub import Hub, HubError
+from mm_gui.chat_page import ChatPage
+from mm_gui.misty_page import MistyPage
 from mm_gui.models import (
     ROLE_HELP,
     ROLES,
-    ROUTER,
     STATUS_TEXT,
     fmt_mb,
     fmt_uptime,
@@ -39,52 +36,16 @@ from mm_gui.models import (
     model_label,
     roles_of,
     suits_role,
-    without_tags_in_last_user_message,
 )
+from mm_gui.pagebase import Page
 from mm_gui.prefs import TEXT_SIZES, THEMES, Appearance
 from mm_gui.tasks import run_task
+
+__all__ = ["ChatPage", "MistyPage", "ModelsPage", "Page", "SettingsPage", "StatusPage"]
 
 _TRUE = {"true", "yes", "on", "1"}
 _FALSE = {"false", "no", "off", "0"}
 _PLACEHOLDER = "(set)"  # config.get's stand-in for a secret the hub keeps
-
-
-class Page(QWidget):
-    """A page of the window. It works on the hub it is attached to and reports failures in its status line."""
-
-    def __init__(self, title: str):
-        super().__init__()
-        self.title = title
-        self.hub: Hub | None = None
-        self.status = QLabel()
-        self.status.setWordWrap(True)
-        self.status.setAccessibleName(f"{title} status")
-
-    def attach(self, hub: Hub) -> None:
-        self.hub = hub
-        self.refresh()
-
-    def refresh(self) -> None:
-        """Read what the page shows from the hub. Each page says how."""
-
-    def shown(self) -> None:
-        """Called when the window opens this page; a page whose numbers go stale refreshes here."""
-
-    def ask(self, what: str, fn: Callable[[Hub], Any], on_done: Callable[[Any], None]) -> None:
-        """Run `fn(hub)` on a worker thread; `what` names the call in the status line while it runs."""
-        hub = self.hub
-        if hub is None:
-            return
-        self.status.setText(f"{what}...")
-
-        def done(value: Any) -> None:
-            self.status.setText("")
-            on_done(value)
-
-        def failed(message: str) -> None:
-            self.status.setText(f"{what} failed: {message}")
-
-        run_task(lambda: fn(hub), done, failed)
 
 
 class StatusPage(Page):
@@ -158,8 +119,15 @@ class StatusPage(Page):
             self.status.setText("Settings warnings: " + "; ".join(str(w) for w in warnings))
 
 
+class _ImportBridge(QObject):
+    """Carries the bytes sent of a model import from the worker thread to the window."""
+
+    progress = Signal(int)
+
+
 class ModelsPage(Page):
     COLUMNS = ["Model", "Source", "Size", "Architecture", "Context", "Router role", "State"]
+    BENCH_COLUMNS = ["Model", "Size", "Tokens per second", "Note"]
 
     def __init__(self):
         super().__init__("Models")
@@ -178,6 +146,13 @@ class ModelsPage(Page):
         self._models: list[dict] = []
         self._visible: list[dict] = []
         self._router: dict | None = None  # router.status, or None on a hub with no router
+        self._note: str | None = None  # a line to show once the next list has been read (after an import)
+        self._importing = False
+        self._import_name = ""
+        self._import_total = 1
+        self._import_bridge = _ImportBridge()
+        self._import_bridge.progress.connect(self._import_progress)
+        self._benching = False
 
         # Which model fills each role of the router: the choices that make the model `auto` usable in any chat.
         self.roles_box = QGroupBox("Router: which model answers")
@@ -206,16 +181,43 @@ class ModelsPage(Page):
         load.clicked.connect(self._load)
         unload = QPushButton("Unload")
         unload.clicked.connect(self._unload)
+        self.importer = QPushButton("Import model file...")
+        self.importer.setToolTip("Copy a .gguf model file into the hub's models folder. A large file can take minutes.")
+        self.importer.clicked.connect(self._import)
         buttons = QHBoxLayout()
-        for button in (scan, load, unload):
+        for button in (scan, load, unload, self.importer):
             buttons.addWidget(button)
         buttons.addStretch(1)
+
+        # The speed test: how fast this machine runs each installed chat model, and which of them suit it.
+        self.bench_box = QGroupBox("Speed test")
+        bench_layout = QVBoxLayout(self.bench_box)
+        bench_text = QLabel("Times this machine and each installed chat model. It takes minutes on a CPU.")
+        bench_text.setWordWrap(True)
+        self.bench_run = QPushButton("Run speed test")
+        self.bench_run.clicked.connect(self._bench)
+        self.bench_table = QTableWidget(0, len(self.BENCH_COLUMNS))
+        self.bench_table.setHorizontalHeaderLabels(self.BENCH_COLUMNS)
+        self.bench_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.bench_table.verticalHeader().setVisible(False)
+        self.bench_table.horizontalHeader().setStretchLastSection(True)
+        self.bench_table.setMaximumHeight(160)
+        self.bench_table.setAccessibleName("Speed test results")
+        self.bench_table.setVisible(False)
+        self.bench_result = QLabel()
+        self.bench_result.setWordWrap(True)
+        self.bench_result.setAccessibleName("Speed test summary")
+        bench_layout.addWidget(bench_text)
+        bench_layout.addWidget(self.bench_run, alignment=Qt.AlignmentFlag.AlignLeft)
+        bench_layout.addWidget(self.bench_table)
+        bench_layout.addWidget(self.bench_result)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.filter)
         layout.addWidget(self.table, 1)
         layout.addWidget(self.roles_box)
         layout.addLayout(buttons)
+        layout.addWidget(self.bench_box)
         layout.addWidget(self.status)
 
     def refresh(self, scan: bool = False) -> None:
@@ -231,6 +233,9 @@ class ModelsPage(Page):
         self._router = router
         self._fill()
         self._fill_roles()
+        if self._note:
+            self.status.setText(self._note)
+            self._note = None
 
     def _fill_roles(self) -> None:
         """The role choosers: Automatic, then every installed model that suits the role."""
@@ -299,437 +304,90 @@ class ModelsPage(Page):
     def _changed(self, _result: Any) -> None:
         self.refresh()
 
+    # ---- importing a model file -------------------------------------------------------------------------------------
 
-class _Bridge(QObject):
-    """Carries each piece of a streamed reply from the worker thread to the window."""
-
-    delta = Signal(str)
-    routed = Signal(str)  # "main: qwen3-9b": the router chose the model for this reply
-
-
-class ChatPage(Page):
-    def __init__(self):
-        super().__init__("Chat")
-        self.model = QComboBox()
-        self.model.setAccessibleName("Model")
-        self.system = QLineEdit()
-        self.system.setPlaceholderText("System prompt (optional)")
-        self.system.setAccessibleName("System prompt")
-        self.transcript = QTextBrowser()
-        self.transcript.setOpenExternalLinks(True)
-        self.transcript.setAccessibleName("Conversation")
-        self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Message (Ctrl+Enter sends)")
-        self.input.setAccessibleName("Message")
-        self.input.setMaximumHeight(110)
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send)
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop)
-        self.stop_button.setEnabled(False)
-        new_chat = QPushButton("New chat")
-        new_chat.clicked.connect(self.new_chat)
-        QShortcut(QKeySequence("Escape"), self).activated.connect(self.stop)
-        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
-            QShortcut(QKeySequence(sequence), self.input).activated.connect(self.send)
-
-        self.messages: list[dict] = []  # {"role": ..., "content": ...}, the last one is the reply being written
-        self._cancel: threading.Event | None = None
-        self._bridge = _Bridge()
-        self._bridge.delta.connect(self._on_delta)
-        self._bridge.routed.connect(self._on_routed)
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(80)
-        self._render_timer.timeout.connect(self._render)
-
-        top = QHBoxLayout()
-        top.addWidget(self.model, 1)
-        top.addWidget(self.system, 2)
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.input, 1)
-        buttons = QVBoxLayout()
-        for button in (self.send_button, self.stop_button, new_chat):
-            buttons.addWidget(button)
-        bottom.addLayout(buttons)
-        layout = QVBoxLayout(self)
-        layout.addLayout(top)
-        layout.addWidget(self.transcript, 1)
-        layout.addLayout(bottom)
-        layout.addWidget(self.status)
-
-    def refresh(self) -> None:
-        self.ask("Loading the models", lambda hub: hub.chat_models(), self._models_listed)
-
-    def _models_listed(self, models: list[dict]) -> None:
-        chosen = self.model.currentData()
-        self.model.clear()
-        items = [m for m in models if is_chat_model(m)]
-        for m in items:
-            self.model.addItem(model_label(m), m.get("id"))
-        # A new chat starts on the router when it has a model that can answer; until then on the first real model.
-        default = next(
-            (i for i, m in enumerate(items) if m.get("router") and m.get("ready")),
-            next((i for i, m in enumerate(items) if not m.get("router")), 0),
-        )
-        index = self.model.findData(chosen) if chosen else -1
-        self.model.setCurrentIndex(index if index >= 0 else default)
-        if self.model.count() == 0:
-            self.status.setText("No chat model is listed. Download one first; the hub's dashboard can do it.")
-
-    def send(self) -> None:
-        text = self.input.toPlainText().strip()
-        model = self.model.currentData()
-        if self.hub is None or self._cancel is not None or not text:
+    def _import(self) -> None:
+        if self.hub is None or self._importing:
             return
-        if not model:
-            self.status.setText("Choose a model first.")
+        path, _ = QFileDialog.getOpenFileName(self, "Import a model", "", "Model files (*.gguf);;All files (*)")
+        if not path:
             return
-        hub = self.hub
-        self.messages += [{"role": "user", "content": text}, {"role": "assistant", "content": ""}]
-        history = self._history()
-        self.input.clear()
-        cancel = threading.Event()
-        self._cancel = cancel
-        self._busy(True)
-        self.status.setText("Writing...")
-        self._render()
+        source = Path(path)
+        self._importing = True
+        self._import_name = source.name
+        self._import_total = max(source.stat().st_size, 1)
+        self.importer.setEnabled(False)
+        self.status.setText(f"Importing {source.name} (a large model can take minutes)...")
+        hub, bridge = self.hub, self._import_bridge
         run_task(
-            lambda: self._answer(hub, model, history, cancel),
-            lambda _answer: self._reply_done(cancel),
-            self._reply_failed,
+            lambda: hub.import_model(source, bridge.progress.emit),
+            self._imported,
+            self._import_failed,
         )
 
-    def _answer(self, hub: Hub, model: str, history: list[dict], cancel: threading.Event) -> str:
-        """On the worker thread. For the router: ask it which model suits the conversation, say so, then send the
-        conversation (without the role tags) to that model."""
-        if model == ROUTER:
-            pick = hub.router_pick(history)
-            if not pick.get("model"):
-                why = "; ".join(str(r) for r in pick.get("reasons") or []) or "no model is ready"
-                raise HubError(f"The router has no model to send this to: {why}. Choose models on the Models page.")
-            self._bridge.routed.emit(f"{pick.get('role') or '?'}: {pick['model']}")
-            return hub.chat_stream(str(pick["model"]), without_tags_in_last_user_message(history), self._bridge.delta.emit, cancel=cancel)
-        return hub.chat_stream(model, history, self._bridge.delta.emit, cancel=cancel)
+    def _import_progress(self, sent: int) -> None:
+        percent = min(100, sent * 100 // self._import_total)
+        self.status.setText(f"Importing {self._import_name}: {percent}%")
 
-    def stop(self) -> None:
-        if self._cancel is not None:
-            self._cancel.set()
-            self.status.setText("Stopping...")
+    def _imported(self, doc: dict) -> None:
+        self._importing = False
+        self.importer.setEnabled(True)
+        self._note = f"Imported {doc.get('name', self._import_name)}. It is in the list now."
+        self.refresh()
 
-    def new_chat(self) -> None:
-        if self._cancel is None:
-            self.messages = []
-            self._render()
-            self.status.setText("")
+    def _import_failed(self, message: str) -> None:
+        self._importing = False
+        self.importer.setEnabled(True)
+        self.status.setText(f"Importing {self._import_name} failed: {message}")
 
-    def _history(self) -> list[dict]:
-        history = [{"role": "system", "content": self.system.text().strip()}] if self.system.text().strip() else []
-        return history + [{"role": m["role"], "content": m["content"]} for m in self.messages[:-1]]
+    # ---- the speed test ---------------------------------------------------------------------------------------------
 
-    def _on_routed(self, label: str) -> None:
-        self.messages[-1]["model"] = label
-        self._render()
-
-    def _on_delta(self, text: str) -> None:
-        self.messages[-1]["content"] += text
-        if not self._render_timer.isActive():
-            self._render_timer.start()
-
-    def _reply_done(self, cancel: threading.Event) -> None:
-        self.status.setText("Stopped." if cancel.is_set() else "")
-        self._finish()
-
-    def _reply_failed(self, message: str) -> None:
-        if not self.messages[-1]["content"]:
-            self.messages.pop()  # the reply never started: keep only the question
-        self.status.setText(f"The reply failed: {message}")
-        self._finish()
-
-    def _finish(self) -> None:
-        self._cancel = None
-        self._busy(False)
-        self._render()
-
-    def _busy(self, busy: bool) -> None:
-        self.send_button.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
-        self.model.setEnabled(not busy)
-
-    def _render(self) -> None:
-        self._render_timer.stop()
-        parts = []
-        for m in self.messages:
-            who = "You" if m["role"] == "user" else (f"Model ({m['model']})" if m.get("model") else "Model")
-            # A backslash before < keeps a model's markup as plain text instead of letting the viewer render it.
-            body = (m["content"] or "...").replace("<", "\\<")
-            parts.append(f"**{who}**\n\n{body}")
-        self.transcript.setMarkdown("\n\n---\n\n".join(parts))
-        bar = self.transcript.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-
-class _MistyBridge(QObject):
-    """Carries each page of a run's events from the worker thread to the window."""
-
-    page = Signal(dict)
-
-
-class MistyPage(Page):
-    """Chat with Misty, the agent inside the hub: she picks a model, searches your documents and uses tools. A tool that
-    changes something waits for your answer in a dialog."""
-
-    ROLES = [("Chosen by the router", ""), ("Fast", "fast"), ("Main", "main"), ("Deep", "deep")]
-    DOCS = [("Router decides", None), ("Always search my documents", True), ("Never search", False)]
-
-    def __init__(self):
-        super().__init__("Misty")
-        self.ready = QLabel("Checking...")
-        self.ready.setWordWrap(True)
-        self.ready.setAccessibleName("Misty readiness")
-        self.role = QComboBox()
-        self.role.setAccessibleName("Model")
-        for label, value in self.ROLES:
-            self.role.addItem(label, value)
-        self.docs = QComboBox()
-        self.docs.setAccessibleName("Documents")
-        for label, value in self.DOCS:
-            self.docs.addItem(label, value)
-        self.transcript = QTextBrowser()
-        self.transcript.setOpenExternalLinks(False)
-        self.transcript.setAccessibleName("Conversation with Misty")
-        self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Ask Misty (Ctrl+Enter sends)")
-        self.input.setAccessibleName("Message")
-        self.input.setMaximumHeight(110)
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send)
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop)
-        self.stop_button.setEnabled(False)
-        new_chat = QPushButton("New chat")
-        new_chat.clicked.connect(self.new_chat)
-        for sequence in ("Ctrl+Return", "Ctrl+Enter"):
-            QShortcut(QKeySequence(sequence), self.input).activated.connect(self.send)
-
-        self.session: str | None = None
-        self.turns: list[dict] = []  # {"you", "text", "notes", "role", "cites", "error"}; the last one may be running
-        self._cancel: threading.Event | None = None
-        self._asked: set[str] = set()
-        self._bridge = _MistyBridge()
-        self._bridge.page.connect(self._on_page)
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(80)
-        self._render_timer.timeout.connect(self._render)
-
-        top = QHBoxLayout()
-        top.addWidget(self.role, 1)
-        top.addWidget(self.docs, 1)
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.input, 1)
-        buttons = QVBoxLayout()
-        for button in (self.send_button, self.stop_button, new_chat):
-            buttons.addWidget(button)
-        bottom.addLayout(buttons)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.ready)
-        layout.addLayout(top)
-        layout.addWidget(self.transcript, 1)
-        layout.addLayout(bottom)
-        layout.addWidget(self.status)
-
-    def refresh(self) -> None:
-        self.ask("Checking Misty", lambda hub: hub.misty_status(), self._status)
-
-    def shown(self) -> None:
-        if self.hub is not None and self._cancel is None:
-            self.refresh()
-
-    def _status(self, st: dict) -> None:
-        roster = {r.get("role"): r for r in st.get("roster") or []}
-        names = [f"{role} = {roster[role].get('model')}" for role in ("fast", "main", "deep") if roster.get(role, {}).get("status") == "ready"]
-        if st.get("ready"):
-            self.ready.setText("Ready: " + ", ".join(names))
-        else:
-            hint = (st.get("next") or ["No language model is ready."])[0]
-            self.ready.setText(f"Not ready. {hint}")
-
-    def send(self) -> None:
-        text = self.input.toPlainText().strip()
-        if self.hub is None or self._cancel is not None or not text:
+    def _bench(self) -> None:
+        if self.hub is None or self._benching:
             return
+        self._benching = True
+        self.bench_run.setEnabled(False)
+        self.status.setText("Running the speed test (a CPU takes minutes)...")
         hub = self.hub
-        args: dict = {"input": text, "approvals": "ask"}
-        if self.session:
-            args["session"] = self.session
-        else:
-            args["new_session"] = True
-        if self.role.currentData():
-            args["role"] = self.role.currentData()
-        if self.docs.currentData() is not None:
-            args["rag"] = self.docs.currentData()
-        self.turns.append({"you": text, "text": "", "notes": [], "role": "", "cites": [], "error": ""})
-        self.input.clear()
-        cancel = threading.Event()
-        self._cancel = cancel
-        self._asked = set()
-        self._busy(True)
-        self.status.setText("Working...")
-        self._render()
-        run_task(
-            lambda: hub.misty_run(args, self._bridge.page.emit, cancel),
-            lambda _page: self._finished(cancel),
-            self._failed,
-        )
+        run_task(lambda: hub.bench(), self._benched, self._bench_failed)
 
-    def stop(self) -> None:
-        if self._cancel is not None:
-            self._cancel.set()
-            self.status.setText("Stopping...")
+    def _benched(self, doc: dict) -> None:
+        self._benching = False
+        self.bench_run.setEnabled(True)
+        self.status.setText("")
+        self._show_bench(doc)
 
-    def new_chat(self) -> None:
-        if self._cancel is None:
-            self.session = None
-            self.turns = []
-            self._render()
-            self.status.setText("")
+    def _bench_failed(self, message: str) -> None:
+        self._benching = False
+        self.bench_run.setEnabled(True)
+        self.status.setText(f"The speed test failed: {message}")
 
-    def _confirm(self, approval: dict) -> bool:
-        """Ask the owner about one tool call. A separate method so a test can answer without a dialog."""
-        args = json.dumps(approval.get("args"), indent=2, ensure_ascii=False)[:1500]
-        box = QMessageBox(self)
-        box.setWindowTitle("Misty asks")
-        box.setText(f"Misty wants to use {approval.get('tool')} ({approval.get('class')}).")
-        box.setInformativeText("Allow it?")
-        box.setDetailedText(args)
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setDefaultButton(QMessageBox.StandardButton.No)
-        return box.exec() == QMessageBox.StandardButton.Yes
+    def _show_bench(self, doc: dict) -> None:
+        rows = doc.get("models") or []
+        self.bench_table.setRowCount(len(rows))
+        self.bench_table.setVisible(bool(rows))
+        for r, row in enumerate(rows):
+            if row.get("error"):
+                speed, note = "-", f"not timed: {row['error']}"
+            else:
+                speed = "-" if row.get("tokens_per_s") is None else f"{row['tokens_per_s']:.1f}"
+                note = "a cold start: left out of the suggestions" if row.get("cold_start") else ""
+            size = f"{row['size_gb']} GB" if row.get("size_gb") else "-"
+            for c, text in enumerate([row.get("model", "?"), size, speed, note]):
+                self.bench_table.setItem(r, c, QTableWidgetItem(str(text)))
+        suggestions = doc.get("suggestions") or {}
 
-    def _on_page(self, page: dict) -> None:
-        if not self.turns:
-            return
-        turn = self.turns[-1]
-        if "start" in page:
-            self.session = page["start"].get("session") or self.session
-            return
-        for e in page.get("events") or []:
-            kind = e.get("type")
-            if kind == "token":
-                turn["text"] += e.get("text") or ""
-            elif kind == "model":
-                turn["role"] = e.get("role") or turn["role"]
-            elif kind == "tool":
-                turn["notes"].append(f"{e.get('name')}: {e.get('status')}")
-            elif kind == "escalate":
-                turn["text"] = ""
-                turn["notes"].append(f"moved up from {e.get('from')} to {e.get('to')}: {e.get('why')}")
-            elif kind == "retrieve":
-                turn["notes"].append(f"searched your documents: {e.get('used')} of {e.get('hits')} passages used")
-            elif kind == "transcript":
-                turn["notes"].append(f"heard: {e.get('text')}")
-            elif kind == "error":
-                turn["error"] = e.get("message") or "the run failed"
-            elif kind == "final":
-                turn["text"] = e.get("text") if e.get("text") is not None else turn["text"]
-                turn["cites"] = e.get("citations") or []
-                turn["role"] = e.get("role") or turn["role"]
-                if e.get("error") and not turn["error"]:
-                    turn["error"] = e["error"]
-        if not self._render_timer.isActive():
-            self._render_timer.start()
-        for approval in page.get("pending") or []:
-            key = approval.get("approval")
-            if key and key not in self._asked and self.hub is not None:
-                self._asked.add(key)
-                allow = self._confirm(approval)
-                hub = self.hub
-                run_task(lambda hub=hub, key=key, allow=allow: hub.misty_approve(key, allow), lambda _r: None, self._approval_failed)
+        def pick(key: str) -> str:
+            return str(suggestions.get(key) or "none fits")
 
-    def _approval_failed(self, message: str) -> None:
-        self.status.setText(f"Your answer did not reach Misty: {message}")
-
-    def _finished(self, cancel: threading.Event) -> None:
-        self.status.setText("Stopped." if cancel.is_set() else "")
-        self._end()
-
-    def _failed(self, message: str) -> None:
-        if self.turns and not self.turns[-1]["text"]:
-            self.turns[-1]["error"] = message
-        self.status.setText(f"Misty could not answer: {message}")
-        self._end()
-
-    def _end(self) -> None:
-        self._cancel = None
-        self._busy(False)
-        self._render()
-
-    def _busy(self, busy: bool) -> None:
-        self.send_button.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
-        self.role.setEnabled(not busy)
-        self.docs.setEnabled(not busy)
-
-    def _render(self) -> None:
-        self._render_timer.stop()
-        # A backslash before < keeps a model's markup as plain text instead of letting the viewer render it.
-        safe = lambda s: str(s).replace("<", "\\<")  # noqa: E731
-        parts = []
-        for t in self.turns:
-            who = f"Misty ({t['role']})" if t["role"] else "Misty"
-            lines = [f"**You**\n\n{safe(t['you'])}", f"**{who}**"]
-            lines += [f"*{safe(n)}*" for n in t["notes"]]
-            lines.append(safe(t["text"] or "..."))
-            if t["error"]:
-                lines.append(f"**Error:** {safe(t['error'])}")
-            if t["cites"]:
-                lines.append("Sources: " + "; ".join(safe(c.get("source", "?")) for c in t["cites"]))
-            parts.append("\n\n".join(lines))
-        self.transcript.setMarkdown("\n\n---\n\n".join(parts))
-        bar = self.transcript.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-
-def _to_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (list, dict)):
-        return json.dumps(value)
-    return str(value)
-
-
-def _from_text(text: str, original: Any) -> Any:
-    """The value typed in a cell, in the type the setting has now; ValueError when it does not fit."""
-    if isinstance(original, bool):
-        if text.strip().lower() in _TRUE:
-            return True
-        if text.strip().lower() in _FALSE:
-            return False
-        raise ValueError("use true or false")
-    if isinstance(original, int):
-        try:
-            return int(text)
-        except ValueError:
-            raise ValueError("a whole number is needed") from None
-    if isinstance(original, float):
-        try:
-            return float(text)
-        except ValueError:
-            raise ValueError("a number is needed") from None
-    if isinstance(original, (list, dict)):
-        try:
-            value = json.loads(text)
-        except ValueError:
-            raise ValueError("write it as JSON") from None
-        if not isinstance(value, type(original)):
-            raise ValueError(f"write a JSON {type(original).__name__}")
-        return value
-    if original is None:
-        return text or None
-    return text
+        memory = doc.get("memory_gbps")
+        lines = [
+            f"RAM {doc.get('ram_gb', '-')} GB; memory copy {'-' if memory is None else f'{memory} GB/s'}.",
+            f"Fastest: {pick('fastest')}. Keeps up with reading: {pick('balanced')}. Best quality that fits: {pick('best')}.",
+        ]
+        if doc.get("note"):
+            lines.append(str(doc["note"]))
+        self.bench_result.setText(" ".join(lines))
 
 
 class SettingsPage(Page):
@@ -838,3 +496,44 @@ class SettingsPage(Page):
     def _saved(self, _result: Any) -> None:
         self.status.setText("Saved.")
         self.refresh()
+
+
+def _to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _from_text(text: str, original: Any) -> Any:
+    """The value typed in a cell, in the type the setting has now; ValueError when it does not fit."""
+    if isinstance(original, bool):
+        if text.strip().lower() in _TRUE:
+            return True
+        if text.strip().lower() in _FALSE:
+            return False
+        raise ValueError("use true or false")
+    if isinstance(original, int):
+        try:
+            return int(text)
+        except ValueError:
+            raise ValueError("a whole number is needed") from None
+    if isinstance(original, float):
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError("a number is needed") from None
+    if isinstance(original, (list, dict)):
+        try:
+            value = json.loads(text)
+        except ValueError:
+            raise ValueError("write it as JSON") from None
+        if not isinstance(value, type(original)):
+            raise ValueError(f"write a JSON {type(original).__name__}")
+        return value
+    if original is None:
+        return text or None
+    return text

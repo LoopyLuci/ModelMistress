@@ -58,12 +58,23 @@ def without_role_tags(text: str) -> str:
 
 
 def without_tags_in_last_user_message(messages: list[dict]) -> list[dict]:
-    """The conversation as it goes to the model the router picked: the role tags of the last user message are not sent."""
+    """The conversation as it goes to the model the router picked: the role tags of the last user message are not sent.
+    A message with pictures has a list of parts; only its text parts are changed, the pictures go as they are."""
     last = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
     if last is None:
         return messages
     out = list(messages)
-    out[last] = {**out[last], "content": without_role_tags(str(out[last].get("content", "")))}
+    content = out[last].get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part = {**part, "text": without_role_tags(str(part.get("text", "")))}
+            parts.append(part)
+        new_content: str | list = parts
+    else:
+        new_content = without_role_tags(str(content))
+    out[last] = {**out[last], "content": new_content}
     return out
 
 
