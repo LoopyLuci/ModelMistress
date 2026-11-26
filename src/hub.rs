@@ -241,6 +241,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::misty::auto::operations());
     all.extend(crate::fabric::operations());
     all.extend(crate::forge::operations());
+    all.extend(crate::benchmark::operations());
     all
 }
 
@@ -1142,6 +1143,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("misty.") => crate::misty::ops::call(hub, id, a).await?,
         id if id.starts_with("router.") => crate::misty::auto::call(hub, id, a).await?,
         id if id.starts_with("fabric.") || id == "machine.status" => crate::fabric::call(hub, id, a).await?,
+        "system.bench" => crate::benchmark::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -2011,6 +2013,36 @@ async fn speech(
     Ok(([("content-type", req.format.content_type())], bytes).into_response())
 }
 
+/// The largest PDF a chat message takes.
+const MAX_DOCUMENT_BODY: usize = 64 << 20;
+
+/// `POST /v1/documents/text`: the body is a PDF; the reply is its text (see `documents`), for a chat message.
+async fn document_text(Extension(_who): Extension<Caller>, body: Bytes) -> ApiResult<Response> {
+    let (text, truncated) = crate::documents::pdf_text(&body).map_err(Fail::invalid)?;
+    Ok(Json(json!({"text": text, "truncated": truncated})).into_response())
+}
+
+/// `POST /v1/models/import`: a `.gguf` file as the body, named in `x-file-name`, copied into the models folder (see
+/// `model_import`). The model list finds it on its next refresh.
+async fn model_import(
+    State(hub): State<Hub>,
+    Extension(_who): Extension<Caller>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    let raw = headers.get("x-file-name").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let name = crate::model_import::file_name(raw).map_err(Fail::invalid)?;
+    let dir = crate::model_import::folder(&hub.engine.home);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Fail::new(500, "io", format!("could not create the models folder: {e}")))?;
+    let dest = dir.join(&name);
+    if dest.exists() {
+        return Err(Fail::new(409, "conflict", format!("{name} is already in the models folder")).into());
+    }
+    let bytes = crate::model_import::save(body, &dest).await.map_err(Fail::invalid)?;
+    Ok(Json(json!({"name": name, "bytes": bytes, "path": dest.display().to_string()})).into_response())
+}
+
 /// `POST /v1/images/generations`: JSON in, the PNGs out (as base64, or as urls of `/v1/images/files/`).
 async fn image_generations(
     State(hub): State<Hub>,
@@ -2232,6 +2264,12 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
         .route("/v1/audio/speech", post(speech))
+        .route(
+            "/v1/documents/text",
+            post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
+        )
+        // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
+        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))

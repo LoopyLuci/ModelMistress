@@ -7,6 +7,9 @@
 //! usage for peers) and `client` (the CLI's, MCP's and the desktop app's way to a running hub).
 
 pub mod audio;
+pub mod benchmark;
+pub mod documents;
+pub mod model_import;
 pub mod catalog;
 pub mod client;
 pub mod engine;
