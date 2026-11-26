@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use super::env::Environment;
+use super::feedback::{Label, Verdict, CAPACITY};
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -55,7 +56,9 @@ impl Store {
                status TEXT NOT NULL, started INTEGER NOT NULL, ms INTEGER NOT NULL, events TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS environments(id TEXT PRIMARY KEY, name TEXT NOT NULL, spec TEXT NOT NULL,
                created INTEGER NOT NULL, updated INTEGER NOT NULL);
-             CREATE UNIQUE INDEX IF NOT EXISTS environments_name ON environments(name COLLATE NOCASE);",
+             CREATE UNIQUE INDEX IF NOT EXISTS environments_name ON environments(name COLLATE NOCASE);
+             CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, question TEXT NOT NULL, answer TEXT NOT NULL,
+               label TEXT NOT NULL, tools TEXT NOT NULL, correction TEXT, at INTEGER NOT NULL);",
         )
         .map_err(|e| e.to_string())?;
         // A session's environment and folder came after the first version of this file: add the columns to an old one.
@@ -317,6 +320,78 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())
     }
+
+    // ---- the owner's verdicts on replies ----------------------------------------------------------------------------
+
+    /// Saves a verdict, then keeps only the newest [`CAPACITY`] of them. Returns its id.
+    pub fn save_feedback(&self, v: &Verdict) -> Result<i64, String> {
+        let c = self.conn.lock();
+        let tools = serde_json::to_string(&v.tools).map_err(|e| e.to_string())?;
+        c.execute(
+            "INSERT INTO feedback(question, answer, label, tools, correction, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![v.question, v.answer, v.label.wire(), tools, v.correction, v.at],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = c.last_insert_rowid();
+        c.execute(
+            "DELETE FROM feedback WHERE id NOT IN (SELECT id FROM feedback ORDER BY id DESC LIMIT ?1)",
+            params![CAPACITY as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Every saved verdict with its id, oldest first. A row with an unknown label is left out.
+    pub fn feedback(&self) -> Result<Vec<(i64, Verdict)>, String> {
+        let c = self.conn.lock();
+        let mut st = c
+            .prepare("SELECT id, question, answer, label, tools, correction, at FROM feedback ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = vec![];
+        for row in rows {
+            let (id, question, answer, label, tools, correction, at) = row.map_err(|e| e.to_string())?;
+            let Some(label) = Label::of(&label) else { continue };
+            let tools: Vec<String> = serde_json::from_str(&tools).unwrap_or_default();
+            out.push((id, Verdict { question, answer, label, tools, correction, at }));
+        }
+        Ok(out)
+    }
+
+    /// Every saved verdict, oldest first.
+    pub fn feedback_all(&self) -> Result<Vec<Verdict>, String> {
+        Ok(self.feedback()?.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Removes one verdict. False when there is no such id.
+    pub fn forget_feedback(&self, id: i64) -> Result<bool, String> {
+        Ok(self
+            .conn
+            .lock()
+            .execute("DELETE FROM feedback WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?
+            > 0)
+    }
+
+    /// Removes every verdict. Returns how many there were.
+    pub fn clear_feedback(&self) -> Result<usize, String> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM feedback", [])
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -469,5 +544,33 @@ mod tests {
         assert!(s.run("missing").unwrap().is_none());
         s.delete_session(&sid).unwrap();
         assert!(s.run("r1").unwrap().is_some(), "a deleted session keeps its run record");
+    }
+
+    #[test]
+    fn verdicts_are_saved_listed_forgotten_and_only_the_newest_are_kept() {
+        let s = Store::memory().unwrap();
+        let v = Verdict::new("what time is it", "noon", Label::NoTools, vec![], None, 1).unwrap();
+        let id = s.save_feedback(&v).unwrap();
+        let fix = Verdict::new("capital of france", "Lyon", Label::Corrected, vec!["calc".into()], Some("Paris"), 2)
+            .unwrap();
+        s.save_feedback(&fix).unwrap();
+        let rows = s.feedback().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (id, v.clone()));
+        assert_eq!(rows[1].1.correction.as_deref(), Some("Paris"));
+        assert_eq!(rows[1].1.tools, vec!["calc".to_string()]);
+        assert!(s.forget_feedback(id).unwrap());
+        assert!(!s.forget_feedback(id).unwrap());
+        assert_eq!(s.feedback_all().unwrap().len(), 1);
+        // only the newest CAPACITY are kept
+        for n in 0..CAPACITY + 3 {
+            let x = Verdict::new(&format!("question {n}"), "a", Label::Bad, vec![], None, n as i64).unwrap();
+            s.save_feedback(&x).unwrap();
+        }
+        let all = s.feedback_all().unwrap();
+        assert_eq!(all.len(), CAPACITY);
+        assert_eq!(all.last().unwrap().question, format!("question {}", CAPACITY + 2));
+        assert_eq!(s.clear_feedback().unwrap(), CAPACITY);
+        assert!(s.feedback_all().unwrap().is_empty());
     }
 }

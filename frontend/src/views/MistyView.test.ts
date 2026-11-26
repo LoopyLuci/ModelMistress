@@ -13,6 +13,7 @@ const DOCS = { id: 'e2', name: 'Docs', description: '', cwd: null, roots: [], va
 
 let envList: unknown[]
 let sessions: any[]
+let runs: any[]
 let envsFail = false
 const sent = (op: string) => vi.mocked(call).mock.calls.filter((c) => c[0] === op).map((c) => c[1] as any)
 
@@ -20,6 +21,7 @@ beforeEach(() => {
   localStorage.clear()
   envList = [APP, DOCS]
   envsFail = false
+  runs = []
   sessions = [
     { id: 's1', title: 'old chat', created: 1, updated: 2, messages: 2, env: 'e1', env_name: 'My app', cwd: null },
     { id: 's2', title: 'own folder', created: 1, updated: 1, messages: 2, env: null, env_name: null, cwd: '/somewhere/else' },
@@ -45,6 +47,8 @@ beforeEach(() => {
       }
       case 'misty.run.start': return { run: 'r1', session: args.session || 'made' }
       case 'misty.run.get': return { run: 'r1', events: [{ type: 'final', status: 'done', text: 'ok', ms: 5 }], next: 1, done: true, running: false, pending: [] }
+      case 'misty.run.list': return { active: [], recent: runs }
+      case 'misty.rate': return { id: 1, label: args.label, counts: {} }
       default: throw new Error(`no operation ${op}`)
     }
   })
@@ -205,5 +209,53 @@ describe('Up and Down in the Misty message box', () => {
     expect(JSON.parse(localStorage.getItem('mm_input_history') || '[]')).toEqual(['remember me'])
     await box(w).trigger('keydown', { key: 'ArrowUp' })
     expect((box(w).element as HTMLTextAreaElement).value).toBe('remember me')
+  })
+})
+
+describe('rating a reply', () => {
+  const ask = async (w: VueWrapper, text: string) => {
+    await box(w).setValue(text)
+    await w.find('form.compose').trigger('submit')
+    await flushPromises()
+  }
+
+  it('rates the reply that was just given, and the rating stays with that reply', async () => {
+    const w = await open()
+    await ask(w, 'what is 2+2?')
+    const good = w.findAll('.rate button').find((b) => b.text() === 'Good')!
+    await good.trigger('click')
+    await flushPromises()
+    expect(sent('misty.rate')).toEqual([{ run: 'r1', label: 'good' }])
+    expect(w.find('.rate .pill').text()).toBe('rated: good')
+  })
+
+  it('takes a correction with the right answer', async () => {
+    const w = await open()
+    await ask(w, 'capital of france?')
+    await w.findAll('.rate button').find((b) => b.text() === 'Correct it...')!.trigger('click')
+    expect(w.find('form.fix').exists()).toBe(true)
+    await w.find('textarea[aria-label="the right answer"]').setValue('Paris')
+    await w.find('form.fix').trigger('submit')
+    await flushPromises()
+    expect(sent('misty.rate')).toEqual([{ run: 'r1', label: 'corrected', correction: 'Paris' }])
+    expect(w.find('form.fix').exists()).toBe(false)
+  })
+
+  it('pairs the replies of an opened chat with their runs, so the old ones can be rated too', async () => {
+    runs = [{ id: 'old1', session: 's1', input: 'what is in main.rs?', status: 'done', started: 1, ms: 2, role: 'fast' }]
+    const w = await open()
+    await w.findAll('.sessions .link')[0].trigger('click')
+    await flushPromises()
+    expect(w.findAll('.rate')).toHaveLength(1)
+    await w.findAll('.rate button').find((b) => b.text() === 'Should have used a tool')!.trigger('click')
+    await flushPromises()
+    expect(sent('misty.rate')).toEqual([{ run: 'old1', label: 'needs_tools' }])
+  })
+
+  it('shows no rating for a chat whose runs the hub cannot list', async () => {
+    const w = await open()
+    await w.findAll('.sessions .link')[0].trigger('click')
+    await flushPromises()
+    expect(w.find('.rate').exists()).toBe(false)
   })
 })

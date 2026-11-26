@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Desktop app: Misty, chat and speech
+
+- Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are
+  kept in Misty's database (`misty.rate`, `misty.feedback.list`, `misty.feedback.forget`). "No tool needed" and "Should have
+  used a tool" route similar questions, and a correction is given to her as a note for similar questions
+  (`src/misty/feedback.rs`, `src/misty/agent.rs`).
+- Learning tab on Setup and status: the rating counts, an export as chat-format JSON lines (`misty.training.export`), and
+  forgetting one rating or all of them.
+- Chat: a message written during a reply waits and is sent after it; "Jump to latest" when scrolled up; Dictate (the
+  microphone into the message box); "Read aloud" under each reply.
+- Speech page: dictation works. Recordings are written as WAV in the browser before upload, because the hub reads WAV and
+  MP3 but not WebM (`frontend/src/wav.ts`).
+- Parity with the Android app: `docs/android-parity.md`. Not on the desktop yet: Live conversation, steer during a reply,
+  camera input, text and PDF attachments, top-k and seed in the chat, and the queue on the Misty page.
+- Tests: `cargo test --lib misty` (145 tests) and the frontend tests for these pages. Not run in the desktop app window.
+
 ### Android app (`android/`, version 0.1.0)
 
 - Live conversation: the phone listens while the model speaks, so talking over it stops it. The phone's own voice is matched

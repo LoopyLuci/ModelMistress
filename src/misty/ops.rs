@@ -24,7 +24,7 @@ use super::pipeline;
 use super::roster::Role;
 use super::runs::Run;
 use super::toolbox;
-use super::{router, setup, Misty};
+use super::{feedback, router, setup, Misty};
 use crate::engine::Fail;
 use crate::hosting::Permit;
 use crate::hub::{ApiError, Hub};
@@ -118,6 +118,12 @@ pub fn operations() -> Vec<Value> {
            json!({"name": t("a pipeline name"), "inputs": {"type": "object"}, "wait": {"type": "boolean"}}), &["name"]),
         op("misty.bench", "Time one short generation on every ready role (the first run includes loading)", true, false,
            json!({"tokens": {"type": "integer", "minimum": 8, "maximum": 512}}), &[]),
+        op("misty.rate", "Rate a reply: good, bad, no_tools (it needed no tool), needs_tools (it needed the tools it was offered), or corrected with the right answer. Similar questions are routed and answered from the verdict from now on", true, false,
+           json!({"run": t("the run of the reply (misty.run.list shows them)"), "label": {"type": "string", "enum": ["good", "bad", "no_tools", "needs_tools", "corrected"]},
+                  "correction": t("the right answer, for corrected")}), &["run", "label"]),
+        op("misty.feedback.list", "The owner's verdicts on replies, newest first, with the counts", false, false, json!({"limit": {"type": "integer", "minimum": 1}}), &[]),
+        op("misty.feedback.forget", "Remove one verdict by its id, or all of them", true, true, json!({"id": {"type": "integer"}, "all": {"type": "boolean"}}), &[]),
+        op("misty.training.export", "The good replies and the corrections as chat-format training data, one JSON object per line", false, false, json!({}), &[]),
     ]
 }
 
@@ -379,6 +385,46 @@ fn merge(cur: &mut Value, patch: &Value) {
 
 // ---- dispatch ----------------------------------------------------------------------------------------------------------
 
+/// Records the owner's verdict on the reply of a finished run. The question and the answer come from the run's record,
+/// and the tools are the ones the run was offered (its `offer` event), so the verdict cannot describe a different reply.
+fn rate(misty: &Misty, a: &Value) -> Res<Value> {
+    let run_id = s(a, "run")?;
+    let run = misty
+        .state
+        .run(run_id)
+        .map_err(io)?
+        .ok_or_else(|| Fail::not_found(format!("no finished run {run_id} (misty.run.list shows them)")))?;
+    let name = s(a, "label")?;
+    let label = feedback::Label::of(name)
+        .ok_or_else(|| Fail::invalid(format!("label {name:?} is not one of good, bad, no_tools, needs_tools, corrected")))?;
+    let offered: Vec<String> = run["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["type"] == "offer")
+        .last()
+        .and_then(|e| e["tools"].as_array())
+        .map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if label == feedback::Label::NeedsTools && offered.is_empty() {
+        return Err(Fail::invalid(
+            "no tool was offered for that reply, so there is no tool it should have used: rate it no_tools, good or bad",
+        ));
+    }
+    let verdict = feedback::Verdict::new(
+        run["input"].as_str().unwrap_or(""),
+        run["output"].as_str().unwrap_or(""),
+        label,
+        offered,
+        a["correction"].as_str(),
+        feedback::now(),
+    )
+    .map_err(Fail::invalid)?;
+    let id = misty.state.save_feedback(&verdict).map_err(io)?;
+    let all = misty.state.feedback_all().map_err(io)?;
+    Ok(json!({"id": id, "label": label.wire(), "counts": feedback::counts(&all)}))
+}
+
 pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
     let misty = Misty::get(hub)?;
     misty.warm().await;
@@ -519,8 +565,42 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             let text = s(a, "input")?;
             let mut f = router::Features::of(text);
             f.rag_hit = misty.rag.strength(&collection, text);
-            let r = router::route(&f, &fleet, cfg.reflex);
-            json!({"features": f, "route": r, "ready": fleet.ready, "warm": fleet.warm, "roster": res})
+            let mut r = router::route(&f, &fleet, cfg.reflex);
+            let taught = agent::apply_taught(&mut r, text, &misty.state.feedback_all().map_err(io)?);
+            json!({"features": f, "route": r, "taught_tools": taught, "ready": fleet.ready, "warm": fleet.warm, "roster": res})
+        }
+        "misty.rate" => rate(&misty, a)?,
+        "misty.feedback.list" => {
+            let rows = misty.state.feedback().map_err(io)?;
+            let all: Vec<feedback::Verdict> = rows.iter().map(|(_, v)| v.clone()).collect();
+            let limit = a["limit"].as_u64().unwrap_or(100) as usize;
+            let verdicts: Vec<Value> = rows
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|(id, v)| {
+                    let mut j = v.to_json();
+                    j["id"] = json!(id);
+                    j
+                })
+                .collect();
+            json!({"counts": feedback::counts(&all), "verdicts": verdicts})
+        }
+        "misty.feedback.forget" => {
+            let removed = if a["all"].as_bool().unwrap_or(false) {
+                misty.state.clear_feedback().map_err(io)?
+            } else {
+                let id = a["id"]
+                    .as_i64()
+                    .ok_or_else(|| Fail::invalid("say which verdict (its id), or all: true"))?;
+                usize::from(misty.state.forget_feedback(id).map_err(io)?)
+            };
+            json!({"removed": removed})
+        }
+        "misty.training.export" => {
+            let lines = feedback::training_lines(&misty.state.feedback_all().map_err(io)?);
+            let jsonl: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            json!({"count": lines.len(), "jsonl": jsonl})
         }
         "misty.rag.ingest" => {
             if let Some(path) = os(a, "path") {
@@ -1081,6 +1161,35 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "duplicate operation ids");
         assert_eq!(route_of("misty.run.get"), "/v1/misty/run/get");
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_rated_its_verdicts_are_listed_exported_and_forgotten() {
+        let r = rig_ops(0);
+        r.llm.say("Lyon.");
+        let v = c(&r, "misty.ask", json!({"input": "capital of france"})).await.unwrap();
+        let run = v["run"].as_str().unwrap().to_string();
+        // no tool was offered for this reply, so none can be the one it should have used
+        let e = c(&r, "misty.rate", json!({"run": run, "label": "needs_tools"})).await.unwrap_err();
+        assert!(e.message.contains("no tool was offered"), "{}", e.message);
+        assert!(c(&r, "misty.rate", json!({"run": run, "label": "corrected"})).await.is_err(), "a correction needs the answer");
+        assert!(c(&r, "misty.rate", json!({"run": "nope", "label": "good"})).await.is_err());
+        assert!(c(&r, "misty.rate", json!({"run": run, "label": "fine"})).await.is_err());
+        let rated = c(&r, "misty.rate", json!({"run": run, "label": "corrected", "correction": "Paris"}))
+            .await
+            .unwrap();
+        assert_eq!(rated["counts"]["corrected"], 1, "{rated}");
+        let id = rated["id"].as_i64().unwrap();
+        let list = c(&r, "misty.feedback.list", json!({})).await.unwrap();
+        assert_eq!(list["verdicts"][0]["question"], "capital of france");
+        assert_eq!(list["verdicts"][0]["answer"], "Lyon.");
+        assert_eq!(list["verdicts"][0]["correction"], "Paris");
+        let train = c(&r, "misty.training.export", json!({})).await.unwrap();
+        assert_eq!(train["count"], 1);
+        assert!(train["jsonl"].as_str().unwrap().contains("Paris"));
+        assert!(c(&r, "misty.feedback.forget", json!({})).await.is_err(), "say which verdict, or all");
+        assert_eq!(c(&r, "misty.feedback.forget", json!({"id": id})).await.unwrap()["removed"], 1);
+        assert_eq!(c(&r, "misty.feedback.list", json!({})).await.unwrap()["counts"]["total"], 0);
     }
 
     #[tokio::test]

@@ -57,6 +57,19 @@
           <article v-for="(m, i) in history" :key="i" class="msg" :class="m.role">
             <strong>{{ m.role === 'user' ? 'You' : 'Misty' }}</strong>
             <div class="text">{{ m.content }}</div>
+            <div v-if="m.role === 'assistant' && m.run" class="rate" aria-label="rate this reply">
+              <span v-if="m.rated" class="pill ok">rated: {{ LABEL_TEXT[m.rated] }}</span>
+              <span v-else class="muted small">Rate this reply:</span>
+              <button v-for="b in LABELS" :key="b.id" class="btn" type="button" @click="rate(m, b.id)">{{ b.text }}</button>
+              <button class="btn" type="button" @click="startFix(m)">Correct it...</button>
+              <form v-if="fixing === m.run" class="fix" @submit.prevent="rate(m, 'corrected', fix.trim())">
+                <textarea v-model="fix" rows="2" aria-label="the right answer" placeholder="What is the right answer? Misty uses it for similar questions."></textarea>
+                <div class="row">
+                  <button class="btn primary" type="submit" :disabled="!fix.trim()">Save correction</button>
+                  <button class="btn" type="button" @click="fixing = ''">Cancel</button>
+                </div>
+              </form>
+            </div>
           </article>
 
           <article v-if="live" class="msg assistant">
@@ -138,12 +151,15 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import FolderPicker from '@/components/FolderPicker.vue'
 import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
-import { TOOL_CLASSES, fold, follow, misty, type Approval, type Ask, type Environment, type Folded, type MistyStatus, type Session } from '@/misty'
+import {
+  LABELS, LABEL_TEXT, TOOL_CLASSES, fold, follow, misty, pairRuns,
+  type Approval, type Ask, type Environment, type Folded, type Label, type MistyStatus, type Session, type Turn,
+} from '@/misty'
 
 const status = ref<MistyStatus | null>(null)
 const sessions = ref<Session[]>([])
 const session = ref('')
-const history = ref<{ role: string; content: string }[]>([])
+const history = ref<Turn[]>([])
 const input = ref('')
 const role = ref('')
 const rag = ref<'auto' | 'on' | 'off'>('auto')
@@ -266,7 +282,9 @@ async function refresh() {
 
 async function open(id: string) {
   try {
-    history.value = await misty.session(id)
+    // the replies are paired with their runs, so that each can be rated; a hub that cannot list runs shows them unrated
+    const turns = await misty.session(id)
+    history.value = pairRuns(turns, await misty.runs().catch(() => []), id)
     session.value = id
     scopeOf(id)
     recall.reset()
@@ -337,7 +355,7 @@ async function send() {
     if (!gone && live.value && live.value.text && live.value.status !== 'error') {
       // the stored history is the record: show it, with this run's footer kept under the last answer
       const last = live.value
-      history.value.push({ role: 'assistant', content: last.text })
+      history.value.push({ role: 'assistant', content: last.text, run: r.run })
       live.value = { ...last, text: '', reasoning: '', notes: [], tools: [] }
     }
   } catch (e) {
@@ -357,6 +375,31 @@ async function answer(a: Approval, allow: boolean) {
   } catch (e) {
     fail(e)
   }
+}
+
+// ---- rating a reply: the owner's verdict on it (src/misty/feedback.rs) -------------------------------------------------
+/** The run whose reply is being corrected (the correction box is open under it). */
+const fixing = ref('')
+const fix = ref('')
+
+async function rate(t: Turn, label: Label, correction?: string) {
+  if (!t.run) return
+  try {
+    await misty.rate(t.run, label, correction || undefined)
+    t.rated = label
+    if (fixing.value === t.run) {
+      fixing.value = ''
+      fix.value = ''
+    }
+  } catch (e) {
+    fail(e)
+  }
+}
+
+function startFix(t: Turn) {
+  if (!t.run) return
+  fixing.value = t.run
+  fix.value = ''
 }
 
 async function stop() {
@@ -409,6 +452,9 @@ onBeforeUnmount(() => {
 .approval { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
 .args { white-space: pre-wrap; max-height: 200px; overflow: auto; margin: 6px 0; }
 .compose textarea { margin-bottom: 8px; }
+.rate { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.fix { flex-basis: 100%; }
+.fix textarea { width: 100%; margin: 6px 0; }
 .scope { margin-bottom: 10px; }
 .scope > * + * { margin-top: 8px; }
 .scope .row { align-items: center; flex-wrap: wrap; gap: 8px; }

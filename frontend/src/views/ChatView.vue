@@ -88,16 +88,29 @@
         />
       </div>
 
+      <div v-if="behind" class="jumprow">
+        <button class="btn" type="button" @click="jumpToLatest">Jump to latest</button>
+      </div>
+
       <form class="composer" @submit.prevent="send">
         <p v-if="error" class="error-box small" role="alert">{{ error }}</p>
         <div v-if="pending.length" class="thumbs">
           <span v-for="(u, i) in pending" :key="i" class="thumb"><img :src="u" alt="attached picture" /><button type="button" aria-label="Remove picture" @click="pending.splice(i, 1)">x</button></span>
         </div>
+        <ul v-if="queuedHere.length" class="queued" aria-label="Queued messages">
+          <li v-for="(q, i) in queuedHere" :key="i">
+            <span class="muted small">Next:</span>
+            <span class="qtext">{{ q.text || 'Picture' }}</span>
+            <button class="mini" type="button" :aria-label="`Remove queued message ${i + 1}`" @click="unqueue(q)">Remove</button>
+          </li>
+        </ul>
         <div class="row inrow">
           <textarea ref="box" v-model="input" rows="2" class="grow" placeholder="Message (Enter sends, Shift+Enter for a new line, Up brings back an earlier message)" aria-label="Message" @keydown="onKey" @paste="onPaste"></textarea>
           <input v-if="canPicture" ref="file" type="file" accept="image/*" multiple hidden @change="onFiles" />
           <button v-if="canPicture" class="btn" type="button" :title="cur?.router ? 'Attach a picture (the router then needs a model that can see pictures)' : 'Attach a picture'" @click="file?.click()">Picture</button>
+          <button class="btn" type="button" :aria-pressed="listening" :disabled="transcribing" :title="listening ? 'Stop, and write down what was said' : 'Say the message instead of typing it'" @click="toggleDictation">{{ listening ? 'Stop listening' : transcribing ? 'Transcribing...' : 'Dictate' }}</button>
           <button v-if="busy" class="btn danger" type="button" @click="stop">Stop</button>
+          <button v-if="busy" class="btn primary" type="submit" :disabled="!canQueue" title="Sent after this reply">Queue</button>
           <button v-else class="btn primary" type="submit" :disabled="!canSend">Send</button>
         </div>
       </form>
@@ -126,6 +139,7 @@ import { chatChoices, groupModels, isChatModel, modelLabel, type HubModel } from
 import { AUTO, pickFor, withoutTagsInLastUserMessage, type RouteNote } from '@/chat/router'
 import { chats, flush, lastId, newConversation, removeConversation, sorted, type Conversation, type Msg } from '@/chat/store'
 import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
+import { notInBuild, startRecording, transcribeClip } from '@/speech'
 
 const route = useRoute()
 const router = useRouter()
@@ -176,6 +190,14 @@ const replies = ref(0)
 let abort: AbortController | null = null
 let waitTimer: number | undefined
 let stick = true
+/** Messages written during a reply: each waits for the reply and goes next, in the chat it was written in. */
+const queue = ref<{ conv: string; text: string; images: string[] }[]>([])
+const queuedHere = computed(() => queue.value.filter((q) => q.conv === conv.value?.id))
+/** The reader has scrolled up from the newest message: a button brings them back. */
+const behind = ref(false)
+const listening = ref(false)
+const transcribing = ref(false)
+let recording: { stop: () => Promise<Blob> } | null = null
 
 /** Up and Down in the message box: what was sent in other chats, then in this one (see chat/recall.ts). */
 const recall = createRecall(() =>
@@ -194,6 +216,7 @@ const known = (id: string) => allModels.value.some((m) => m.id === id)
 /** A picture can be attached to a model that sees pictures, and to the router (it picks one that does, or says it has none). */
 const canPicture = computed(() => !!cur.value?.vision || !!cur.value?.router)
 const canSend = computed(() => !busy.value && !!conv.value?.model && (!!input.value.trim() || pending.value.length > 0))
+const canQueue = computed(() => busy.value && !!conv.value?.model && (!!input.value.trim() || pending.value.length > 0))
 const waiting = computed(() => {
   if (routing.value) return 'The router is choosing a model...'
   const who = target.value ? `Waiting for ${target.value}...` : 'Waiting for the model...'
@@ -236,6 +259,7 @@ function open(id: string) {
   pickDefault()
   stick = true
   nextTick(() => scrollDown(true))
+  nextTick(drainQueue) // a message queued here while a reply ran in another chat goes now
 }
 
 function startNew() {
@@ -289,13 +313,19 @@ function scrollDown(force = false) {
 function onScroll() {
   const el = scroller.value
   if (el) stick = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+  behind.value = !stick
+}
+function jumpToLatest() {
+  stick = true
+  behind.value = false
+  scrollDown(true)
 }
 
 function onKey(e: KeyboardEvent) {
   if (box.value && recallKey(e, box.value, recall, (t) => (input.value = t))) return
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
-    if (canSend.value) send()
+    if (canSend.value || canQueue.value) send()
   }
 }
 function onWindowKey(e: KeyboardEvent) {
@@ -366,16 +396,74 @@ function historyFor(c: Conversation, upto: number): ChatMessage[] {
 
 async function send() {
   const c = conv.value
-  if (!c || !canSend.value) return
-  error.value = ''
+  if (!c) return
   const text = input.value.trim()
-  c.messages.push({ role: 'user', content: text, ...(pending.value.length ? { images: [...pending.value] } : {}) })
-  if (!c.renamed && c.messages.length === 1) c.title = (text || 'Picture').replace(/\s+/g, ' ').slice(0, 48)
+  if (busy.value) {
+    // a message written during a reply waits for it, and is sent next in this chat
+    if (!canQueue.value) return
+    queue.value.push({ conv: c.id, text, images: [...pending.value] })
+    remember(text)
+    recall.reset()
+    input.value = ''
+    pending.value = []
+    return
+  }
+  if (!canSend.value) return
+  error.value = ''
+  const images = [...pending.value]
   remember(text)
   recall.reset()
   input.value = ''
   pending.value = []
+  await sendNow(c, text, images)
+}
+
+async function sendNow(c: Conversation, text: string, images: string[]) {
+  c.messages.push({ role: 'user', content: text, ...(images.length ? { images } : {}) })
+  if (!c.renamed && c.messages.length === 1) c.title = (text || 'Picture').replace(/\s+/g, ' ').slice(0, 48)
   await reply(c)
+}
+
+/** Sends the next message queued in the chat on screen, once no reply is running. */
+function drainQueue() {
+  const c = conv.value
+  if (!c || busy.value) return
+  const i = queue.value.findIndex((q) => q.conv === c.id)
+  if (i < 0) return
+  const [next] = queue.value.splice(i, 1)
+  sendNow(c, next.text, next.images)
+}
+
+function unqueue(item: { conv: string; text: string; images: string[] }) {
+  queue.value = queue.value.filter((q) => q !== item)
+}
+
+/** Dictation: the first press starts the microphone; the second writes what was said into the box. */
+async function toggleDictation() {
+  error.value = ''
+  if (listening.value) {
+    listening.value = false
+    transcribing.value = true
+    try {
+      const clip = await recording?.stop()
+      recording = null
+      const said = clip ? await transcribeClip(clip) : ''
+      if (said) input.value = [input.value.trimEnd(), said].filter(Boolean).join(' ')
+      else error.value = 'No speech was recognised.'
+    } catch (e: any) {
+      error.value = notInBuild(e) ? 'Dictation is not available in this build.' : `Dictation: ${e?.message || e}`
+    } finally {
+      transcribing.value = false
+    }
+    nextTick(() => box.value?.focus())
+    return
+  }
+  try {
+    recording = await startRecording()
+    listening.value = true
+  } catch (e: any) {
+    error.value = `The microphone is not available: ${e?.message || e}`
+  }
 }
 
 async function retry() {
@@ -444,6 +532,7 @@ async function reply(c: Conversation) {
     replies.value++
     refreshModels()
     nextTick(() => box.value?.focus())
+    nextTick(drainQueue)
   }
 }
 
@@ -487,6 +576,10 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKey)
   window.clearInterval(waitTimer)
+  if (recording) {
+    void recording.stop() // the microphone is let go
+    recording = null
+  }
   // A reply in progress goes on only while this page is open.
   abort?.abort()
 })
@@ -531,6 +624,10 @@ watch(
 .thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .thumb { position: relative; }
 .thumb img { height: 56px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.queued { list-style: none; margin: 0 auto 6px; padding: 0; max-width: 900px; }
+.queued li { display: flex; gap: 8px; align-items: center; }
+.qtext { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jumprow { flex: none; text-align: center; padding: 4px 0; }
 .thumb button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); background: var(--panel); line-height: 1; font-size: 0.7rem; }
 @media (max-width: 800px) {
   .chat, .chat.withcanvas { grid-template-columns: minmax(0, 1fr); }

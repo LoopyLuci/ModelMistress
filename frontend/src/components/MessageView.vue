@@ -5,6 +5,7 @@
       <span v-if="msg.route?.role" class="pill good" title="The router chose this model for the message">router: {{ msg.route.role }}</span>
       <span class="grow"></span>
       <button v-if="msg.role === 'assistant' && msg.content" class="mini" type="button" @click="copyAll">{{ copied === 'all' ? 'Copied' : 'Copy' }}</button>
+      <button v-if="msg.role === 'assistant' && parts.answer" class="mini" type="button" :disabled="speaking" title="Hear this reply (the hub's voice)" @click="readAloud">{{ speaking ? 'Reading...' : 'Read aloud' }}</button>
       <button v-if="canRetry" class="mini" type="button" @click="emit('retry')">Regenerate</button>
     </header>
 
@@ -31,6 +32,7 @@
     </div>
 
     <p v-if="msg.error" class="error-box" role="alert">{{ msg.error }}</p>
+    <p v-if="speakError" class="error-box small" role="alert">{{ speakError }}</p>
     <p v-if="msg.stopped" class="muted small">Stopped.</p>
 
     <details v-if="msg.route?.why?.length" class="why muted small">
@@ -53,10 +55,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { renderMarkdown, splitThink } from '@/chat/markdown'
 import type { Msg } from '@/chat/store'
 import { extractAssets, isHubPath, type AssetKind } from '@/chat/media'
+import { notInBuild, speakClip } from '@/speech'
 
 const props = defineProps<{ msg: Msg; streaming?: boolean; canRetry?: boolean; waiting?: string; index?: number }>()
 const emit = defineEmits<{ (e: 'retry'): void; (e: 'open-asset', id: string): void }>()
@@ -72,6 +75,28 @@ const parts = computed(() => {
 })
 const html = computed(() => renderMarkdown(parts.value.answer))
 const sec = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`)
+
+// ---- read aloud: the reply's words, spoken by the hub's voice ----------------------------------------------------------
+const speaking = ref(false)
+const speakError = ref('')
+let player: HTMLAudioElement | null = null
+async function readAloud() {
+  speakError.value = ''
+  speaking.value = true
+  try {
+    const clip = await speakClip(parts.value.answer)
+    const url = URL.createObjectURL(clip)
+    player?.pause()
+    player = new Audio(url)
+    player.onended = () => URL.revokeObjectURL(url)
+    await player.play()
+  } catch (e: any) {
+    speakError.value = notInBuild(e) ? 'Read aloud is not available in this build.' : `Read aloud: ${e?.message || e}`
+  } finally {
+    speaking.value = false
+  }
+}
+onBeforeUnmount(() => player?.pause())
 
 const copied = ref('')
 async function copy(text: string): Promise<boolean> {
