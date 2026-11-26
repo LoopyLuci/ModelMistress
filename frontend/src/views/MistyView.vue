@@ -117,7 +117,21 @@
         </div>
 
         <form class="card compose" @submit.prevent="send">
-          <textarea ref="box" v-model="input" rows="3" placeholder="Ask Misty (Ctrl+Enter sends, Up brings back an earlier message)" aria-label="message" :disabled="busy" @keydown="onKey"></textarea>
+          <ul v-if="queuedHere.length" class="queued" aria-label="Queued messages">
+            <li v-for="(q, i) in queuedHere" :key="i">
+              <span class="muted small">Next:</span>
+              <span class="qtext">{{ q.text }}</span>
+              <button class="mini" type="button" :aria-label="`Remove queued message ${i + 1}`" @click="queue.splice(queue.indexOf(q), 1)">Remove</button>
+            </li>
+          </ul>
+          <div v-if="pendingFiles.length" class="filechips" aria-label="Attached files">
+            <span v-for="(f, i) in pendingFiles" :key="i" class="fchip">{{ f.name }}<span v-if="f.cut" class="muted small"> (cut to 2000 characters)</span><button class="mini" type="button" :aria-label="`Remove file ${f.name}`" @click="pendingFiles.splice(i, 1)">Remove</button></span>
+          </div>
+          <p v-if="steer && steer.session === session" class="small muted" role="status">
+            Steer: "{{ steer.text }}" goes in after the next sentence. The text so far is kept.
+            <button class="mini" type="button" @click="cancelSteer">Cancel steer</button>
+          </p>
+          <textarea ref="box" v-model="input" rows="3" placeholder="Ask Misty (Ctrl+Enter sends, or queues while she answers; Up brings back an earlier message)" aria-label="message" @keydown="onKey"></textarea>
           <div class="row">
             <label class="field inline">model
               <select v-model="role" :disabled="busy">
@@ -135,9 +149,12 @@
               </select>
             </label>
             <label class="row small"><input v-model="noTools" type="checkbox" :disabled="busy" /> no tools</label>
+            <input ref="docs" type="file" accept=".txt,.md,.markdown,.json,.csv,.tsv,.log,.py,.rs,.ts,.tsx,.js,.jsx,.vue,.html,.css,.xml,.yaml,.yml,.toml,.ini,.sh,.ps1,.sql,.go,.java,.kt,.c,.h,.cpp,.hpp,.cs,.rb,.php,.swift,.pdf,text/*,application/json,application/pdf" multiple hidden @change="onDocs" />
+            <button class="btn" type="button" title="Attach a text, source or PDF file. Its text goes in with the message as data, cut to 2000 characters." @click="docs?.click()">Attach file</button>
             <span class="grow"></span>
             <button v-if="busy" class="btn danger" type="button" @click="stop">Stop</button>
-            <button class="btn primary" type="submit" :disabled="busy || !input.trim()">Send</button>
+            <button v-if="busy" class="btn" type="button" :disabled="!canSteer" title="Write a note now. It goes in after the next sentence of this reply; the text so far is kept." @click="steerNow">Steer</button>
+            <button class="btn primary" type="submit" :disabled="!input.trim() && !pendingFiles.length">{{ busy ? 'Queue' : 'Send' }}</button>
           </div>
         </form>
       </section>
@@ -151,6 +168,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import FolderPicker from '@/components/FolderPicker.vue'
 import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
+import { steerCut } from '@/chat/extras'
+import { readAttachment, type Attachment } from '@/chat/documents'
 import {
   LABELS, LABEL_TEXT, TOOL_CLASSES, fold, follow, misty, pairRuns,
   type Approval, type Ask, type Environment, type Folded, type Label, type MistyStatus, type Session, type Turn,
@@ -173,6 +192,17 @@ const scroller = ref<HTMLElement | null>(null)
 const box = ref<HTMLTextAreaElement | null>(null)
 let stopped = false
 let gone = false
+/** The reply text kept when a steering note cut it (null while no cut was made). */
+let steeredText: string | null = null
+/** Messages written during a reply wait here; each goes next in the session it was written in. */
+const queue = ref<{ session: string; text: string }[]>([])
+const queuedHere = computed(() => queue.value.filter((q) => q.session === session.value))
+/** A steering note waits for the next sentence end of the reply it was written in. */
+const steer = ref<{ text: string; from: number; session: string } | null>(null)
+/** Files attached to the message being written (their text goes in with it). */
+const pendingFiles = ref<Attachment[]>([])
+const docs = ref<HTMLInputElement | null>(null)
+const canSteer = computed(() => busy.value && !!input.value.trim() && !steer.value)
 
 const fail = (e: any) => {
   error.value = e?.message || String(e)
@@ -318,15 +348,71 @@ async function drop(id: string) {
 }
 
 async function send() {
+  const typed = input.value.trim()
+  if (!typed && !pendingFiles.value.length) return
+  // the attached files' text goes in with the message, as data (chat/extras.ts)
+  const files = [...pendingFiles.value]
+  const text = [typed, ...files.map((f) => f.text)].filter(Boolean).join('\n\n')
+  if (busy.value) {
+    // a message written during a reply waits for it, and goes next in this session
+    queue.value.push({ session: session.value, text })
+    remember(typed)
+    recall.reset()
+    input.value = ''
+    pendingFiles.value = []
+    return
+  }
+  remember(typed)
+  recall.reset()
+  input.value = ''
+  pendingFiles.value = []
+  await startTurn(text)
+}
+
+/** Attached files: text-like files are read here, PDFs by the hub (chat/documents.ts). */
+async function onDocs(e: Event) {
+  const el = e.target as HTMLInputElement
+  for (const f of [...(el.files || [])]) {
+    try {
+      pendingFiles.value.push(await readAttachment(f))
+    } catch (err: any) {
+      error.value = err?.message || String(err)
+    }
+  }
+  el.value = ''
+}
+
+/** Messages written during a reply: each waits, and goes next in the session it was written in. */
+function drainQueue() {
+  if (busy.value || gone) return // a page that was closed starts nothing new
+  const i = queue.value.findIndex((q) => q.session === session.value)
+  if (i < 0) return
+  const [next] = queue.value.splice(i, 1)
+  startTurn(next.text)
+}
+
+/** A steering note: the reply is cut after its next sentence (chat/extras.ts), and the note goes in next. */
+function steerNow() {
   const text = input.value.trim()
-  if (!text || busy.value) return
-  busy.value = true
-  stopped = false
-  error.value = ''
-  history.value.push({ role: 'user', content: text })
+  if (!busy.value || !text || steer.value) return
+  steer.value = { text, from: live.value?.text.length ?? 0, session: session.value }
   remember(text)
   recall.reset()
   input.value = ''
+}
+function cancelSteer() {
+  if (!steer.value) return
+  if (!input.value.trim()) input.value = steer.value.text // the note goes back into the box
+  steer.value = null
+}
+
+/** One turn: the text goes to Misty as a new message in the open session, or in a new one. */
+async function startTurn(text: string) {
+  busy.value = true
+  stopped = false
+  steeredText = null
+  error.value = ''
+  history.value.push({ role: 'user', content: text })
   live.value = fold([])
   toBottom()
   try {
@@ -341,18 +427,36 @@ async function send() {
     if (noTools.value) a.no_tools = true
     const r = await misty.start(a)
     runId.value = r.run
-    if (r.session) session.value = r.session
+    if (r.session) {
+      session.value = r.session
+      // a message queued before this chat had a session goes into it
+      for (const q of queue.value) if (!q.session) q.session = r.session
+    }
     await follow(
       r.run,
       (p, all) => {
         live.value = fold(all)
         pending.value = p.pending
+        const s = steer.value
+        if (s && s.session === session.value && steeredText == null && live.value) {
+          const cut = steerCut(live.value.text, s.from)
+          if (cut != null) {
+            // the sentence is done: the reply keeps what it said, and the run is stopped
+            steeredText = live.value.text.slice(0, cut).trimEnd()
+            stopped = true
+            misty.cancel(r.run).catch(fail)
+          }
+        }
         toBottom()
       },
       () => stopped || gone,
     )
     pending.value = []
-    if (!gone && live.value && live.value.text && live.value.status !== 'error') {
+    if (steeredText != null) {
+      // a cut reply has no rating: its run keeps the full text the model wrote
+      history.value.push({ role: 'assistant', content: steeredText })
+      live.value = null
+    } else if (!gone && live.value && live.value.text && live.value.status !== 'error') {
       // the stored history is the record: show it, with this run's footer kept under the last answer
       const last = live.value
       history.value.push({ role: 'assistant', content: last.text, run: r.run })
@@ -365,6 +469,11 @@ async function send() {
     runId.value = ''
     refresh()
     toBottom()
+    // a steering note that did not cut the reply goes next, before anything queued
+    const note = steer.value
+    steer.value = null
+    if (note) queue.value.unshift({ session: note.session, text: note.text })
+    nextTick(drainQueue)
   }
 }
 
@@ -436,6 +545,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 14px; align-items: start; }
+.filechips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.fchip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 6px 2px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); font-size: 0.85rem; }
+.queued { list-style: none; margin: 0 0 6px; padding: 0; }
+.queued li { display: flex; gap: 8px; align-items: center; }
+.qtext { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sessions ul { list-style: none; padding: 0; margin: 8px 0 0; }
 .sessions li { display: flex; align-items: center; gap: 4px; border-radius: 6px; }
 .sessions li.on { background: var(--panel-2); }
