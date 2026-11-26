@@ -18,7 +18,12 @@
       <div class="thinktext">{{ parts.reasoning }}</div>
     </details>
 
-    <div v-if="msg.role === 'user'" class="usertext">{{ msg.content }}</div>
+    <template v-if="msg.role === 'user'">
+      <div v-if="msg.files?.length" class="filechips" aria-label="Attached files">
+        <span v-for="f in msg.files" :key="f.name" class="fchip">{{ f.name }}<span v-if="f.cut" class="muted small"> (cut to 2000 characters)</span></span>
+      </div>
+      <div class="usertext">{{ userText }}</div>
+    </template>
     <!-- eslint-disable-next-line vue/no-v-html -->
     <div v-else-if="parts.answer" class="md" @click="onClick" v-html="html"></div>
     <p v-else-if="streaming && !msg.error" class="muted wait">{{ waiting }}</p>
@@ -74,6 +79,13 @@ const parts = computed(() => {
   return { reasoning, answer: t.answer, thinking: t.thinking || (!!m.reasoning && !t.answer) }
 })
 const html = computed(() => renderMarkdown(parts.value.answer))
+/** The message as typed: the attached files' text (which follows it) is shown as chips, not as a block of text. */
+const userText = computed(() => {
+  const t = props.msg.content || ''
+  if (!props.msg.files?.length) return t
+  const i = t.indexOf('[File: ')
+  return i >= 0 ? t.slice(0, i).trimEnd() : t
+})
 const sec = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`)
 
 // ---- read aloud: the reply's words, spoken by the hub's voice ----------------------------------------------------------
@@ -140,6 +152,8 @@ async function onClick(e: MouseEvent) {
 .mini { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font-size: 0.75rem; color: var(--muted); }
 .mini:hover { border-color: var(--accent); color: var(--text); }
 .usertext { white-space: pre-wrap; word-break: break-word; }
+.filechips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.fchip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 0.85rem; }
 .assets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
 .asset { display: flex; align-items: center; gap: 6px; max-width: 220px; padding: 3px 8px 3px 3px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; font-size: 0.8rem; color: var(--text); }
 .asset:hover { border-color: var(--accent); }
