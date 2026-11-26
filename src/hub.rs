@@ -239,6 +239,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::factory::ops::operations());
     all.extend(crate::misty::ops::operations());
     all.extend(crate::misty::auto::operations());
+    all.extend(crate::fabric::operations());
     all.extend(crate::forge::operations());
     all
 }
@@ -1140,6 +1141,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("factory.") => crate::factory::ops::call(hub, id, a).await?,
         id if id.starts_with("misty.") => crate::misty::ops::call(hub, id, a).await?,
         id if id.starts_with("router.") => crate::misty::auto::call(hub, id, a).await?,
+        id if id.starts_with("fabric.") || id == "machine.status" => crate::fabric::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1822,9 +1824,18 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
     let asked = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     check_model(&hub, &who, &asked)?;
     let t0 = Instant::now();
+    // a request kept for the fabric: copied only when this hub is joined to one and may offload
+    let spare = crate::fabric::offers(&hub).then(|| body.clone());
     let (model, resp, lease) = match hub.engine.forward(path, body).await {
         Ok(x) => x,
         Err(f) => {
+            // no room here (or busy): another node of the fabric may have it
+            if let (Some(spare), true) = (&spare, crate::fabric::capacity_failure(&f)) {
+                if let Some(r) = crate::fabric::offload(&hub, path, spare).await {
+                    hub.engine.record(&asked, true, t0.elapsed().as_millis() as u64, None);
+                    return Ok(r);
+                }
+            }
             if let Some(p) = &who.0 {
                 p.finish(&asked, false, 0, 0);
             }
@@ -2250,7 +2261,9 @@ pub fn router(hub: Hub) -> Router {
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())
         .merge(crate::misty::ops::routes())
-        .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
+        .route_layer(middleware::from_fn_with_state(hub.clone(), auth))
+        // how many routers a request has passed (`x-cf-hop`), so a request the fabric sent here is not sent back
+        .layer(middleware::from_fn(crate::fabric::hop_layer));
     Router::new()
         .route("/v1/health", get(health))
         .merge(crate::trace::ui::routes())

@@ -1,0 +1,25 @@
+[package]
+name = "mm-overlay"
+version = "0.1.0"
+edition = "2021"
+description = "ModelMistress's Transferd overlay node: expose the desktop hub to paired devices, and reach a paired desktop's hub from the phone"
+
+# A standalone crate: it is not a member of the desktop workspace at the repository root, so the desktop build does not
+# fetch or compile Transferd. Build it from this folder.
+[workspace]
+
+[lib]
+name = "mm_overlay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mm-overlay"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the same Transferd commit as ComputeFabric (docs/TRANSFERD-BINDING.md there). Change the pin only with the
+# owner's approval, and record it in docs/FEATURE_MAP.md and this file's header.
+transferd-overlay = { git = "https://github.com/LoopyLuci/TransferDaemon.git", rev = "4ec66e7e0637664a0568b50bb0163f8d9381802b" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+rand = "0.8"
+serde_json = "1"

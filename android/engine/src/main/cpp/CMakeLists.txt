@@ -7,6 +7,10 @@ if(NOT EXISTS "${LLAMA_SOURCE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "llama.cpp was not found at ${LLAMA_SOURCE_DIR}. Check out engines/llama.cpp first.")
 endif()
 
+# Debug builds (AGP's default) compile llama.cpp at -O0, which runs 5 to 10 times slower on a phone. The inference code is
+# always built optimised; the Kotlin side can still be debugged.
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+
 set(LLAMA_BUILD_IS_DEV OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${LLAMA_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp")

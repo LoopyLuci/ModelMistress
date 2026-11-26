@@ -10,6 +10,7 @@ pub mod audio;
 pub mod catalog;
 pub mod client;
 pub mod engine;
+pub mod fabric;
 pub mod factory;
 pub mod forge;
 pub mod hosting;

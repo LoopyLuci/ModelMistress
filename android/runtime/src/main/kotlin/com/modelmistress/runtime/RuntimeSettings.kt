@@ -53,6 +53,37 @@ class RuntimeSettings(context: Context) {
             prefs.edit().putString(KEY_DEFAULT_MODEL, value).apply()
         }
 
+    /**
+     * A Hugging Face token, needed only for gated or private repos. It stays on this device, in plain text, like the peer
+     * keys do. Blank means none.
+     */
+    var hfToken: String?
+        get() = prefs.getString(KEY_HF_TOKEN, null)?.takeIf { it.isNotBlank() }
+        set(value) {
+            prefs.edit().putString(KEY_HF_TOKEN, value?.trim()?.takeIf { it.isNotEmpty() }).apply()
+        }
+
+    /** Off: chats go straight to the chat model. On: chats go through Misty, with the owner's tools. */
+    var mistyEnabled: Boolean
+        get() = prefs.getBoolean(KEY_MISTY_ENABLED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_MISTY_ENABLED, value).apply()
+        }
+
+    /** Whether Needle gets a first try at an obvious tool call. It only runs when Misty is on and Needle is installed. */
+    var mistyReflex: Boolean
+        get() = prefs.getBoolean(KEY_MISTY_REFLEX, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_MISTY_REFLEX, value).apply()
+        }
+
+    /** On: Misty asks before each file write. Off: Misty's file writes are refused. */
+    var mistyAskBeforeWrite: Boolean
+        get() = prefs.getBoolean(KEY_MISTY_ASK_WRITE, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_MISTY_ASK_WRITE, value).apply()
+        }
+
     companion object {
         const val DEFAULT_PORT = 8080
         const val DEFAULT_CONTEXT = 2048
@@ -64,6 +95,10 @@ class RuntimeSettings(context: Context) {
         private const val KEY_CONTEXT = "context_tokens"
         private const val KEY_THREADS = "threads"
         private const val KEY_DEFAULT_MODEL = "default_model"
+        private const val KEY_HF_TOKEN = "hf_token"
+        private const val KEY_MISTY_ENABLED = "misty_enabled"
+        private const val KEY_MISTY_REFLEX = "misty_reflex"
+        private const val KEY_MISTY_ASK_WRITE = "misty_ask_write"
         private const val KEY_BYTES = 24
 
         private fun defaultThreads(): Int = (java.lang.Runtime.getRuntime().availableProcessors() - 1).coerceIn(1, 4)

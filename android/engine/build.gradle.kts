@@ -20,7 +20,7 @@ android {
                     "-DGGML_NATIVE=OFF",
                     "-DGGML_OPENMP=OFF",
                     "-DGGML_LLAMAFILE=OFF",
-                    "-DGGML_CPU_ARM_ARCH=armv8-a",
+                    "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod",
                     "-DLLAMA_OPENSSL=OFF",
                     "-DLLAMA_USE_PREBUILT_UI=OFF",
                     "-DLLAMA_BUILD_COMMON=OFF",

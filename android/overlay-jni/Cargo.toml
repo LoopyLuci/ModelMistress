@@ -1,0 +1,23 @@
+[package]
+name = "mm-overlay-jni"
+version = "0.1.0"
+edition = "2021"
+description = "JNI bridge from the ModelMistress app to the Transferd overlay node (mm-overlay)"
+
+# A standalone crate: built by android/runtime's Gradle task with cargo-ndk, not part of the desktop workspace.
+[workspace]
+
+[lib]
+name = "mm_overlay_jni"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+mm-overlay = { path = "../../overlay" }
+jni = { version = "0.21", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# The app packages this library as it is; stripping keeps the APK small.
+[profile.release]
+strip = "symbols"

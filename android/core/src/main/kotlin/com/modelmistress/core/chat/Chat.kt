@@ -1,5 +1,7 @@
 package com.modelmistress.core.chat
 
+import java.io.Closeable
+
 enum class Role(val wire: String) {
     SYSTEM("system"),
     USER("user"),
@@ -68,6 +70,9 @@ fun interface TokenSink {
 interface ChatBackend {
     fun complete(messages: List<ChatMessage>, options: GenerationOptions, sink: TokenSink): GenerationStats
 }
+
+/** A model loaded on this device to answer chats. Closing it frees the memory the model holds. */
+interface LocalEngine : ChatBackend, Closeable
 
 /** The models a device holds and the backend for each. */
 interface ModelCatalog {

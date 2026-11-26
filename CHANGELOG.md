@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fabric: ModelMistress in a ComputeFabric
+
+- New `machine.status` operation: each GPU's free memory, what models may use of it (`vram_usable_mib`, held to
+  `vram_reserve_mib` and the Windows commit), free RAM and what is running. ComputeFabric reads it to decide where a model
+  fits.
+- New `fabric.*` operations (`fabric.status`, `fabric.nodes`, `fabric.models`, `fabric.route`, `fabric.set`) and
+  `<home>/fabric.json`: a hub joined to a ComputeFabric passes a request it cannot serve (no room for the model, or no free
+  slot with `fail_fast_busy`) to the fabric's OpenAI endpoint instead of failing. A request that came through the fabric
+  (`x-cf-hop`) is never passed on again; the answer carries `x-mm-offloaded` and `x-mm-node`. Off until `fabric.set` is
+  used. See `docs/fabric.md`. Tests: `fabric::tests`, and six in `tests_upstream.rs` (busy hub offloads, hop guard, offload
+  off, unreachable fabric, `fabric.set` checks, `machine.status`).
+
 - **The server log says how a model's layers were placed, and `model.telemetry` reads it** (`src/loadlog.rs`, `src/engine.rs`,
   `src/hub.rs`, `src/serving.rs`; [serving](docs/serving.md#the-server-log-and-model-telemetry)). llama.cpp b12726 prints its
   load details (devices, memory fit, layers on the GPU, every buffer, KV cache and state, compute graph and its splits, stage

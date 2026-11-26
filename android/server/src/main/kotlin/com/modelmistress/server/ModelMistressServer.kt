@@ -5,6 +5,8 @@ import com.modelmistress.core.chat.ChatMessage
 import com.modelmistress.core.chat.GenerationOptions
 import com.modelmistress.core.chat.ModelRouter
 import com.modelmistress.core.chat.OpenAi
+import com.modelmistress.core.images.ImageApi
+import com.modelmistress.core.images.ImageCatalog
 import com.modelmistress.core.json.Json
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -30,13 +32,15 @@ data class ServerConfig(
 
 /**
  * The OpenAI-compatible HTTP server. It binds [ServerConfig.host] and answers /v1/health, /v1/models and
- * /v1/chat/completions, streamed as server-sent events when the request asks for it. When [ServerConfig.apiKey] is set,
+ * /v1/chat/completions, streamed as server-sent events when the request asks for it, and /v1/images/generations when
+ * [images] is given. When [ServerConfig.apiKey] is set,
  * every route except health needs it as a bearer token. Cross-origin browser access is deliberately not enabled, so a
  * web page cannot read replies from the device.
  */
 class ModelMistressServer(
     private val router: ModelRouter,
     private val config: ServerConfig,
+    private val images: ImageCatalog? = null,
     private val log: (String) -> Unit = {},
 ) : Closeable {
     private var listener: ServerSocket? = null
@@ -145,8 +149,26 @@ class ModelMistressServer(
                 authorize(request)
                 chat(request, writer)
             }
+            "/v1/images/generations", "/images/generations" -> {
+                requireMethod(request, "POST")
+                authorize(request)
+                imageGeneration(request, writer)
+            }
             else -> throw ApiException(404, "route_not_found", "There is no route ${request.path} on this server.")
         }
+    }
+
+    /** Makes one PNG for each image asked for, one after another, and returns them base64-encoded. */
+    private fun imageGeneration(request: HttpRequest, writer: HttpResponseWriter) {
+        val catalog = images ?: throw ApiException(404, "route_not_found", "This server has no image models.")
+        val parsed = ImageApi.parse(String(request.body, Charsets.UTF_8))
+        val model = parsed.model ?: catalog.defaultModelId()
+            ?: throw ApiException(404, "model_not_found", "No image model is installed on this device.")
+        if (model !in catalog.models()) {
+            throw ApiException(404, "model_not_found", "The image model '$model' is not installed on this device.")
+        }
+        val made = (0 until parsed.count).map { index -> catalog.generate(model, parsed.spec(index)) }
+        writer.json(200, ImageApi.response(nowSeconds(), made))
     }
 
     private fun requireMethod(request: HttpRequest, expected: String) {

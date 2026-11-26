@@ -1,13 +1,12 @@
 package com.modelmistress.engine
 
-import com.modelmistress.core.chat.ChatBackend
 import com.modelmistress.core.chat.ChatMessage
 import com.modelmistress.core.chat.FinishReason
 import com.modelmistress.core.chat.GenerationOptions
 import com.modelmistress.core.chat.GenerationStats
+import com.modelmistress.core.chat.LocalEngine
 import com.modelmistress.core.chat.TokenSink
 import com.modelmistress.core.text.Utf8Chunker
-import java.io.Closeable
 import java.nio.charset.StandardCharsets
 import kotlin.random.Random
 
@@ -15,7 +14,7 @@ import kotlin.random.Random
 class LlamaEngine private constructor(
     private var handle: Long,
     val contextTokens: Int,
-) : ChatBackend, Closeable {
+) : LocalEngine {
 
     @Synchronized
     override fun complete(messages: List<ChatMessage>, options: GenerationOptions, sink: TokenSink): GenerationStats {

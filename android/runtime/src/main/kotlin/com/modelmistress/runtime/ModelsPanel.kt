@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -27,7 +28,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
-/** Lists the models on this device, imports GGUF files, sets the default and deletes. */
+/** Lists the models on this device, imports GGUF and LiteRT-LM files, sets the default and deletes. */
 @Composable
 fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -67,7 +68,7 @@ fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !busy) {
-                Text("Import GGUF model")
+                Text("Import model")
             }
             if (busy) CircularProgressIndicator()
         }
@@ -75,7 +76,7 @@ fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
 
         if (models.isEmpty()) {
             Text(
-                "No models yet. Import a GGUF file, for example one you downloaded to Downloads.",
+                "No models yet. Import a GGUF or .litertlm file, for example one you downloaded to Downloads.",
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
@@ -103,10 +104,22 @@ fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
                 }
             }
         }
+        HorizontalDivider()
+        HuggingFacePanel(runtime, onInstalled = { refresh() })
+        HorizontalDivider()
+        ImageModelsPanel(runtime)
+        HorizontalDivider()
+        BenchmarkPanel(runtime)
+        HorizontalDivider()
+        MistyPanel(runtime)
+        HorizontalDivider()
+        WorkspacePanel(runtime)
+        HorizontalDivider()
+        DesktopsPanel(runtime)
     }
 }
 
-private fun formatSize(bytes: Long): String = when {
+internal fun formatSize(bytes: Long): String = when {
     bytes >= (1L shl 30) -> String.format(Locale.US, "%.1f GB", bytes / (1L shl 30).toDouble())
     bytes >= (1L shl 20) -> String.format(Locale.US, "%.0f MB", bytes / (1L shl 20).toDouble())
     else -> "$bytes B"
