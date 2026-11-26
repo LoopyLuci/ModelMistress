@@ -205,6 +205,9 @@ class Toolbox(
 
     private fun list(path: String): String {
         val ws = workspace ?: throw IllegalArgumentException("there is no workspace")
+        if (ws.isLinksFolder(path)) {
+            return "Linked folders:\n" + ws.linkNames().joinToString("\n") { "$it/" }
+        }
         val folder = ws.resolve(path)
         val shown = ws.relativePath(folder)
         if (!folder.isDirectory) throw IllegalArgumentException("$shown is not a folder")
@@ -213,10 +216,13 @@ class Toolbox(
             .filter { !Workspace.isSecret(ws.relativePath(it)) }
             .sortedBy { it.name.lowercase() }
             .take(MAX_LIST_ENTRIES)
-        if (entries.isEmpty()) return "Folder $shown is empty."
         val lines = entries.map { entry ->
             if (entry.isDirectory) "${entry.name}/" else "${entry.name} (${entry.length()} bytes)"
+        }.toMutableList()
+        if (folder == ws.root && ws.linkNames().isNotEmpty()) {
+            lines += "${Workspace.LINKS_FOLDER}/ (linked folders)"
         }
+        if (lines.isEmpty()) return "Folder $shown is empty."
         return "Folder $shown:\n" + lines.joinToString("\n")
     }
 
@@ -241,7 +247,8 @@ class Toolbox(
         val base = ws.resolve(path)
         val needle = query.lowercase()
         val files = mutableListOf<File>()
-        collect(ws, base, files, depth = 0)
+        val starts = if (base == ws.root) ws.searchRoots() else listOf(base)
+        starts.forEach { collect(ws, it, files, depth = 0) }
         val matches = mutableListOf<String>()
         for (file in files) {
             if (matches.size >= max) break

@@ -26,11 +26,12 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 
 /** Lists the models on this device, imports GGUF and LiteRT-LM files, sets the default and deletes. */
 @Composable
-fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
+fun ModelsPanel(runtime: ModelRuntime, onExportTraining: ((File) -> Unit)? = null, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var models by remember { mutableStateOf<List<LocalModel>>(emptyList()) }
@@ -111,9 +112,7 @@ fun ModelsPanel(runtime: ModelRuntime, modifier: Modifier = Modifier) {
         HorizontalDivider()
         BenchmarkPanel(runtime)
         HorizontalDivider()
-        MistyPanel(runtime)
-        HorizontalDivider()
-        WorkspacePanel(runtime)
+        MistyPanel(runtime, onExportTraining)
         HorizontalDivider()
         DesktopsPanel(runtime)
     }

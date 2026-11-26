@@ -5,6 +5,7 @@ import com.modelmistress.core.chat.ChatMessage
 import com.modelmistress.core.chat.GenerationOptions
 import com.modelmistress.core.chat.Role
 import com.modelmistress.core.tools.ScopedToolSource
+import com.modelmistress.core.tools.Steering
 import com.modelmistress.core.tools.ToolCall
 import com.modelmistress.core.tools.ToolListener
 import com.modelmistress.core.tools.ToolLoop
@@ -49,6 +50,7 @@ class MistyTurn(
         confirm: (ToolCall) -> Boolean,
         listener: ToolListener,
         question: String? = null,
+        steering: Steering = Steering.NONE,
     ): MistyTurnResult {
         val routed = question ?: history.lastOrNull { it.role == Role.USER }?.content.orEmpty()
         val route = MistyRouter.route(
@@ -64,7 +66,7 @@ class MistyTurn(
         } else {
             chat
         }
-        val run: ToolRun = ToolLoop(offered, policies).run(backend, history, options, keepGoing, confirm, listener)
+        val run: ToolRun = ToolLoop(offered, policies).run(backend, history, options, keepGoing, confirm, listener, steering)
         if (run.toolCalls == 0 && claimsFileChange(run.answer)) {
             notes("Misty: the reply said a file changed, but no file tool ran; the reply was replaced.")
             return MistyTurnResult(NO_FILE_REPLY, 0, route, replaced = true)

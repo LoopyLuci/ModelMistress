@@ -18,6 +18,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.modelmistress.runtime.ModelRuntime
 import com.modelmistress.runtime.ModelsPanel
@@ -43,6 +44,7 @@ private enum class Tab(val title: String, val glyph: String) {
 
 @Composable
 private fun AppRoot(runtime: ModelRuntime) {
+    val context = LocalContext.current
     var tab by remember { mutableStateOf(Tab.CHAT) }
     Scaffold(
         bottomBar = {
@@ -63,7 +65,7 @@ private fun AppRoot(runtime: ModelRuntime) {
             Tab.MODELS -> Column(
                 Modifier.padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),
             ) {
-                ModelsPanel(runtime)
+                ModelsPanel(runtime, onExportTraining = { file -> shareTrainingFile(context, file) })
             }
             Tab.SERVER -> Column(
                 Modifier.padding(padding).padding(16.dp).verticalScroll(rememberScrollState()),

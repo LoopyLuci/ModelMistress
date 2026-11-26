@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,6 +21,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -47,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.modelmistress.core.chat.ChatAttachment
 import com.modelmistress.core.chat.ChatMessage
 import com.modelmistress.core.chat.ChatSummary
 import com.modelmistress.core.chat.Role
@@ -62,11 +65,27 @@ import kotlinx.coroutines.launch
 /** Documents and pictures the paperclip offers. The system's file picker shows them as a normal file explorer. */
 private val ATTACHABLE_TYPES = arrayOf("text/*", "application/pdf", "image/*", "application/json")
 
+/** The chat, or the live conversation when the owner starts one. Each chat works in its own sandbox. */
 @Composable
 fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
     val viewModel: ChatViewModel = viewModel(factory = ChatViewModel.factory(runtime))
     val state by viewModel.uiState.collectAsState()
+    var live by remember { mutableStateOf(false) }
+    if (live) {
+        LiveScreen(viewModel = viewModel, onEnd = { live = false }, modifier = modifier)
+    } else {
+        ChatContent(viewModel = viewModel, state = state, onLive = { live = true }, modifier = modifier)
+    }
+}
+
+@Composable
+private fun ChatContent(
+    viewModel: ChatViewModel,
+    state: ChatUiState,
+    onLive: () -> Unit,
+    modifier: Modifier,
+) {
+    val context = LocalContext.current
     // The Chat tab is composed each time it opens, so the list picks up models installed or deleted on the Models tab.
     LaunchedEffect(Unit) { viewModel.refreshModels() }
     val transcript = state.messages + listOfNotNull(state.streaming?.let { ChatMessage(Role.ASSISTANT, it) })
@@ -100,15 +119,29 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
         if (result.resultCode == Activity.RESULT_OK && !spoken.isNullOrBlank()) viewModel.appendToDraft(spoken)
     }
 
+    val openFile: (File, String) -> Unit = { file, name ->
+        openSandboxFile(context, file, name)?.let { viewModel.reportError(it) }
+    }
+    val fileOf: (ChatAttachment) -> File? = { attachment -> viewModel.sandboxFile(attachment.file) }
+    val missing: () -> Unit = { viewModel.reportError("That file is no longer in the sandbox.") }
+
     Column(
         modifier = modifier.fillMaxSize().padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             OutlinedButton(onClick = viewModel::newChat, enabled = !state.busy) { Text("New chat") }
             OutlinedButton(onClick = viewModel::toggleHistory) {
                 Text(if (state.historyOpen) "Hide history" else "History")
             }
+            OutlinedButton(onClick = viewModel::toggleFiles) {
+                Text(if (state.filesOpen) "Hide files" else "Files")
+            }
+            Button(onClick = onLive, enabled = !state.busy && state.selectedId != null) { Text("Live") }
         }
         if (state.historyOpen) {
             HistoryList(
@@ -117,6 +150,13 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
                 onOpen = viewModel::openChat,
                 onDelete = viewModel::deleteChat,
             )
+        }
+        if (state.filesOpen) {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 340.dp).verticalScroll(rememberScrollState()),
+            ) {
+                SandboxPanel(state = state, viewModel = viewModel)
+            }
         }
         ModelChooser(models = state.models, selected = state.selectedId, onSelect = viewModel::selectModel)
         if (state.models.isEmpty()) {
@@ -136,6 +176,9 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
                         message = message,
                         canRead = message.role == Role.ASSISTANT && !streaming,
                         onRead = { speaker.speak(message.content) },
+                        fileOf = fileOf,
+                        onOpen = openFile,
+                        onMissing = missing,
                     )
                 }
             }
@@ -155,8 +198,16 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
             }
         }
         state.feedbackStatus?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
+        if (state.steers.isNotEmpty()) {
+            state.steers.forEach { note ->
+                Text("Note sent during the reply, taken in at its next step: $note", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        if (state.queue.isNotEmpty()) {
+            QueueList(queue = state.queue, onRemove = viewModel::removeQueued, onClear = viewModel::clearQueue)
+        }
         if (state.attaching) {
-            Text("Reading the attachment…", style = MaterialTheme.typography.labelSmall)
+            Text("Keeping and reading the attachment…", style = MaterialTheme.typography.labelSmall)
         }
         if (state.attachments.isNotEmpty()) {
             Row(
@@ -176,7 +227,7 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(
                 onClick = { pickFiles.launch(ATTACHABLE_TYPES) },
-                enabled = !state.busy && !state.attaching,
+                enabled = !state.attaching,
                 modifier = Modifier.semantics { contentDescription = "Attach a document or picture" },
             ) { Text("📎") }
             OutlinedButton(
@@ -188,7 +239,6 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
                         dictate.launch(intent)
                     }
                 },
-                enabled = !state.busy,
                 modifier = Modifier.semantics { contentDescription = "Speak your message" },
             ) { Text("🎤") }
             OutlinedButton(
@@ -208,19 +258,26 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
                         }
                     }
                 },
-                enabled = !state.busy && !state.attaching,
+                enabled = !state.attaching,
                 modifier = Modifier.semantics { contentDescription = "Take a photo to recognise" },
             ) { Text("📷") }
         }
-        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            OutlinedTextField(
-                value = state.draft,
-                onValueChange = viewModel::setDraft,
-                placeholder = { Text("Message") },
-                enabled = !state.busy,
-                modifier = Modifier.weight(1f),
-            )
+        OutlinedTextField(
+            value = state.draft,
+            onValueChange = viewModel::setDraft,
+            placeholder = { Text(if (state.busy) "Add a note, or queue the next message" else "Message") },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (state.busy) {
+                OutlinedButton(
+                    onClick = viewModel::steerDraft,
+                    enabled = state.draft.isNotBlank(),
+                ) { Text("Steer") }
+                OutlinedButton(
+                    onClick = viewModel::queueDraft,
+                    enabled = state.draft.isNotBlank() || state.attachments.isNotEmpty(),
+                ) { Text("Queue") }
                 OutlinedButton(onClick = viewModel::stop) { Text("Stop") }
             } else {
                 Button(
@@ -243,6 +300,32 @@ fun ChatScreen(runtime: ModelRuntime, modifier: Modifier = Modifier) {
             confirmButton = { Button(onClick = { viewModel.answerPendingCall(true) }) { Text("Allow") } },
             dismissButton = { OutlinedButton(onClick = { viewModel.answerPendingCall(false) }) { Text("Refuse") } },
         )
+    }
+}
+
+/**
+ * The messages queued to send after the reply that is running. Each goes in order; the owner can remove one or clear them all.
+ */
+@Composable
+private fun QueueList(queue: List<QueuedMessage>, onRemove: (Int) -> Unit, onClear: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Queued: ${queue.size}", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+            TextButton(onClick = onClear) { Text("Clear") }
+        }
+        queue.forEachIndexed { index, message ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val attached = if (message.attachments.isEmpty()) "" else " (+${message.attachments.size} file)"
+                Text(
+                    "${index + 1}. ${message.text.ifEmpty { "Attachments" }}$attached",
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { onRemove(index) }) { Text("×") }
+            }
+        }
     }
 }
 
@@ -347,13 +430,21 @@ private fun ModelChooser(models: List<String>, selected: String?, onSelect: (Str
 }
 
 @Composable
-private fun Bubble(message: ChatMessage, canRead: Boolean, onRead: () -> Unit) {
-    Column {
+private fun Bubble(
+    message: ChatMessage,
+    canRead: Boolean,
+    onRead: () -> Unit,
+    fileOf: (ChatAttachment) -> File?,
+    onOpen: (File, String) -> Unit,
+    onMissing: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(
             if (message.role == Role.USER) "You" else "Model",
             style = MaterialTheme.typography.labelSmall,
         )
         Text(message.content, style = MaterialTheme.typography.bodyMedium)
+        AttachmentRow(attachments = message.attachments, fileFor = fileOf, onOpen = onOpen, onMissing = onMissing)
         if (canRead && message.content.isNotBlank()) {
             TextButton(onClick = onRead) { Text("Read aloud") }
         }

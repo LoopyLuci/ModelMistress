@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Android app (`android/`, version 0.1.0)
+
+- Live conversation: the phone listens while the model speaks, so talking over it stops it. The phone's own voice is matched
+  against the last 160 words it said, so it is not taken as the owner's. A finished sentence waits about 1.5 seconds with
+  Cancel send, or "cancel" spoken, before it is sent. Edit before send keeps it in an editable box until Send now. Listen
+  pauses the microphone without ending a reply. Live stays open when the phone rotates.
+- Voice corrections: a sentence that starts with "correction", "that's wrong" or "not quite" is saved against the last reply
+  for Misty, not sent as a message. The Misty panel counts the training examples and exports them as chat-format JSON lines.
+- Default model is LFM2-2.6B-Q4_0 (1.4 GB).
+- Not yet checked on the phone: Send now, corrections, the training export, and the echo matching over a full session.
+  See `android/docs/FEATURE_MAP.md`.
+
 ### Fabric: ModelMistress in a ComputeFabric
 
 - New `machine.status` operation: each GPU's free memory, what models may use of it (`vram_usable_mib`, held to

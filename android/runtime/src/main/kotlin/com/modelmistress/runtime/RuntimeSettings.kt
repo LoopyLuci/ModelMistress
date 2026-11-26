@@ -2,6 +2,8 @@ package com.modelmistress.runtime
 
 import android.content.Context
 import android.util.Base64
+import com.modelmistress.core.tools.FileWrites
+import com.modelmistress.core.tools.ToolUse
 import java.security.SecureRandom
 
 /** The owner's settings for the local server and the models, kept on this device only. */
@@ -77,12 +79,31 @@ class RuntimeSettings(context: Context) {
             prefs.edit().putBoolean(KEY_MISTY_REFLEX, value).apply()
         }
 
-    /** On: Misty asks before each file write. Off: Misty's file writes are refused. */
-    var mistyAskBeforeWrite: Boolean
-        get() = prefs.getBoolean(KEY_MISTY_ASK_WRITE, true)
+    /**
+     * Whether the chat's tools are used at all. Off: none. On: reading runs at once, a file change asks first. Full auto: every
+     * tool runs at once, file changes included, when [fileWrites] allows them.
+     */
+    var toolUse: ToolUse
+        get() = enumSetting(KEY_TOOL_USE, ToolUse.ON)
         set(value) {
-            prefs.edit().putBoolean(KEY_MISTY_ASK_WRITE, value).apply()
+            prefs.edit().putString(KEY_TOOL_USE, value.name).apply()
         }
+
+    /**
+     * Whether the chat may change files in its sandbox. Off: no writes. On: each write asks. Full auto: writes run at once, while
+     * [toolUse] is full auto too. A setting saved by an earlier version, where Misty asked before writes, maps onto this.
+     */
+    var fileWrites: FileWrites
+        get() {
+            if (prefs.contains(KEY_FILE_WRITES)) return enumSetting(KEY_FILE_WRITES, FileWrites.ON)
+            return if (prefs.getBoolean(KEY_MISTY_ASK_WRITE, true)) FileWrites.ON else FileWrites.OFF
+        }
+        set(value) {
+            prefs.edit().putString(KEY_FILE_WRITES, value.name).apply()
+        }
+
+    private inline fun <reified T : Enum<T>> enumSetting(key: String, default: T): T =
+        prefs.getString(key, null)?.let { stored -> enumValues<T>().firstOrNull { it.name == stored } } ?: default
 
     companion object {
         const val DEFAULT_PORT = 8080
@@ -99,6 +120,8 @@ class RuntimeSettings(context: Context) {
         private const val KEY_MISTY_ENABLED = "misty_enabled"
         private const val KEY_MISTY_REFLEX = "misty_reflex"
         private const val KEY_MISTY_ASK_WRITE = "misty_ask_write"
+        private const val KEY_TOOL_USE = "tool_use"
+        private const val KEY_FILE_WRITES = "file_writes"
         private const val KEY_BYTES = 24
 
         private fun defaultThreads(): Int = (java.lang.Runtime.getRuntime().availableProcessors() - 1).coerceIn(1, 4)

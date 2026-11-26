@@ -14,12 +14,14 @@ data class SavedChat(
     val createdAt: Long,
     val updatedAt: Long,
     val messages: List<ChatMessage>,
+    /** The sandbox this chat works in. Null for a chat saved before sandboxes existed; it then uses the older files. */
+    val environmentId: String? = null,
 ) {
     init {
         require(ID_PATTERN.matches(id)) { "A chat id uses 1 to 64 letters, digits, '.', '_' or '-'." }
     }
 
-    fun summary(): ChatSummary = ChatSummary(id, title, modelId, updatedAt, messages.size)
+    fun summary(): ChatSummary = ChatSummary(id, title, modelId, updatedAt, messages.size, environmentId)
 
     companion object {
         val ID_PATTERN = Regex("[A-Za-z0-9._-]{1,64}")
@@ -44,6 +46,7 @@ data class ChatSummary(
     val modelId: String?,
     val updatedAt: Long,
     val messageCount: Int,
+    val environmentId: String? = null,
 )
 
 /** Where saved chats are kept. The app keeps them as files; the tests keep them in a folder they make. */
@@ -72,8 +75,23 @@ object ChatCodec {
             "model" to chat.modelId,
             "created_at" to chat.createdAt,
             "updated_at" to chat.updatedAt,
+            "environment" to chat.environmentId,
             "messages" to chat.messages.map { message ->
-                linkedMapOf("role" to message.role.wire, "content" to message.content)
+                linkedMapOf<String, Any?>(
+                    "role" to message.role.wire,
+                    "content" to message.content,
+                ).also { item ->
+                    if (message.attachments.isNotEmpty()) {
+                        item["attachments"] = message.attachments.map { attachment ->
+                            linkedMapOf(
+                                "label" to attachment.label,
+                                "file" to attachment.file,
+                                "kind" to attachment.kind.wire,
+                                "text" to attachment.text,
+                            )
+                        }
+                    }
+                }
             },
         ),
     )
@@ -86,7 +104,21 @@ object ChatCodec {
             val item = entry as? Map<*, *> ?: throw JsonException("A saved message must be a JSON object.")
             val role = Role.fromWire(item["role"] as? String ?: "")
                 ?: throw JsonException("A saved message has an unknown role.")
-            ChatMessage(role, item["content"] as? String ?: throw JsonException("A saved message has no text."))
+            val attachments = (item["attachments"] as? List<*>)?.map { raw ->
+                val part = raw as? Map<*, *> ?: throw JsonException("A saved attachment must be a JSON object.")
+                ChatAttachment(
+                    label = part["label"] as? String ?: throw JsonException("A saved attachment has no label."),
+                    file = part["file"] as? String ?: throw JsonException("A saved attachment has no file."),
+                    kind = AttachmentKind.fromWire(part["kind"] as? String ?: "")
+                        ?: throw JsonException("A saved attachment has an unknown kind."),
+                    text = part["text"] as? String ?: "",
+                )
+            } ?: emptyList()
+            ChatMessage(
+                role,
+                item["content"] as? String ?: throw JsonException("A saved message has no text."),
+                attachments,
+            )
         } ?: throw JsonException("A saved chat has no message list.")
         return SavedChat(
             id = root["id"] as? String ?: throw JsonException("A saved chat has no id."),
@@ -95,6 +127,7 @@ object ChatCodec {
             createdAt = (root["created_at"] as? Number)?.toLong() ?: 0L,
             updatedAt = (root["updated_at"] as? Number)?.toLong() ?: 0L,
             messages = messages,
+            environmentId = root["environment"] as? String,
         )
     }
 }

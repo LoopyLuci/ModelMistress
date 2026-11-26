@@ -52,4 +52,9 @@ dependencies {
     // On-device recognition for photos and pictures in documents: labels and text. Both run without a network connection.
     implementation(libs.mlkit.image.labeling)
     implementation(libs.mlkit.text.recognition)
+    // The live conversation's camera: a preview on screen and a frame read every second or so, on this phone.
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
 }

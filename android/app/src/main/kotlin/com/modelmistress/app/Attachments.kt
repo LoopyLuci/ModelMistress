@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
@@ -14,20 +16,18 @@ import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.modelmistress.core.chat.AttachmentKind
+import com.modelmistress.core.chat.ChatAttachment
 import java.io.File
+import java.io.InputStream
 import java.util.Locale
-import java.util.UUID
 
 /**
- * A file or photo added to a message. [label] is its name as the chat shows it. [text] is what the model reads: the file's
- * text, or what the photo shows. It is cut to [Attachments.MAX_CHARS] so it fits the model's context.
- */
-data class Attachment(val label: String, val text: String)
-
-/**
- * Reads what a document or a photo holds, on this phone. Text files are read as they are. PDFs are drawn page by page and read
- * with text recognition, since the phone has no PDF text reader. Pictures and photos get labels and any text in them from
- * ML Kit. None of it leaves the device.
+ * Reads what a document or a picture holds, on this phone. Text files are read as they are. PDFs are drawn page by page and read
+ * with text recognition, since the phone has no PDF text reader. Pictures get labels and any text in them from ML Kit. None of
+ * it leaves the device.
+ *
+ * The file itself is kept in the chat's sandbox, so the chat can show it and open it. Only the text read from it goes to the model.
  */
 object Attachments {
     /** Most text one attachment adds to a message. About 500 tokens, so a few fit in the default context. */
@@ -36,48 +36,78 @@ object Attachments {
     /** Pages of a PDF that are read. The first pages hold most of the text in a short document. */
     const val MAX_PDF_PAGES = 3
 
-    /** Longest side of a picture that recognition reads. Larger pictures are scaled down first. */
+    /** Largest side of a picture that recognition reads. Larger pictures are scaled down first. */
     private const val MAX_IMAGE_SIDE = 1280
 
     /** Bytes read from a text file. Anything past this is not sent to the model anyway. */
     private const val MAX_READ_BYTES = 256 * 1024
 
+    /** Largest file the owner can attach or add to a sandbox. */
+    const val MAX_FILE_BYTES = 25L * 1024 * 1024
+
     private val TEXT_EXTENSIONS = setOf(
         "txt", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml", "log", "html", "htm", "ini", "conf", "toml",
         "properties", "kt", "java", "py", "js", "ts", "c", "h", "cpp", "rs", "go", "sh", "sql",
     )
+    private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "bmp", "gif")
+    private const val LABEL_CONFIDENCE = 0.5f
+    private const val MAX_LABELS = 6
+    private const val PAGE_WIDTH = 1200
 
-    /** Reads a document the owner picked. Throws [IllegalArgumentException] with a reason the chat can show. */
-    fun fromDocument(context: Context, uri: Uri): Attachment {
-        val name = displayName(context, uri)
-        val extension = name.substringAfterLast('.', "").lowercase(Locale.US)
-        val mime = context.contentResolver.getType(uri).orEmpty()
+    /** True when the chat can read a file of this name and type. Others are kept in the sandbox but not attached. */
+    fun supports(name: String, mime: String): Boolean = kindOf(name, mime) != null
+
+    /** The kind of attachment a file makes, or null when the chat cannot read it. */
+    fun kindOf(name: String, mime: String): AttachmentKind? {
+        val extension = extensionOf(name)
         return when {
-            extension == "pdf" || mime == "application/pdf" -> {
-                val file = copyToCache(context, uri, "pdf")
-                val text = try { pdfText(file) } finally { file.delete() }
-                Attachment(name, "PDF text from the first pages:\n" + clip(text))
-            }
-            mime.startsWith("image/") || extension in IMAGE_EXTENSIONS -> {
-                val file = copyToCache(context, uri, extension.ifEmpty { "jpg" })
-                val description = try { describePicture(file, "Picture") } finally { file.delete() }
-                Attachment(name, description)
-            }
-            mime.startsWith("text/") || extension in TEXT_EXTENSIONS || mime == "application/json" -> {
-                val bytes = context.contentResolver.openInputStream(uri)?.use { stream ->
-                    readAtMost(stream, MAX_READ_BYTES)
-                } ?: throw IllegalArgumentException("$name could not be opened.")
-                if (bytes.contains(0.toByte())) throw IllegalArgumentException("$name is not a text file.")
-                Attachment(name, clip(String(bytes, Charsets.UTF_8)))
-            }
-            else -> throw IllegalArgumentException(
-                "$name is not supported yet. Text files, PDFs and pictures can be attached.",
-            )
+            extension == "pdf" || mime == "application/pdf" -> AttachmentKind.DOCUMENT
+            mime.startsWith("image/") || extension in IMAGE_EXTENSIONS -> AttachmentKind.PICTURE
+            mime.startsWith("text/") || extension in TEXT_EXTENSIONS || mime == "application/json" -> AttachmentKind.DOCUMENT
+            else -> null
         }
     }
 
-    /** Describes a photo the camera saved to [file]. */
-    fun fromPhoto(file: File): Attachment = Attachment("Photo", describePicture(file, "Photo"))
+    /**
+     * Reads a file the sandbox has stored as [stored], and returns the attachment for it, labelled [label]. Throws
+     * [IllegalArgumentException] with a reason the chat can show when the file cannot be read.
+     */
+    fun read(stored: File, label: String, mime: String): ChatAttachment {
+        val kind = kindOf(stored.name, mime)
+            ?: throw IllegalArgumentException("$label is not supported yet. Text files, PDFs and pictures can be attached.")
+        val text = when {
+            extensionOf(stored.name) == "pdf" || mime == "application/pdf" -> "PDF text from the first pages:\n" + clip(pdfText(stored))
+            kind == AttachmentKind.PICTURE -> pictureText(stored)
+            else -> {
+                val bytes = stored.inputStream().use { readAtMost(it, MAX_READ_BYTES) }
+                if (bytes.contains(0.toByte())) throw IllegalArgumentException("$label is not a text file.")
+                clip(String(bytes, Charsets.UTF_8))
+            }
+        }
+        return ChatAttachment(label = label, file = stored.name, kind = kind, text = text)
+    }
+
+    /** Labels and text for a bitmap from the camera, turned by [rotationDegrees] so ML Kit sees it upright. */
+    fun describeBitmap(bitmap: Bitmap, rotationDegrees: Int): String = recognise(bitmap, rotationDegrees)
+
+    /** The file name a picked document has on the device, or a plain fallback. */
+    fun nameOf(context: Context, uri: Uri): String {
+        val fromProvider = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        return fromProvider?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+    }
+
+    /** The type a file opens as. Pictures and PDFs go to the apps that show them; anything else is text. */
+    fun mimeFor(name: String): String {
+        val extension = extensionOf(name)
+        return when {
+            extension == "pdf" -> "application/pdf"
+            extension in IMAGE_EXTENSIONS -> "image/*"
+            extension == "json" -> "application/json"
+            extension in TEXT_EXTENSIONS -> "text/plain"
+            else -> "*/*"
+        }
+    }
 
     /** Cuts [text] to [MAX_CHARS], with a note that it was cut. */
     fun clip(text: String): String {
@@ -86,18 +116,19 @@ object Attachments {
         return trimmed.take(MAX_CHARS) + "\n[The rest was cut to fit the model's context.]"
     }
 
-    private fun describePicture(file: File, what: String): String {
+    private fun pictureText(file: File): String {
+        // decodeScaled has already turned the picture upright, so recognition reads it with no further turn.
         val bitmap = decodeScaled(file) ?: throw IllegalArgumentException("The picture could not be read.")
         try {
-            return "$what: " + recognise(bitmap)
+            return "Picture: " + recognise(bitmap, 0)
         } finally {
             bitmap.recycle()
         }
     }
 
-    /** Labels and text for one picture. */
-    private fun recognise(bitmap: Bitmap): String {
-        val image = InputImage.fromBitmap(bitmap, 0)
+    /** Labels and text for one picture, turned upright by [rotationDegrees]. */
+    private fun recognise(bitmap: Bitmap, rotationDegrees: Int): String {
+        val image = InputImage.fromBitmap(bitmap, rotationDegrees)
         val labeler = ImageLabeling.getClient(ImageLabelerOptions.Builder().setConfidenceThreshold(LABEL_CONFIDENCE).build())
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         try {
@@ -122,7 +153,7 @@ object Attachments {
         }
     }
 
-    private fun readAtMost(stream: java.io.InputStream, limit: Int): ByteArray {
+    private fun readAtMost(stream: InputStream, limit: Int): ByteArray {
         val out = java.io.ByteArrayOutputStream()
         val buffer = ByteArray(8192)
         while (out.size() < limit) {
@@ -168,32 +199,35 @@ object Attachments {
         }
     }
 
-    private fun decodeScaled(file: File): Bitmap? {
+    /** Degrees a photo must turn to be upright, from its EXIF orientation. Zero when the file says nothing. */
+    fun rotationOf(file: File): Int {
+        val orientation = runCatching { ExifInterface(file.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) }
+            .getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+        return when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270
+            else -> 0
+        }
+    }
+
+    /** A picture scaled down so its longest side is at most [MAX_IMAGE_SIDE], turned upright. Null when it cannot be read. */
+    fun decodeScaled(file: File, maxSide: Int = MAX_IMAGE_SIDE): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_IMAGE_SIDE) sample *= 2
-        return BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
+        val decoded = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+            ?: return null
+        // The thumbnails and labels are read upright; the copy is turned here, so both views agree.
+        val turn = rotationOf(file)
+        if (turn == 0) return decoded
+        val matrix = Matrix().apply { postRotate(turn.toFloat()) }
+        val upright = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        if (upright != decoded) decoded.recycle()
+        return upright
     }
 
-    private fun copyToCache(context: Context, uri: Uri, extension: String): File {
-        val folder = File(context.cacheDir, "attachments").apply { mkdirs() }
-        val file = File(folder, "${UUID.randomUUID()}.$extension")
-        val input = context.contentResolver.openInputStream(uri)
-            ?: throw IllegalArgumentException("The file could not be opened.")
-        input.use { source -> file.outputStream().use { target -> source.copyTo(target) } }
-        return file
-    }
-
-    private fun displayName(context: Context, uri: Uri): String {
-        val fromProvider = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
-        return fromProvider?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "file"
-    }
-
-    private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "bmp", "gif")
-    private const val LABEL_CONFIDENCE = 0.5f
-    private const val MAX_LABELS = 6
-    private const val PAGE_WIDTH = 1200
+    private fun extensionOf(name: String): String = name.substringAfterLast('.', "").lowercase(Locale.US)
 }

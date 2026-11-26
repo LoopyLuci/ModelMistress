@@ -16,6 +16,12 @@ enum class FeedbackLabel(val wire: String) {
 
     /** The reply should have used a tool. Similar questions are offered the tools in [FeedbackExample.tools]. */
     NEEDS_TOOLS("needs_tools"),
+
+    /**
+     * The owner said the reply was wrong, and what is right, by voice in a live conversation. [FeedbackExample.correction]
+     * holds it. Similar questions are answered with it in mind. It says nothing about the route, so it never changes routing.
+     */
+    CORRECTED("corrected"),
     ;
 
     companion object {
@@ -34,6 +40,10 @@ data class FeedbackExample(
     val calls: List<String>,
     val answer: String,
     val at: Long,
+    /** What the owner said is right, for [FeedbackLabel.CORRECTED]. Null for the other labels. */
+    val correction: String? = null,
+    /** What the camera showed with the question, when it was asked in a live conversation. Null otherwise. */
+    val camera: String? = null,
 ) {
     companion object {
         /** The reply text kept with an example. Longer replies are cut to this many characters. */
@@ -71,14 +81,19 @@ class FileMistyFeedback(private val file: File, private val capacity: Int = DEFA
         file.delete()
     }
 
-    private fun encode(example: FeedbackExample): Map<String, Any> = mapOf(
-        "question" to example.question,
-        "label" to example.label.wire,
-        "tools" to example.tools,
-        "calls" to example.calls,
-        "answer" to example.answer,
-        "at" to example.at,
-    )
+    private fun encode(example: FeedbackExample): Map<String, Any> {
+        val fields = mutableMapOf<String, Any>(
+            "question" to example.question,
+            "label" to example.label.wire,
+            "tools" to example.tools,
+            "calls" to example.calls,
+            "answer" to example.answer,
+            "at" to example.at,
+        )
+        example.correction?.let { fields["correction"] = it }
+        example.camera?.let { fields["camera"] = it }
+        return fields
+    }
 
     private fun decode(line: String): FeedbackExample? {
         if (line.isBlank()) return null
@@ -92,6 +107,9 @@ class FileMistyFeedback(private val file: File, private val capacity: Int = DEFA
             calls = strings(fields["calls"]),
             answer = fields["answer"] as? String ?: "",
             at = (fields["at"] as? Number)?.toLong() ?: 0L,
+            // Lines saved before corrections existed have neither field.
+            correction = fields["correction"] as? String,
+            camera = fields["camera"] as? String,
         )
     }
 
@@ -106,6 +124,9 @@ class FileMistyFeedback(private val file: File, private val capacity: Int = DEFA
 object MistyLearning {
     /** How much two questions must share, from 0 to 1, before the owner's verdict on one applies to the other. */
     const val SIMILAR = 0.6
+
+    /** The verdicts that say something about the route a question should take. */
+    private val ROUTING = setOf(FeedbackLabel.GOOD, FeedbackLabel.NO_TOOLS, FeedbackLabel.NEEDS_TOOLS)
 
     private val STOP_WORDS = setOf(
         "the", "a", "an", "is", "are", "it", "to", "of", "in", "on", "for", "and", "or", "my", "me", "i", "you", "do",
@@ -129,13 +150,25 @@ object MistyLearning {
 
     /**
      * The verdict that applies to [question]: the most similar saved one that is close enough, the newest first among
-     * equals. Verdicts marked [FeedbackLabel.BAD] never apply, because they say nothing about the route.
+     * equals. Only the routing verdicts apply. [FeedbackLabel.BAD] and [FeedbackLabel.CORRECTED] say nothing about the route.
      */
     fun taught(question: String, examples: List<FeedbackExample>): FeedbackExample? = examples
-        .filter { it.label != FeedbackLabel.BAD }
+        .filter { it.label in ROUTING }
         .map { it to similarity(question, it.question) }
         .filter { it.second >= SIMILAR }
         .sortedWith(compareByDescending<Pair<FeedbackExample, Double>> { it.second }.thenByDescending { it.first.at })
         .firstOrNull()
         ?.first
+
+    /**
+     * The owner's corrections that apply to [question], the most similar first and the newest among equals, at most [limit].
+     * They are given to the model as notes about similar questions.
+     */
+    fun corrections(question: String, examples: List<FeedbackExample>, limit: Int = 2): List<FeedbackExample> = examples
+        .filter { it.label == FeedbackLabel.CORRECTED && !it.correction.isNullOrBlank() }
+        .map { it to similarity(question, it.question) }
+        .filter { it.second >= SIMILAR }
+        .sortedWith(compareByDescending<Pair<FeedbackExample, Double>> { it.second }.thenByDescending { it.first.at })
+        .take(limit)
+        .map { it.first }
 }

@@ -9,7 +9,7 @@ import com.modelmistress.core.chat.ModelRouter
 import com.modelmistress.core.misty.FileMistyFeedback
 import com.modelmistress.core.misty.MistyFeedback
 import com.modelmistress.core.remote.CombinedCatalog
-import com.modelmistress.core.tools.Workspace
+import com.modelmistress.core.environment.EnvironmentStore
 import com.modelmistress.runtime.overlay.TransferdOverlay
 import com.modelmistress.server.ModelMistressServer
 import com.modelmistress.server.ServerConfig
@@ -50,8 +50,11 @@ class ModelRuntime private constructor(context: Context) {
     /** The chats kept on this device, one file each under the app's storage. */
     val chats: ChatStore = FileChatStore(File(context.filesDir, "chats"))
 
-    /** The text files the chat's tools may read. Only files added on the Models screen are visible to the model. */
-    val workspace = Workspace(File(context.filesDir, "workspace").apply { mkdirs() })
+    /**
+     * The sandboxes: one folder per chat, on this device. A chat's tools reach its own folder and the ones it is linked to,
+     * and nothing else on the device.
+     */
+    val environments = EnvironmentStore(context.filesDir)
 
     /** Downloads GGUF models from Hugging Face into the library, one at a time. */
     val downloads = ModelDownloads(library, settings)
