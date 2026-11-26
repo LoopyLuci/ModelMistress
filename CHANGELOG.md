@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- **The server log says how a model's layers were placed, and `model.telemetry` reads it** (`src/loadlog.rs`, `src/engine.rs`,
+  `src/hub.rs`, `src/serving.rs`; [serving](docs/serving.md#the-server-log-and-model-telemetry)). llama.cpp b12726 prints its
+  load details (devices, memory fit, layers on the GPU, every buffer, KV cache and state, compute graph and its splits, stage
+  times) only at verbosity 4, so a stock llama-server is now started with `-lv 4` unless the owner's `extra_args` set a
+  verbosity (about 19 KB per load, 2.8 KB per request; Rigel and Prism are unchanged). Each log opens with `# mm` lines:
+  what the hub ran, with which environment, and why. The logs of the three loads before the current one are kept
+  (`<model>.1.log` to `.3.log`), so the crash that caused a retry on the CPU can be read; `logs.tail` takes `previous`.
+  New operation `model.telemetry`: the load report, the placement with layer counts, the latest request timings, the
+  server's `/metrics` and `/slots`, and the GPU memory the process holds now. The placement label now follows the layer
+  counts in the log: gemma-4-31B (every layer on the card) was labelled `partial` from a memory estimate and is now `gpu`,
+  and its note no longer says that 19.9 GB of it stay in RAM (the estimate for a sliding-window model was 42 GB against
+  14.5 GB measured). Measured through a debug hub with the b12726 engine on an RX 7900 XTX, 900-token replies:
+  Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL 37.8 tokens/s (66/66 layers, 16.6 GB, 52.6 s to load from an SSD),
+  gemma-4-31B-it-UD-Q2_K_XL 41.2 tokens/s (61/61 layers, 14.5 GB, 109 s from a hard drive).
+
+- **The VRAM estimate knows sliding-window attention** (`src/serving.rs`, `src/catalog.rs`; [serving](docs/serving.md#the-vram-planner)).
+  The estimate took every layer for full attention with 32 KV heads of 512 (the query heads, because the GGUF reader
+  skipped every list and gemma 4 keeps its KV heads per layer): gemma-4-31B came to 42,450 MiB for a load that took
+  14,540 and was held back from the card for it. The reader now keeps short lists of numbers and flags (at most 1,024 entries), and
+  the shape takes the heads, the head sizes (`key_length_swa`) and the window layers (`sliding_window_pattern`) per
+  layer, plus layers that share the cache of earlier ones (`shared_kv_layers`). The window layers are sized as
+  llama.cpp sizes them: the window and a batch, rounded to 256, for each slot (one window for all with `--kv-unified`),
+  or the whole context with `--swa-full`. For gemma 2, gemma 3, gemma 3n, cohere2, gpt-oss, olmo2, afmoe and plamo3,
+  whose files may lack the pattern, the period llama.cpp builds in is used (read from `engines/llama.cpp`); any other
+  architecture with no pattern in its file stays full attention, which is the safe side. Checked against the real file:
+  gemma-4-31B at 4,096 tokens now estimates 1,520 MiB of KV (the server printed 320 MiB for the 10 full layers and
+  1,200 MiB for the 50 window layers) and 13,250 MiB in all, against 12,918 MiB projected by the server; Huihui
+  Qwen3.8-27B (no window) is unchanged at 17,886 MiB. A 32k context on gemma now costs 3,760 MiB of KV, not 30 GB.
+
 - **llama.cpp b12726 (Inkling 2), and a GPU crash gets a second try with the Vulkan cooperative-matrix kernels off**
   (`engines/llama.cpp`, `engines/patches/mm-routing.patch`, `src/engine.rs`). The pinned llama.cpp moved from 7fee17846 to
   the tag b12726, which runs `inkling2_loop`; the routing patch was re-based. A load that crashes llama-server on the GPU

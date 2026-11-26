@@ -1295,6 +1295,20 @@ impl Engine {
         embeddings: bool,
         on_stop: Option<Box<dyn FnOnce() + Send>>,
     ) -> Arc<Instance> {
+        self.adopt_with_log(model, port, key, embeddings, PathBuf::new(), on_stop)
+    }
+
+    /// [`adopt_as`](Self::adopt_as) for a stand-in with a server log (for `logs.tail` and `model.telemetry`).
+    #[doc(hidden)]
+    pub fn adopt_with_log(
+        &self,
+        model: &str,
+        port: u16,
+        key: &str,
+        embeddings: bool,
+        log: PathBuf,
+        on_stop: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Arc<Instance> {
         let inst = Arc::new(Instance {
             model: model.to_string(),
             port,
@@ -1303,7 +1317,7 @@ impl Engine {
             child: Mutex::new(None),
             started: Instant::now(),
             args: vec![],
-            log: PathBuf::new(),
+            log,
             embeddings,
             reranking: false,
             opts: LoadOpts::default(),
@@ -1467,6 +1481,13 @@ impl Engine {
             cpu_moe,
             n_cpu_moe: opts.n_cpu_moe.unwrap_or(0) as u64,
             extra_gpu_bytes: draft,
+            kv_unified: r.flags.kv_unified.unwrap_or(false),
+            swa_full: self
+                .settings()
+                .extra_args
+                .iter()
+                .chain(opts.extra_args.iter())
+                .any(|a| a == "--swa-full"),
         };
         Some(serving::estimate_vram(&shape, &placement)).filter(|e| e.total_mib > 0)
     }
@@ -2030,12 +2051,67 @@ impl Engine {
         } else {
             None
         };
+        // the layers the server says it put on the GPU (its log has them at verbosity 4)
+        let layers = crate::loadlog::parse(&log).summary();
         let mut sv = inst.serving.write();
         if let Some(p) = props {
             sv.apply_props(&p);
         }
         sv.vram_mib = process.map(|m| m as f64).or_else(|| serving::vram_from_log(&log));
         sv.estimated_vram_mib = estimate;
+        sv.layers = layers;
+    }
+
+    /// How a loaded model runs, for `model.telemetry`: the server's own account of the load (layers, buffers, the
+    /// memory fit, the KV cache, the compute graph, how long each stage took), what it holds on the GPU now, the
+    /// timings of its latest requests and its own counters (`/metrics`, `/slots`).
+    pub async fn telemetry(&self, inst: &Instance) -> Value {
+        // the load is at the top of the log and the latest requests at the end: a log that has grown is not read whole
+        let report = crate::loadlog::parse(&read_head(&inst.log, 1 << 20));
+        let requests = crate::loadlog::recent_requests(&read_tail(&inst.log, 256 << 10), 10);
+        let fetch = |path: &'static str| {
+            let req = self
+                .http
+                .get(format!("http://127.0.0.1:{}{path}", inst.port))
+                .bearer_auth(&inst.key)
+                .timeout(Duration::from_secs(5));
+            async move {
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => r.text().await.ok(),
+                    _ => None,
+                }
+            }
+        };
+        let counters = fetch("/metrics").await.map(|t| crate::loadlog::parse_prometheus(&t));
+        let slots = fetch("/slots")
+            .await
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .map(|v| crate::loadlog::slots_summary(&v));
+        let gpu_now = if inst.pid > 0 {
+            typeperf(&format!(r"\GPU Process Memory(pid_{}_*)\Dedicated Usage", inst.pid))
+                .await
+                .and_then(|t| serving::process_used_mib(&t))
+        } else {
+            None
+        };
+        let sv = inst.serving();
+        let hub = self.metrics.lock().get(&inst.model).cloned();
+        crate::loadlog::prune(json!({
+            "model": inst.model, "pid": inst.pid, "port": inst.port,
+            "uptime_s": inst.started.elapsed().as_secs(), "args": inst.args,
+            "placement": {
+                "where": sv.placement, "note": sv.placement_note, "layers": sv.layers,
+                "line": sv.layers.as_ref().map(crate::loadlog::describe_layers),
+                "vram_mib": sv.vram_mib, "estimated_vram_mib": sv.estimated_vram_mib,
+                "gpu_dedicated_now_mib": gpu_now,
+            },
+            "load": report.to_json(),
+            "runtime": {
+                "recent_requests": requests.iter().map(crate::loadlog::timing_json).collect::<Vec<_>>(),
+                "server_counters": counters, "slots": slots, "hub": hub,
+            },
+            "logs": log_files(&inst.log),
+        }))
     }
 
     /// The server program a load with `r` runs.
@@ -2359,6 +2435,12 @@ impl Engine {
                     if !history.is_empty() {
                         let tail = if how == Try::Cpu { "; it runs on the CPU" } else { "" };
                         note = Some(format!("{}{tail}", history.join("; ")));
+                    } else if let Try::Held { budget, .. } = &how {
+                        if let Some(n) =
+                            held_note_after_load(*budget, &inst.serving(), crate::loadlog::moves_tensors(&inst.args))
+                        {
+                            note = Some(n);
+                        }
                     }
                     if note.is_some() {
                         inst.serving.write().placement_note = note;
@@ -2603,6 +2685,18 @@ impl Engine {
             }
         }
         args.push("--metrics".into());
+        // llama.cpp prints how it placed a model (the layers on each device, every buffer, the KV cache, the graph
+        // splits, the memory fit) at verbosity 4 only. The hub reads those lines for where the weights are and for
+        // `model.telemetry`; a verbosity the owner's own arguments set stands, and a server that does not list the
+        // flag is not given it.
+        if !rigel
+            && !resolved.flags.is_prism()
+            && !crate::loadlog::sets_verbosity(&s.extra_args)
+            && !crate::loadlog::sets_verbosity(&opts.extra_args)
+            && self.server_has_flag(&exe, "--log-verbosity").await
+        {
+            args.extend(["-lv".into(), "4".into()]);
+        }
         let user_threads =
             opts.threads.is_some() || serving::sets_threads(&s.extra_args) || serving::sets_threads(&opts.extra_args);
         if let Some(t) = opts.threads {
@@ -2635,8 +2729,12 @@ impl Engine {
         let logs = self.home.join("logs");
         let _ = std::fs::create_dir_all(&logs);
         let log = logs.join(format!("{}.log", safe_name(&entry.id)));
+        // the log of the load before this one stays as `<model>.1.log` (and so on): when a load crashed and is tried
+        // again, the crash is what the owner needs to read
+        rotate_logs(&log, LOGS_KEPT);
         let out = std::fs::File::create(&log).map_err(|e| Fail::new(500, "io", format!("{}: {e}", log.display())))?;
         let err = out.try_clone().map_err(|e| Fail::new(500, "io", e.to_string()))?;
+        let head = out.try_clone().map_err(|e| Fail::new(500, "io", e.to_string()))?;
 
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(&args)
@@ -2656,12 +2754,38 @@ impl Engine {
         }
         // a GPU load that crashed the server once: Vulkan's cooperative-matrix kernels off (the variables mean nothing
         // to a server built for another backend)
+        let mut env_set = resolved.env();
         if safe_kernels && resolved.gpu_layers != 0 {
             for var in ["GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2"] {
                 if std::env::var_os(var).is_none() {
                     cmd.env(var, "1");
+                    env_set.push((var.to_string(), "1".to_string()));
                 }
             }
+        }
+        // what the hub runs, and why, goes first in the log: it says how the load was made even when the server dies
+        // before it prints a line
+        {
+            use std::io::Write;
+            let attempt = format!(
+                "{} {how:?}{}",
+                entry.id,
+                if safe_kernels {
+                    " (a GPU load of it crashed the server: Vulkan's cooperative-matrix kernels are off)"
+                } else {
+                    ""
+                }
+            );
+            let text = crate::loadlog::log_header(
+                env!("CARGO_PKG_VERSION"),
+                now_s(),
+                &exe.display().to_string(),
+                &args,
+                &env_set,
+                &attempt,
+            );
+            let mut head = head;
+            let _ = head.write_all(text.as_bytes());
         }
         no_window(&mut cmd);
         #[cfg(target_os = "linux")]
@@ -2765,8 +2889,14 @@ impl Engine {
                         .map(|e| e.weights_mib + e.kv_mib + e.state_mib);
                     {
                         let mut sv = inst.serving.write();
-                        sv.placement =
-                            serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers);
+                        // the server's own count of the layers on the GPU, when its log has it, beats a guess from the
+                        // memory it holds (a model whose estimate is high looked "partial" while every layer was on the card)
+                        let counted = sv.layers.as_ref().and_then(|l| {
+                            crate::loadlog::placement_from_layers(l, crate::loadlog::moves_tensors(&inst.args))
+                        });
+                        sv.placement = counted.unwrap_or_else(|| {
+                            serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers)
+                        });
                         if sv.placement_note.is_none() {
                             sv.placement_note = spill_note;
                         }
@@ -3193,6 +3323,97 @@ async fn typeperf(counter: &str) -> Option<String> {
 
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+}
+
+/// The note of a load that was held to `budget` MiB because its estimate was over what the card allows ("the rest stays
+/// in RAM"), corrected once the server's own log shows every layer on the card: the estimate was too high, and the
+/// part that was to stay in RAM did not exist. None when the log does not say that, and the note stands.
+fn held_note_after_load(budget: u64, sv: &Serving, moves_tensors: bool) -> Option<String> {
+    let layers = sv.layers.as_ref()?;
+    if crate::loadlog::placement_from_layers(layers, moves_tensors) != Some("gpu") {
+        return None;
+    }
+    let estimate = sv
+        .estimated_vram_mib
+        .map(|e| format!("The estimate of {e} MiB"))
+        .unwrap_or_else(|| "The estimate".into());
+    let held = sv
+        .vram_mib
+        .map(|v| format!(" ({v:.0} MiB on the card)"))
+        .unwrap_or_default();
+    Some(format!(
+        "{estimate} was more than the card allows, so the load was held to {budget} MiB; llama-server's own fit then \
+         put every layer on the GPU{held}"
+    ))
+}
+
+/// Earlier loads' logs kept beside a model's current one (`<model>.1.log` is the load before this one).
+const LOGS_KEPT: usize = 3;
+
+/// `<model>.log` for 0, `<model>.1.log` for 1, and so on.
+pub fn numbered_log(log: &Path, n: usize) -> PathBuf {
+    if n == 0 {
+        log.to_path_buf()
+    } else {
+        log.with_extension(format!("{n}.log"))
+    }
+}
+
+/// Moves `<model>.log` to `<model>.1.log`, that one to `.2.log` and so on, and drops the oldest. A move that fails
+/// (a file another program holds) leaves the old log to be overwritten, as before.
+fn rotate_logs(log: &Path, keep: usize) {
+    let _ = std::fs::remove_file(numbered_log(log, keep));
+    for n in (1..keep).rev() {
+        let from = numbered_log(log, n);
+        if from.exists() {
+            let _ = std::fs::rename(&from, numbered_log(log, n + 1));
+        }
+    }
+    if log.exists() {
+        let _ = std::fs::rename(log, numbered_log(log, 1));
+    }
+}
+
+/// The logs kept for a model: path, size and when each was last written.
+fn log_files(log: &Path) -> Vec<Value> {
+    (0..=LOGS_KEPT)
+        .filter_map(|n| {
+            let p = numbered_log(log, n);
+            let meta = std::fs::metadata(&p).ok()?;
+            let at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(
+                json!({"load": if n == 0 { "this".to_string() } else { format!("{n} before") },
+                        "file": p, "bytes": meta.len(), "modified": crate::loadlog::iso_utc(at)}),
+            )
+        })
+        .collect()
+}
+
+/// At most `max` bytes from the start of a file (a server's log opens with its load).
+fn read_head(path: &Path, max: u64) -> String {
+    use std::io::Read;
+    let mut raw = vec![];
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(max).read_to_end(&mut raw);
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// At most `max` bytes from the end of a file (a server's log ends with its latest requests).
+fn read_tail(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut raw = vec![];
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(max)));
+        let _ = f.read_to_end(&mut raw);
+    }
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn safe_name(id: &str) -> String {
@@ -4366,6 +4587,248 @@ parallel = 1
         // a crash is remembered only when the CPU start worked, and here it did not
         assert!(!d.join("placements.json").exists());
         assert_eq!(e.loaded().len(), 0);
+
+        // the log of each start is kept: the one that is left is the CPU's, the GPU starts before it are `.1` and `.2`,
+        // and each opens with what the hub ran
+        let log = d.join("logs").join("m.log");
+        let [now, before, first] =
+            [0, 1, 2].map(|n| std::fs::read_to_string(numbered_log(&log, n)).unwrap_or_default());
+        assert!(now.starts_with("# mm "), "{now}");
+        assert!(now.contains("# mm args: ") && now.contains("-dev none"), "{now}");
+        assert!(before.starts_with("# mm ") && !before.contains("-dev none"), "{before}");
+        assert!(before.contains("cooperative-matrix kernels are off"), "{before}");
+        assert!(before.contains("# mm env: GGML_VK_DISABLE_COOPMAT=1"), "{before}");
+        assert!(
+            first.starts_with("# mm ") && !first.contains("cooperative-matrix"),
+            "{first}"
+        );
+        assert!(!numbered_log(&log, 3).exists(), "only the two earlier starts exist");
+    }
+
+    /// The details of a load are printed at verbosity 4 only: the hub asks for them when the server has the flag, and
+    /// leaves the owner's own verbosity alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_load_details_are_asked_for_unless_the_owner_chose_a_verbosity() {
+        let d = crate::testing::TestDir::new("mm-verbosity");
+        let server = gpu_crashing_server(&d);
+        // the same stand-in, which now lists the flag in its `--help`
+        let text = std::fs::read_to_string(&server).unwrap();
+        std::fs::write(
+            &server,
+            text.replace("--fit --device", "--fit --device --log-verbosity"),
+        )
+        .unwrap();
+        let e = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(server),
+                ollama_url: String::new(),
+                gpu_fallback: false,
+                ..Default::default()
+            },
+        );
+        let entry = stand_in_entry(&d, 1);
+        let _ = e.ensure_loaded(&entry, &LoadOpts::default(), true).await;
+        let _ = e
+            .ensure_loaded(
+                &entry,
+                &LoadOpts {
+                    extra_args: vec!["-lv".into(), "2".into()],
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+        let seen = starts(&d);
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen[0].contains(" -lv 4"), "{}", seen[0]);
+        let last = seen.last().unwrap();
+        assert!(last.contains("-lv 2") && !last.contains("-lv 4"), "{last}");
+    }
+
+    /// A server without the flag (an older build, another engine) is started as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_without_the_verbosity_flag_is_not_given_it() {
+        let d = crate::testing::TestDir::new("mm-no-verbosity");
+        let e = ladder_engine(&d, false);
+        let _ = e
+            .ensure_loaded(&stand_in_entry(&d, 1), &LoadOpts::default(), true)
+            .await;
+        let seen = starts(&d);
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|l| !l.contains("-lv")), "{seen:?}");
+    }
+
+    /// An instance whose server is gone (nothing listens on its port) but whose log is there: all `telemetry` and
+    /// `learn_serving` need of it.
+    fn instance_with_log(d: &Path, log: &str, args: &[&str]) -> Instance {
+        let path = d.join("logs").join("m.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, log).unwrap();
+        Instance {
+            model: "m".into(),
+            port: free_port().unwrap(),
+            pid: 0,
+            key: "k".into(),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            log: path,
+            embeddings: false,
+            reranking: false,
+            opts: LoadOpts::default(),
+            extras: Extras::default(),
+            serving: RwLock::new(Serving::default()),
+            last_used: AtomicU64::new(now_s()),
+            keep: AtomicI64::new(0),
+            inflight: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            on_stop: Mutex::new(None),
+        }
+    }
+
+    /// What the server's log says about the layers is learned once the server is up, and is what `model.telemetry`
+    /// reports, with the log's own request timings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_layers_in_the_servers_log_are_learned_and_reported() {
+        let d = crate::testing::TestDir::new("mm-telemetry");
+        let e = ladder_engine(&d, false);
+        let partial = include_str!("../tests/fixtures/llama/small-partial.txt");
+        let inst = instance_with_log(&d, partial, &["-m", "m.gguf", "-ngl", "10"]);
+        e.learn_serving(&inst, Some(900)).await;
+        let l = inst
+            .serving()
+            .layers
+            .expect("the log says how many layers went to the GPU");
+        assert_eq!((l.total, l.offloaded), (25, 10));
+        assert_eq!(
+            crate::loadlog::placement_from_layers(&l, false),
+            Some("partial"),
+            "the layer counts, not a guess from the memory held"
+        );
+
+        // an earlier load's log is listed too
+        std::fs::write(numbered_log(&inst.log, 1), "# mm 0.0.0 earlier\n").unwrap();
+        let t = e.telemetry(&inst).await;
+        assert_eq!(t["model"], "m");
+        assert_eq!(t["load"]["layers"]["offloaded"], 10);
+        assert_eq!(t["load"]["model"]["arch"], "qwen35");
+        assert_eq!(t["placement"]["layers"]["total"], 25);
+        assert!(
+            t["placement"]["line"].as_str().unwrap().contains("10"),
+            "{}",
+            t["placement"]["line"]
+        );
+        assert_eq!(t["load"]["graphs"][0]["splits"], 257);
+        let logs = t["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert_eq!(
+            (logs[0]["load"].as_str(), logs[1]["load"].as_str()),
+            (Some("this"), Some("1 before"))
+        );
+        // nothing is listening, so the counters are left out rather than reported as zero
+        assert!(
+            t["runtime"].get("server_counters").is_none() && t["runtime"].get("slots").is_none(),
+            "{t}"
+        );
+
+        // a long-running server's log has the load at its top and the requests at its end
+        let gpu = include_str!("../tests/fixtures/llama/small-gpu.txt");
+        let load: String = gpu
+            .lines()
+            .take_while(|l| !l.contains("new prompt"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let request: String = gpu
+            .lines()
+            .skip_while(|l| !l.contains("new prompt"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let filler = "0.05.000.000 I srv  filler: a line a server prints between its requests, a hundred bytes or so\n";
+        let long = format!("{load}{}{request}", filler.repeat(14_000));
+        assert!(
+            long.len() > (1 << 20) + (256 << 10),
+            "the log is longer than the parts the hub reads"
+        );
+        let inst = instance_with_log(&d, &long, &[]);
+        let t = e.telemetry(&inst).await;
+        assert_eq!(t["load"]["layers"]["offloaded"], 25);
+        let requests = t["runtime"]["recent_requests"]
+            .as_array()
+            .expect("the request at the end is found");
+        assert_eq!(requests.len(), 1, "{t}");
+        assert_eq!(requests[0]["generated_tokens"], 300);
+    }
+
+    /// A log at the default verbosity gives no layers: the hub's guess from the memory held stays in force.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_log_without_the_details_leaves_the_placement_to_the_memory_guess() {
+        let d = crate::testing::TestDir::new("mm-telemetry-bare");
+        let e = ladder_engine(&d, false);
+        let inst = instance_with_log(&d, include_str!("../tests/fixtures/llama/default-verbosity.txt"), &[]);
+        e.learn_serving(&inst, None).await;
+        assert!(inst.serving().layers.is_none());
+        let t = e.telemetry(&inst).await;
+        assert!(t["load"]["notes"][0].as_str().unwrap().contains("-lv 4"), "{t}");
+        assert!(t["placement"].get("layers").is_none());
+    }
+
+    /// A load held to a budget by an estimate that proved too high says so once the log shows every layer on the card,
+    /// instead of promising that part of the model stays in RAM. (The numbers are the old estimate of a sliding-window
+    /// model, 42,450 MiB for a load that took 14,540; the estimate is right for those now, and this stays the check on
+    /// the architectures it does not know.)
+    #[test]
+    fn a_held_load_that_the_log_shows_wholly_on_the_card_is_not_said_to_spill_into_ram() {
+        let gemma = include_str!("../tests/fixtures/llama/gemma.txt");
+        let partial = include_str!("../tests/fixtures/llama/small-partial.txt");
+        let mut sv = Serving {
+            estimated_vram_mib: Some(42450),
+            vram_mib: Some(14540.0),
+            ..Default::default()
+        };
+        // nothing known of the layers: the note made before the load stands
+        assert_eq!(held_note_after_load(22512, &sv, false), None);
+        sv.layers = crate::loadlog::parse(gemma).summary();
+        let n = held_note_after_load(22512, &sv, false).expect("every layer is on the card");
+        assert!(
+            n.contains("42450 MiB") && n.contains("22512 MiB") && n.contains("every layer"),
+            "{n}"
+        );
+        assert!(
+            n.contains("14540 MiB on the card") && !n.contains("stays in RAM"),
+            "{n}"
+        );
+        // experts moved off the card by the owner's arguments: a part is in RAM after all
+        assert_eq!(held_note_after_load(22512, &sv, true), None);
+        // some layers on the CPU: the load was split, and the note stands
+        sv.layers = crate::loadlog::parse(partial).summary();
+        assert_eq!(held_note_after_load(22512, &sv, false), None);
+    }
+
+    /// Rotating keeps the loads before the current one, and the oldest goes.
+    #[test]
+    fn the_logs_of_the_loads_before_are_kept_and_the_oldest_goes() {
+        let d = crate::testing::TestDir::new("mm-rotate");
+        let log = d.join("m.log");
+        for n in 1..=5 {
+            rotate_logs(&log, LOGS_KEPT);
+            std::fs::write(&log, format!("load {n}")).unwrap();
+        }
+        let read = |n| std::fs::read_to_string(numbered_log(&log, n)).ok();
+        assert_eq!(
+            [read(0), read(1), read(2), read(3), read(4)],
+            [
+                Some("load 5".into()),
+                Some("load 4".into()),
+                Some("load 3".into()),
+                Some("load 2".into()),
+                None
+            ]
+        );
+        // a model id with dots keeps them
+        let dotted = d.join("Qwen3.5-0.8B.log");
+        assert_eq!(numbered_log(&dotted, 2), d.join("Qwen3.5-0.8B.2.log"));
     }
 
     /// A model that worked on the GPU only with the cooperative-matrix kernels off keeps starting that way, and is

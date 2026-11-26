@@ -479,12 +479,25 @@ fn core_operations() -> Vec<Value> {
         ),
         op(
             "logs.tail",
-            "The last lines of a loaded model's llama-server log",
+            "The last lines of a loaded model's llama-server log (the log starts with what the hub ran and why; \
+             `previous` reads the load before, such as an attempt that crashed and was tried again)",
             false,
             false,
             json!({
-                "model": model, "lines": {"type": "integer", "minimum": 1, "maximum": 2000}
+                "model": model, "lines": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "previous": {"type": "integer", "minimum": 0, "maximum": 3,
+                             "description": "0: this load's log (default); 1: the load before it, 2: the one before that"}
             }),
+            &["model"],
+        ),
+        op(
+            "model.telemetry",
+            "How a loaded model runs, from its server's own log and counters: layers on the GPU, every buffer, the KV \
+             cache and recurrent state, the compute graph and its splits, the memory fit, flash attention, how long \
+             each stage of the load took, what the GPU holds now, and the speed of the latest requests",
+            false,
+            false,
+            json!({"model": model}),
             &["model"],
         ),
         op(
@@ -979,7 +992,26 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .into_iter()
                 .find(|i| i.model == m.id)
                 .ok_or_else(|| Fail::new(409, "not_loaded", format!("{} is not loaded", m.id)))?;
-            json!({"model": m.id, "log": inst.log, "text": crate::engine::tail(&inst.log, n)})
+            let previous = a["previous"].as_u64().unwrap_or(0).min(3) as usize;
+            let log = crate::engine::numbered_log(&inst.log, previous);
+            if previous > 0 && !log.exists() {
+                return Err(Fail::new(
+                    404,
+                    "no_such_log",
+                    format!("{} has no log from {previous} load(s) ago", m.id),
+                )
+                .into());
+            }
+            json!({"model": m.id, "log": log, "previous": previous, "text": crate::engine::tail(&log, n)})
+        }
+        "model.telemetry" => {
+            let m = llama_entry(hub, s(a, "model")?)?;
+            let inst = e
+                .loaded()
+                .into_iter()
+                .find(|i| i.model == m.id)
+                .ok_or_else(|| Fail::new(409, "not_loaded", format!("{} is not loaded", m.id)))?;
+            e.telemetry(&inst).await
         }
         "model.pull" => {
             let spec = s(a, "model")?;
@@ -2739,6 +2771,56 @@ unrelated line
         let v = get("/v1/models").await;
         assert_eq!(v["data"][0]["meta"]["loaded"], true);
         assert!(v["data"][0]["serving"].is_object());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `model.telemetry` and `logs.tail` read the log of a loaded model, and the logs of the loads before it.
+    #[tokio::test]
+    async fn the_servers_log_and_its_telemetry_are_read_through_the_hub() {
+        let home = crate::testing::temp_home();
+        let h = hub_without_tools(&home, &["tiny"]);
+        // not loaded: nothing to read, and the answer says so
+        for op in ["model.telemetry", "logs.tail"] {
+            let (code, v) = json_post(&h, &format!("/v1/call/{op}"), json!({"model": "tiny"})).await;
+            assert_eq!(code, 409, "{op}: {v}");
+        }
+        let log = home.join("logs").join("tiny.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, include_str!("../tests/fixtures/llama/small-partial.txt")).unwrap();
+        std::fs::write(
+            crate::engine::numbered_log(&log, 1),
+            "# mm 0.4.2 tiny GpuAsked\nggml_vulkan: the load before this one crashed\n",
+        )
+        .unwrap();
+        h.engine.adopt_with_log("tiny", 1, "k", false, log, None);
+
+        let (code, v) = json_post(&h, "/v1/call/model.telemetry", json!({"model": "tiny"})).await;
+        assert_eq!(code, 200, "{v}");
+        let r = &v["result"];
+        assert_eq!(
+            (&r["load"]["layers"]["offloaded"], &r["load"]["layers"]["total"]),
+            (&json!(10), &json!(25))
+        );
+        assert_eq!(r["load"]["model"]["arch"], "qwen35");
+        assert!(r["load"]["buffers"].as_array().is_some_and(|b| b.len() > 5), "{r}");
+        assert_eq!(r["logs"].as_array().map(Vec::len), Some(2), "{r}");
+
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "lines": 2000})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(
+            v["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("offloaded 10/25 layers to GPU"),
+            "{v}"
+        );
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "previous": 1})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["result"]["text"].as_str().unwrap().contains("crashed"), "{v}");
+        assert_eq!(v["result"]["previous"], 1);
+        // there is no log two loads back
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "previous": 2})).await;
+        assert_eq!(code, 404, "{v}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -582,6 +582,10 @@ pub struct Serving {
     /// Where the weights went: "gpu" (all on the GPU), "partial" (some layers on the GPU, the rest on the CPU), "cpu",
     /// or "unknown" (not measured: no GPU counters, or not loaded yet).
     pub placement: &'static str,
+    /// What the server's own log says about the layers: how many it put on the GPU, the buffers on each side, the
+    /// graph splits. This decides `placement` when it is there (the server prints it at verbosity 4, which the hub
+    /// asks for).
+    pub layers: Option<crate::loadlog::LayerSummary>,
     /// Why it is where it is, when that is not what was asked for (a retry on the CPU after the GPU failed, a
     /// remembered failure).
     pub placement_note: Option<String>,
@@ -617,6 +621,7 @@ impl Serving {
             vram_mib: None,
             estimated_vram_mib: None,
             placement: if r.gpu_layers == 0 { "cpu" } else { "unknown" },
+            layers: None,
             placement_note: None,
             source: "requested",
         }
@@ -670,18 +675,36 @@ pub fn vram_from_log(text: &str) -> Option<f64> {
 
 // ---- estimating ----------------------------------------------------------------------------------------------
 
+/// What one token adds to the cache of the layers of one kind: the elements of K and of V, summed over those layers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct KvElems {
+    pub k: u64,
+    pub v: u64,
+}
+
+impl KvElems {
+    fn is_empty(&self) -> bool {
+        self.k == 0 && self.v == 0
+    }
+}
+
 /// What the planner needs to know about a model, read from its GGUF header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelShape {
     pub file_bytes: u64,
     /// Transformer layers that are served (the multi-token-prediction layer a file may carry is left out).
     pub layers: u64,
-    /// Of those, the ones with a KV cache (a hybrid model has attention in every Nth layer only).
+    /// Of those, the ones with a KV cache (a hybrid model has attention in every Nth layer only, and a model that shares
+    /// the cache of its last layers has none there).
     pub attn_layers: u64,
     pub n_embd: u64,
-    pub n_head_kv: u64,
-    pub key_len: u64,
-    pub val_len: u64,
+    /// Per token, over the layers that attend over the whole context.
+    pub kv_full: KvElems,
+    /// Per token, over the layers that attend over a sliding window. Their cache holds the window (and a batch), not the
+    /// context: that is most of the layers of a Gemma, and why a long context costs so little there.
+    pub kv_swa: KvElems,
+    /// Tokens of the window (0: no layer has one).
+    pub swa_window: u64,
     /// Bytes of recurrent state one slot needs (0 for a pure transformer).
     pub state_bytes_per_slot: u64,
     /// Fraction of the weights that are expert tensors (0 for a dense model).
@@ -692,23 +715,127 @@ fn meta_u64(meta: &Map<String, Value>, key: &str) -> Option<u64> {
     meta.get(key).and_then(Value::as_u64)
 }
 
+/// A setting that may be one number or one per layer (`head_count_kv` of a model whose layers differ): the number, or
+/// the largest of the list.
+fn meta_num(meta: &Map<String, Value>, key: &str) -> Option<u64> {
+    match meta.get(key)? {
+        Value::Array(a) => a.iter().filter_map(Value::as_u64).max(),
+        v => v.as_u64(),
+    }
+}
+
+/// One number per layer, when the file lists them.
+fn meta_per_layer(meta: &Map<String, Value>, key: &str) -> Option<Vec<u64>> {
+    let a = meta.get(key)?.as_array()?;
+    Some(a.iter().map(|v| v.as_u64().unwrap_or(0)).collect())
+}
+
+/// How llama.cpp builds the sliding-window pattern of the architectures that have one built in (`load_swa_pattern`
+/// in each model's loader): the period (every Nth layer attends over the whole context, the others over the window),
+/// whether the first layer of a period is the full one, and the window when the file does not give one.
+const SWA_BUILT_IN: &[(&str, u64, bool, u64)] = &[
+    ("gemma2", 2, false, 4096),
+    ("gemma3", 6, false, 0),
+    ("gemma3n", 5, false, 0),
+    ("cohere2", 4, false, 0),
+    ("gpt-oss", 2, false, 0),
+    ("olmo2", 4, false, 0),
+    ("afmoe", 4, false, 0),
+    ("plamo3", 8, false, 0),
+];
+
+/// Which of the first `n` layers attend over a window only, and how wide it is. The file's own list wins
+/// (`sliding_window_pattern`, one flag per layer: Gemma 4), then its period, then the one built into llama.cpp for the
+/// architecture. A model with none of them (or no window) is taken as all full attention, which is the safe side.
+fn swa_layers(meta: &Map<String, Value>, arch: &str, n: u64) -> (Vec<bool>, u64) {
+    let built_in = SWA_BUILT_IN.iter().find(|(a, ..)| *a == arch);
+    let window = meta_u64(meta, &format!("{arch}.attention.sliding_window"))
+        .filter(|w| *w > 0)
+        .or_else(|| built_in.map(|b| b.3).filter(|w| *w > 0));
+    let Some(window) = window else {
+        return (vec![false; n as usize], 0);
+    };
+    let by_period = |period: u64, dense_first: bool| -> Vec<bool> {
+        (0..n)
+            .map(|il| {
+                period == 0
+                    || if dense_first {
+                        il % period != 0
+                    } else {
+                        il % period < period - 1
+                    }
+            })
+            .collect()
+    };
+    let flags = match meta.get(&format!("{arch}.attention.sliding_window_pattern")) {
+        Some(Value::Array(a)) => (0..n as usize)
+            .map(|i| match a.get(i) {
+                Some(Value::Bool(b)) => *b,
+                Some(v) => v.as_u64().unwrap_or(0) != 0,
+                None => false,
+            })
+            .collect(),
+        Some(v) if v.as_u64().is_some() => by_period(v.as_u64().unwrap_or(0), false),
+        _ => match built_in {
+            Some((_, period, dense_first, _)) => by_period(*period, *dense_first),
+            None => vec![false; n as usize],
+        },
+    };
+    if flags.iter().any(|f| *f) {
+        (flags, window)
+    } else {
+        (flags, 0)
+    }
+}
+
 /// The shape from the scalar GGUF metadata (`<arch>.*`). None when the layers or widths are not in it.
 pub fn shape_from_meta(meta: &Map<String, Value>, file_bytes: u64) -> Option<ModelShape> {
     let arch = meta.get("general.architecture")?.as_str()?;
     let k = |s: &str| meta_u64(meta, &format!("{arch}.{s}"));
+    let kn = |s: &str| meta_num(meta, &format!("{arch}.{s}"));
     let blocks = k("block_count")?;
     let nextn = k("nextn_predict_layers").unwrap_or(0);
     let layers = blocks.saturating_sub(nextn).max(1);
     let n_embd = k("embedding_length")?;
-    let n_head = k("attention.head_count")?.max(1);
-    let n_head_kv = k("attention.head_count_kv").unwrap_or(n_head);
+    let n_head = kn("attention.head_count")?.max(1);
+    let n_head_kv = kn("attention.head_count_kv").unwrap_or(n_head);
     let key_len = k("attention.key_length").unwrap_or(n_embd / n_head);
     let val_len = k("attention.value_length").unwrap_or(key_len);
+    let key_len_swa = k("attention.key_length_swa").unwrap_or(key_len);
+    let val_len_swa = k("attention.value_length_swa").unwrap_or(val_len);
     let interval = k("full_attention_interval").filter(|n| *n > 1);
-    let attn_layers = match interval {
-        Some(n) => layers / n,
-        None => layers,
+    // the layers that keep a cache of their own: the first ones, when the last share the cache of earlier layers
+    let with_cache = match arch {
+        "gemma3n" => layers.min(20),
+        _ => layers
+            .saturating_sub(k("attention.shared_kv_layers").unwrap_or(0))
+            .max(1),
     };
+    let heads_kv = meta_per_layer(meta, &format!("{arch}.attention.head_count_kv"));
+    let (swa, window) = swa_layers(meta, arch, layers);
+    let (mut kv_full, mut kv_swa) = (KvElems::default(), KvElems::default());
+    let mut attn_layers = 0;
+    for il in 0..layers {
+        // a hybrid has attention in every Nth layer only; a list of heads per layer says it with zeros
+        let attends = il < with_cache && interval.is_none_or(|n| (il + 1) % n == 0);
+        let heads = match &heads_kv {
+            Some(h) => h.get(il as usize).copied().unwrap_or(0),
+            None => n_head_kv,
+        };
+        if !attends || heads == 0 {
+            continue;
+        }
+        attn_layers += 1;
+        let is_swa = swa[il as usize];
+        let (kl, vl) = if is_swa {
+            (key_len_swa, val_len_swa)
+        } else {
+            (key_len, val_len)
+        };
+        let into = if is_swa { &mut kv_swa } else { &mut kv_full };
+        into.k += heads * kl;
+        into.v += heads * vl;
+    }
     let state_bytes_per_slot = match (interval, k("ssm.state_size"), k("ssm.inner_size")) {
         // gated delta-net layers: a state_size x inner_size recurrent matrix plus the convolution window, in f32
         (Some(_), Some(state), Some(inner)) => {
@@ -732,15 +859,15 @@ pub fn shape_from_meta(meta: &Map<String, Value>, file_bytes: u64) -> Option<Mod
         layers,
         attn_layers,
         n_embd,
-        n_head_kv,
-        key_len,
-        val_len,
+        kv_full,
+        kv_swa,
+        swa_window: if kv_swa.is_empty() { 0 } else { window },
         state_bytes_per_slot,
         expert_share,
     })
 }
 
-/// Bytes one element of a KV type takes.
+// Bytes one element of a KV type takes.
 pub fn kv_bytes_per_elem(t: &str) -> f64 {
     match t {
         "f32" => 4.0,
@@ -769,6 +896,10 @@ pub struct Placement {
     pub n_cpu_moe: u64,
     /// Extra bytes already known to sit on the GPU (a draft model's file).
     pub extra_gpu_bytes: u64,
+    /// `--kv-unified`: one cache for all the slots.
+    pub kv_unified: bool,
+    /// `--swa-full`: the sliding-window layers keep the whole context, as the others do.
+    pub swa_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -784,6 +915,22 @@ const MIB: f64 = 1_048_576.0;
 /// Fixed cost of a context on the GPU (driver, command buffers) and the compute graph per 512 tokens of ubatch.
 const CONTEXT_OVERHEAD_MIB: f64 = 200.0;
 const COMPUTE_MIB_PER_512_UBATCH: f64 = 300.0;
+
+/// Cells the cache of the sliding-window layers has, as llama.cpp sizes it (`llama_kv_cache_iswa`): the window plus a
+/// batch, rounded up to 256, for each slot (or for all of them together, with a unified cache), and never more than the
+/// context. With `--swa-full` it is the whole context.
+fn swa_cells(window: u64, p: &Placement) -> u64 {
+    if window == 0 || p.swa_full {
+        return p.ctx_total;
+    }
+    let pad = |n: u64| n.div_ceil(256) * 256;
+    let slots = p.slots.max(1);
+    if p.kv_unified {
+        pad(p.ctx_total.min(window * slots + p.ubatch))
+    } else {
+        slots * pad((p.ctx_total / slots).min(window + p.ubatch))
+    }
+}
 
 /// VRAM a load takes, from the shape, the context and the KV types. An estimate, within a few hundred MiB for
 /// the models measured (see docs/serving.md); the planner keeps a margin for that.
@@ -814,11 +961,11 @@ pub fn estimate_vram(shape: &ModelShape, p: &Placement) -> VramEstimate {
         weights -= weights * on_cpu;
     }
     weights = weights * on_gpu + p.extra_gpu_bytes as f64;
-    let per_token = shape.attn_layers as f64
-        * shape.n_head_kv as f64
-        * (shape.key_len as f64 * kv_bytes_per_elem(&p.cache_type_k)
-            + shape.val_len as f64 * kv_bytes_per_elem(&p.cache_type_v));
-    let kv = per_token * p.ctx_total as f64 * on_gpu;
+    let per_token =
+        |e: &KvElems| e.k as f64 * kv_bytes_per_elem(&p.cache_type_k) + e.v as f64 * kv_bytes_per_elem(&p.cache_type_v);
+    let kv = (per_token(&shape.kv_full) * p.ctx_total as f64
+        + per_token(&shape.kv_swa) * swa_cells(shape.swa_window, p) as f64)
+        * on_gpu;
     let state = shape.state_bytes_per_slot as f64 * p.slots as f64 * on_gpu;
     let compute = COMPUTE_MIB_PER_512_UBATCH * p.ubatch as f64 / 512.0 + CONTEXT_OVERHEAD_MIB;
     let r = |b: f64| (b / MIB).ceil() as u64;
@@ -1370,6 +1517,8 @@ mod tests {
             cpu_moe: false,
             n_cpu_moe: 0,
             extra_gpu_bytes: 0,
+            kv_unified: false,
+            swa_full: false,
         }
     }
 
@@ -1391,6 +1540,161 @@ mod tests {
             estimate_vram(&shape, &place(65536, 1, "f16", "f16")).kv_mib,
             f16.kv_mib * 2
         );
+    }
+
+    /// The header of gemma-4-31B-it as the file has it: 60 layers, every sixth one full attention (4 KV heads of 512),
+    /// the rest a 1024-token window (16 KV heads of 256).
+    fn gemma4_meta() -> Map<String, Value> {
+        let heads: Vec<u64> = (0..60).map(|il| if il % 6 == 5 { 4 } else { 16 }).collect();
+        let pattern: Vec<bool> = (0..60).map(|il| il % 6 != 5).collect();
+        meta(&[
+            ("general.architecture", json!("gemma4")),
+            ("gemma4.block_count", json!(60)),
+            ("gemma4.embedding_length", json!(5376)),
+            ("gemma4.attention.head_count", json!(32)),
+            ("gemma4.attention.head_count_kv", json!(heads)),
+            ("gemma4.attention.key_length", json!(512)),
+            ("gemma4.attention.value_length", json!(512)),
+            ("gemma4.attention.key_length_swa", json!(256)),
+            ("gemma4.attention.value_length_swa", json!(256)),
+            ("gemma4.attention.sliding_window", json!(1024)),
+            ("gemma4.attention.sliding_window_pattern", json!(pattern)),
+            ("gemma4.attention.shared_kv_layers", json!(0)),
+        ])
+    }
+
+    #[test]
+    fn a_sliding_window_model_is_sized_as_the_server_sizes_it() {
+        let shape = shape_from_meta(&gemma4_meta(), 11_213 << 20).unwrap();
+        assert_eq!((shape.layers, shape.attn_layers, shape.swa_window), (60, 60, 1024));
+        // 10 full layers x 4 heads x 512, 50 window layers x 16 heads x 256
+        assert_eq!(shape.kv_full, KvElems { k: 20_480, v: 20_480 });
+        assert_eq!(shape.kv_swa, KvElems { k: 204_800, v: 204_800 });
+        // what llama-server printed for this file at -c 4096, one slot, f16: 4096 cells over 10 layers (320 MiB) and
+        // 1536 cells over 50 (1200 MiB): the window, 1024, and a batch of 512
+        let e = estimate_vram(&shape, &place(4096, 1, "f16", "f16"));
+        assert_eq!(e.kv_mib, 320 + 1200);
+        // the context grows the full layers only: at 32768 the window layers still hold 1536 cells
+        let long = estimate_vram(&shape, &place(32768, 1, "f16", "f16"));
+        assert_eq!(long.kv_mib, 2560 + 1200);
+        // treated as all full attention with 32 KV heads of 512 (what the estimate did before) the same load came to
+        // 15 GiB of cache at 4096 tokens
+        let all_full = ModelShape {
+            kv_full: KvElems {
+                k: 60 * 32 * 512,
+                v: 60 * 32 * 512,
+            },
+            kv_swa: KvElems::default(),
+            swa_window: 0,
+            ..shape.clone()
+        };
+        assert_eq!(estimate_vram(&all_full, &place(4096, 1, "f16", "f16")).kv_mib, 15_360);
+        // slots each have a window of their own; the full layers share the -c
+        let two = estimate_vram(&shape, &place(8192, 2, "f16", "f16"));
+        assert_eq!(two.kv_mib, 640 + 2400);
+        // a unified cache has one window for all the slots: 2 x 1024 + 512, rounded to 2560 cells
+        let unified = estimate_vram(
+            &shape,
+            &Placement {
+                kv_unified: true,
+                ..place(8192, 2, "f16", "f16")
+            },
+        );
+        assert_eq!(unified.kv_mib, 640 + 2000);
+        // --swa-full keeps the whole context in every layer
+        let full = estimate_vram(
+            &shape,
+            &Placement {
+                swa_full: true,
+                ..place(4096, 1, "f16", "f16")
+            },
+        );
+        assert_eq!(full.kv_mib, 320 + 3200);
+        // a context shorter than the window needs no more than the context
+        let short = estimate_vram(&shape, &place(512, 1, "f16", "f16"));
+        assert_eq!(short.kv_mib, 40 + 400);
+    }
+
+    #[test]
+    fn the_period_built_into_the_architecture_stands_in_for_a_pattern_the_file_lacks() {
+        // gemma 3 27B: 62 layers, every sixth full (10), the rest a 1024 window (52); 16 KV heads of 128, scalar
+        let m = meta(&[
+            ("general.architecture", json!("gemma3")),
+            ("gemma3.block_count", json!(62)),
+            ("gemma3.embedding_length", json!(5376)),
+            ("gemma3.attention.head_count", json!(32)),
+            ("gemma3.attention.head_count_kv", json!(16)),
+            ("gemma3.attention.key_length", json!(128)),
+            ("gemma3.attention.value_length", json!(128)),
+            ("gemma3.attention.sliding_window", json!(1024)),
+        ]);
+        let shape = shape_from_meta(&m, 16 << 30).unwrap();
+        assert_eq!(shape.kv_full.k, 10 * 16 * 128);
+        assert_eq!(shape.kv_swa.k, 52 * 16 * 128);
+        assert_eq!(shape.swa_window, 1024);
+        // no window in the file: gemma 3 is plain attention
+        let mut plain = m.clone();
+        plain.remove("gemma3.attention.sliding_window");
+        let shape = shape_from_meta(&plain, 16 << 30).unwrap();
+        assert_eq!((shape.kv_swa, shape.swa_window), (KvElems::default(), 0));
+        assert_eq!(shape.kv_full.k, 62 * 16 * 128);
+        // gemma 2 has a window of 4096 built in, on every other layer (the even ones)
+        let g2 = meta(&[
+            ("general.architecture", json!("gemma2")),
+            ("gemma2.block_count", json!(42)),
+            ("gemma2.embedding_length", json!(3584)),
+            ("gemma2.attention.head_count", json!(16)),
+            ("gemma2.attention.head_count_kv", json!(8)),
+            ("gemma2.attention.key_length", json!(256)),
+            ("gemma2.attention.value_length", json!(256)),
+        ]);
+        let shape = shape_from_meta(&g2, 5 << 30).unwrap();
+        assert_eq!(
+            (shape.kv_full.k, shape.kv_swa.k, shape.swa_window),
+            (21 * 8 * 256, 21 * 8 * 256, 4096)
+        );
+        // the file's own period wins over the built-in one, and 0 means every layer
+        let mut own = g2.clone();
+        own.insert("gemma2.attention.sliding_window_pattern".into(), json!(3));
+        let shape = shape_from_meta(&own, 5 << 30).unwrap();
+        assert_eq!(shape.kv_full.k, 14 * 8 * 256);
+        // an architecture the table does not know, with a window but no pattern: all full, the safe side
+        let mut other = g2.clone();
+        other.insert("general.architecture".into(), json!("newarch"));
+        for key in g2.keys().filter(|k| k.starts_with("gemma2.")) {
+            other.insert(key.replace("gemma2.", "newarch."), g2[key].clone());
+        }
+        other.insert("newarch.attention.sliding_window".into(), json!(4096));
+        let shape = shape_from_meta(&other, 5 << 30).unwrap();
+        assert_eq!((shape.kv_swa, shape.swa_window), (KvElems::default(), 0));
+        assert_eq!(shape.kv_full.k, 42 * 8 * 256);
+    }
+
+    #[test]
+    fn layers_that_share_the_cache_of_earlier_ones_add_none() {
+        let mut m = gemma4_meta();
+        m.insert("gemma4.attention.shared_kv_layers".into(), json!(20));
+        let shape = shape_from_meta(&m, 5 << 30).unwrap();
+        // the first 40 layers keep a cache: 6 full ones (il 5, 11, ... 35) and 34 window ones
+        assert_eq!(shape.attn_layers, 40);
+        assert_eq!(shape.kv_full.k, 6 * 4 * 512);
+        assert_eq!(shape.kv_swa.k, 34 * 16 * 256);
+    }
+
+    #[test]
+    fn a_list_of_heads_per_layer_drops_the_layers_without_attention() {
+        // a hybrid that says it with zeros instead of an interval: attention in 2 of 4 layers
+        let m = meta(&[
+            ("general.architecture", json!("lst")),
+            ("lst.block_count", json!(4)),
+            ("lst.embedding_length", json!(1024)),
+            ("lst.attention.head_count", json!(8)),
+            ("lst.attention.head_count_kv", json!([0, 2, 0, 4])),
+            ("lst.attention.key_length", json!(64)),
+        ]);
+        let shape = shape_from_meta(&m, 1 << 30).unwrap();
+        assert_eq!(shape.attn_layers, 2);
+        assert_eq!(shape.kv_full, KvElems { k: 6 * 64, v: 6 * 64 });
     }
 
     #[test]
@@ -1718,9 +2022,9 @@ Exiting, please wait...
             layers: 40,
             attn_layers: 10,
             n_embd: 2048,
-            n_head_kv: 2,
-            key_len: 256,
-            val_len: 256,
+            kv_full: KvElems { k: 5120, v: 5120 },
+            kv_swa: KvElems::default(),
+            swa_window: 0,
             state_bytes_per_slot: 0,
             expert_share: 0.8,
         };

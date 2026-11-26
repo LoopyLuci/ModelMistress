@@ -69,7 +69,7 @@ Before a load starts a server, the hub estimates its VRAM from the GGUF header (
 file size) and the profile:
 
     weights (file size; minus the expert tensors with --cpu-moe / --n-cpu-moe; x GPU layers / layers)
-  + KV cache  (attention layers x KV heads x (key size x K type + value size x V type) x context tokens)
+  + KV cache  (for each attention layer: KV heads x (key size x K type + value size x V type) x cells)
   + recurrent state (hybrid models such as Qwen3.5: per slot)
   + compute buffers (about 300 MiB per 512 of `ubatch_size`) + 200 MiB per context
 
@@ -78,6 +78,15 @@ and compares it, plus `vram_margin_mib` (default 768), with the GPU's free memor
 Memory`): llama-server's own "free" figure does not see what other processes hold (measured: it reported 18.7 GB free
 with 5.8 GB taken by other programs, and 5 GB fewer after a 18.5 GB model was loaded). Where the counter is not
 available the planner uses llama-server's figure.
+
+The cells of a layer are the context tokens, except in a **sliding-window** layer (most of a Gemma's): it keeps the
+window and a batch, rounded up to 256, for each slot (`-c 4096` on gemma-4-31B: 4,096 cells in its 10 full layers,
+1,536 in its 50 window layers; with `--kv-unified` one window serves all slots, with `--swa-full` the window layers
+keep the whole context). The heads, head sizes and which layers have a window are read per layer from the header
+(`head_count_kv` as a list, `key_length_swa`, `sliding_window_pattern`, `shared_kv_layers`). For gemma 2, gemma 3,
+gemma 3n, cohere2, gpt-oss, olmo2, afmoe and plamo3 the pattern llama.cpp builds in is used when the file has none;
+for any other architecture a file without a pattern counts as full attention, which can overstate but not understate.
+The reader keeps lists of at most 1,024 numbers or flags; `/v1/models` shows them in `metadata`.
 
 **What models may use.** The card keeps `vram_reserve_mib` (default 2048) free for the system: models may use at most
 the card's total minus that (22 GB of a 24 GB card), and what other loaded models already hold counts against it. The
@@ -154,8 +163,11 @@ yet measured on a real over-memory model: see the HANDOVER.
 (some are), `cpu`, or `unknown` (no GPU counters on this machine, or not measured yet). It comes from the dedicated
 GPU memory of the model's server process compared with the weights and KV cache of every layer (compute buffers are on
 the GPU either way, so they are left out). Where the counters work, a server
-that holds none is `cpu`. `serving.placement_note` says why a model is not where it was asked to be (below). The Models page
-shows both.
+that holds none is `cpu`. When the server's log says how many layers it put on the GPU (it does at verbosity 4, which
+the hub asks for: [the server log](#the-server-log-and-model-telemetry)), that count decides instead of the memory: all
+layers and the output layer on the card is `gpu`, some is `partial`, none is `cpu`, and a load that moves experts to
+the CPU (`--cpu-moe`, `--n-cpu-moe`, `-ot`, or a fit that did) is `partial`. `serving.layers` carries the counts.
+`serving.placement_note` says why a model is not where it was asked to be (below). The Models page shows both.
 
 **When the GPU fails a load.** With `gpu_fallback = true` (the default), a load that fails because of the GPU is tried
 again instead of being reported at once:
@@ -212,6 +224,51 @@ backend in `<home>/engines/prism-gpu/` (`MM_PRISM_GPU_SERVER` overrides). A load
 GPU build; one with `gpu_layers = 0`, and the retry on the CPU after the card ran out of memory, runs the CPU build. That
 server has no `--fit`, so a ternary file is not split with RAM: it fits the card (counting `vram_reserve_mib`) or runs on
 the CPU. `hardware.can_run_on` says `["gpu","cpu"]` for a ternary file only when the GPU build is installed.
+
+## The server log and model telemetry
+
+Each model's llama-server writes `<home>/logs/<model id>.log`. llama.cpp (b12726) prints how it placed a model only at
+verbosity 4, so the hub starts a stock llama-server with `-lv 4` when `--help` lists `--log-verbosity`, unless the
+model's `extra_args` (profile or load) set a verbosity of their own. PrismML and Rigel servers are started as before.
+The cost is about 19 KB of log per load and about 2.8 KB per request.
+
+**What the log holds.**
+
+- The top, written by the hub before the server starts: `# mm <version> <time>: <model> <how>`, `# mm server: <program>`,
+  `# mm args: ...` and one `# mm env: NAME=value` per variable it set (the Vulkan cooperative-matrix switches of a retry
+  among them). A server that dies before it prints a line still leaves the story of how it was started.
+- The server's own account: the devices and their free memory, the memory fit (what it projected, whether it moved
+  tensors off the card, how long it took), the model's metadata, how many layers went to the GPU, every buffer on every
+  device (weights, KV cache, recurrent state, compute), the KV cache of each kind (a sliding-window model has two), the
+  compute graph with its splits (a layer split shows in the prompt graph), flash attention, and how long each stage of
+  the load took.
+- One timing block per request: prompt and generation tokens and speeds, total time, graphs reused.
+
+The logs of the three loads before the current one stay as `<model id>.1.log`, `.2.log` and `.3.log`. A load that
+crashed and was tried again leaves its log there for the owner to read, with its own header (the GPU start, the GPU
+start with the cooperative-matrix kernels off, the CPU start).
+
+**Reading it.** Two operations:
+
+- `logs.tail` (`model`, `lines`, `previous` 0 to 3): the last lines of the current log, or of an earlier load's.
+  A `previous` with no such log is `404 no_such_log`.
+- `model.telemetry` (`model`): the log read into numbers. The model must be loaded (`409 not_loaded` otherwise).
+
+`model.telemetry` answers with these parts; a value that was not found is left out, never printed as null or zero:
+
+| Part | Holds |
+|---|---|
+| `model`, `pid`, `port`, `uptime_s`, `args` | which server and how it was started |
+| `placement` | `where` (`gpu`, `partial`, `cpu`), `note`, `layers` (total, offloaded, output on the GPU, the memory of the weights on each side, KV and state, graph splits), a one-line `line`, `vram_mib` and `estimated_vram_mib`, `gpu_dedicated_now_mib` (what the process holds on the card now, on Windows) |
+| `load` | the report of the log: `devices`, `cpu`, `fit`, `model` (architecture, file type and size, bits per weight, layers, experts, trained context, sliding window, recurrent), `layers`, `buffers`, `caches`, `context`, `graphs`, `flash_attention`, `fused_ops`, `server` (slots, prompt cache, checkpoints), `stages` (fit, weights read and MiB/s, context, warm-up, time to ready), `warnings` and `notes` |
+| `runtime` | `recent_requests` (the last 10 timings), `server_counters` (the server's `/metrics`), `slots` (`/slots`) and the hub's own `hub` counters |
+| `logs` | the log files kept, with size and time |
+
+What it cannot say: a server started at the default verbosity (an owner's `-lv 3`, an engine without the flag) has no
+layers or buffers in its log; `load.notes` says so, `placement.layers` is absent, and the placement falls back to the
+memory guess above. The load report is read from the first 1 MiB of the log and the requests from the last 256 KiB, so
+a server that has run for a long time still answers quickly and shows only its latest requests. The log restarts only
+when the model is loaded again.
 
 ## Hub watchdog
 

@@ -95,6 +95,28 @@ Tried through a scratch hub on the RX 7900 XTX (23280 MiB usable VRAM, about 17 
 - Replaced the BF16 with `Huihui-Qwen3.8-27B-abliterated-UD-Q8_K_XL.gguf` (31.5 GB, huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF, in `C:/AIModels/Huihui-Qwen3.8-27B-abliterated-UD-Q8_K_XL`; the BF16 files were deleted at the owner's say-so). It **loads and answers** through the hub with the bundled llama-server: the hub started it with `--fit on --fit-target 901 -c 8192 -np 2` (card plus RAM split). Measured: first load plus a 40-token reply 130 s; generation 3.6 tokens/s, prompt 17.5 tokens/s (199-token reply). It thinks before it answers (`reasoning_content`) unless `enable_thinking` is false.
 - The `/v1/videos/generations` request with LTX hit the hub's 6 h limit because the machine slept; the direct `sd-cli` LTX run still stands.
 
+## Server log telemetry (2026-11-25)
+
+- The b12726 llama-server prints how it placed a model only at verbosity 4, so the logs had said nothing about layers
+  and gemma-4-31B (every layer on the card) was labelled `partial` from a memory estimate. `src/loadlog.rs` reads a
+  log into a report (devices, fit, layers, buffers, KV and state, graph splits, stage times, request timings); the hub
+  starts a stock server with `-lv 4` (not Rigel or Prism, not when the owner set a verbosity), keeps the logs of the three
+  earlier loads and writes `# mm` header lines first. New operation `model.telemetry`; `logs.tail` takes `previous`.
+  Docs: `docs/serving.md` (the server log and model telemetry). The parser is tested on real logs in
+  `tests/fixtures/llama/*.txt` (b12726, trimmed; they are `.txt` because `.gitignore` has `*.log`).
+- **If llama.cpp changes its log format** the parser degrades to "no layers" (the report's `notes` say so) and the hub
+  falls back to the memory guess; refresh the fixtures with `llama-server -lv 4` on a small model and fix the tests.
+- Speed tests for this work use 500 to 1000 tokens or more (the owner's rule); a 64-token run is not a measurement.
+- **Sliding-window VRAM estimate (2026-11-25).** The estimate (`serving::estimate_vram`) now sizes the window layers of a
+  Gemma-like model as llama.cpp does (`swa_cells`, from `llama-kv-cache-iswa.cpp`): gemma-4-31B at 4096 tokens is 1,520
+  MiB of KV, exactly what the server printed, and 13,250 MiB in all (was 42,450 at the hub's 8192). It needed the GGUF
+  reader to keep short lists (`catalog::read_meta`, `MAX_KEPT_ARRAY`) because gemma 4 keeps `head_count_kv` per layer.
+  The built-in periods (`SWA_BUILT_IN`) were copied from `engines/llama.cpp/src/models/*.cpp` (`load_swa_pattern`); when
+  the engine is bumped and a new architecture gets a sliding window, add it there, or its file must carry
+  `sliding_window_pattern`. Not covered: llama4's chunked attention, exaone4 (window only at 64 layers), smallthinker
+  (window fixed at 4096), models with a different window per layer. They count as full attention (an overstatement).
+  `held_note_after_load` stays as the check on whatever the estimate still gets wrong.
+
 ## Media models and the chat canvas (2026-11-24)
 
 - Images: MOSS-Image-Base BF16 and MiniMax-H3-Image (UD-Q4_K_XL) render through `sd-cli` of the new
