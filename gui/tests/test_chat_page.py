@@ -152,8 +152,8 @@ def test_live_opens_beside_the_messages_and_its_sentences_are_chat_messages(app)
     mics: list[FakeMic] = []
     speaker = FakeSpeaker()
 
-    def mic_factory(on_utterance):
-        mics.append(FakeMic(on_utterance))
+    def mic_factory(on_utterance, alignment=None):
+        mics.append(FakeMic(on_utterance, alignment))
         return mics[-1]
 
     page.live_options = {"mic_factory": mic_factory, "speaker": speaker}

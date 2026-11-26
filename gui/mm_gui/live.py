@@ -97,7 +97,7 @@ class LivePanel(QFrame):
         send: Callable[[str, list[str]], bool],
         stop: Callable[[], None],
         can_picture: bool,
-        mic_factory: Callable[[Callable[[bytes, int], None]], object] | None = None,
+        mic_factory: Callable[..., object] | None = None,  # (on_utterance, alignment) -> microphone
         speaker=None,
         camera_factory: Callable[[], object] | None = None,
         parent: QWidget | None = None,
@@ -132,7 +132,7 @@ class LivePanel(QFrame):
         self._build()
         self._dispatch(self.turns.start())
         try:
-            self._mic = self._mic_factory(self._utterance)
+            self._mic = self._mic_factory(self._utterance, self._speaker.alignment)
             self._mic.open()
         except DeviceError as e:
             self._dispatch(self.turns.failed(False, str(e)))

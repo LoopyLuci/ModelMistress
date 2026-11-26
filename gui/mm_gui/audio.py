@@ -13,6 +13,7 @@ import sys
 import wave
 from typing import Callable
 
+import numpy as np
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtMultimedia import (
@@ -26,6 +27,7 @@ from PySide6.QtMultimedia import (
     QVideoSink,
 )
 
+from mm_gui import dsp
 from mm_gui.segmenter import Segmenter, SegmenterOptions
 
 RATE = 16000  # the sound is 16-bit mono at this rate: what the hub's speech to text takes
@@ -48,6 +50,21 @@ def wav_bytes(pcm: bytes, rate: int = RATE, channels: int = 1) -> bytes:
     return out.getvalue()
 
 
+def wav_floats(wav: bytes) -> np.ndarray:
+    """A WAV clip as float samples in [-1, 1] at RATE (its first channel). Empty when it is not 16-bit PCM WAV."""
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            if w.getsampwidth() != 2 or w.getframerate() <= 0:
+                return np.zeros(0)
+            channels, rate = w.getnchannels(), w.getframerate()
+            raw = w.readframes(w.getnframes())
+    except (wave.Error, EOFError):
+        return np.zeros(0)
+    usable = len(raw) - len(raw) % (2 * channels)
+    samples = np.frombuffer(raw[:usable], dtype="<i2").astype(np.float64) / 32768.0
+    return dsp.resample(samples[::channels], rate, RATE)
+
+
 def level(pcm: bytes) -> float:
     """The RMS of 16-bit little-endian samples: 0 for silence, 1 for full scale."""
     samples = array.array("h")
@@ -59,12 +76,35 @@ def level(pcm: bytes) -> float:
     return math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
 
 
+class SoundCleaner:
+    """Takes the echo and the background out of the microphone's sound: 16-bit mono at RATE in, the same kind out. With an
+    alignment, the clip the speaker plays is the echo's reference; without one, only the background is lowered. The output
+    comes a block (16 ms) late and in whole blocks, so its length can differ a little from the input's."""
+
+    def __init__(self, alignment: dsp.Alignment | None = None):
+        self._alignment = alignment
+        self._cleaner = dsp.Cleaner()
+
+    def __call__(self, pcm: bytes) -> bytes:
+        mic = np.frombuffer(pcm[: len(pcm) - len(pcm) % 2], dtype="<i2").astype(np.float64) / 32768.0
+        ref = self._alignment.reference_for(mic) if self._alignment is not None else None
+        out = self._cleaner.push(mic, ref)
+        return (np.clip(out, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
 class MicCore:
     """Finds the owner's sentences in the sound, with no device in it. Feed it the sound as it comes (16-bit mono at RATE);
-    it calls `on_utterance(pcm, duration_ms)` for each sentence the owner finished. Off, nothing is heard."""
+    it calls `on_utterance(pcm, duration_ms)` for each sentence the owner finished. Off, nothing is heard. `clean`, when
+    given, takes each piece of sound first (the echo and background cancellation)."""
 
-    def __init__(self, on_utterance: Callable[[bytes, int], None], options: SegmenterOptions | None = None):
+    def __init__(
+        self,
+        on_utterance: Callable[[bytes, int], None],
+        options: SegmenterOptions | None = None,
+        clean: Callable[[bytes], bytes] | None = None,
+    ):
         self._on_utterance = on_utterance
+        self._clean = clean
         self._seg = Segmenter(options)
         self._frame_bytes = RATE * FRAME_MS // 1000 * 2
         self._pending = bytearray()
@@ -83,6 +123,8 @@ class MicCore:
             self._pending.clear()
 
     def feed(self, pcm: bytes) -> None:
+        if self._clean is not None:
+            pcm = self._clean(pcm)
         self._pending += pcm
         while len(self._pending) >= self._frame_bytes:
             frame = bytes(self._pending[: self._frame_bytes])
@@ -153,11 +195,17 @@ class AudioInput(QObject):
 
 
 class Microphone(QObject):
-    """The microphone for Live: its sound goes through MicCore, which says when the owner has finished a sentence."""
+    """The microphone for Live: its sound is cleaned (the echo of the speaker's `alignment`, and the background), then goes
+    through MicCore, which says when the owner has finished a sentence."""
 
-    def __init__(self, on_utterance: Callable[[bytes, int], None], parent: QObject | None = None):
+    def __init__(
+        self,
+        on_utterance: Callable[[bytes, int], None],
+        alignment: dsp.Alignment | None = None,
+        parent: QObject | None = None,
+    ):
         super().__init__(parent)
-        self._core = MicCore(on_utterance)
+        self._core = MicCore(on_utterance, clean=SoundCleaner(alignment))
         self._input = AudioInput(self._core.feed, self)
 
     def open(self) -> None:
@@ -201,11 +249,15 @@ class Speaker(QObject):
         self._player.setAudioOutput(self._output)
         self._buffer: QBuffer | None = None
         self._on_done: Callable[[str | None], None] | None = None
+        # What is playing, lined up with the microphone: the echo canceller's reference. The delay to the microphone is
+        # measured from the sound, so the player's own latency does not need to be known.
+        self.alignment = dsp.Alignment()
         self._player.mediaStatusChanged.connect(self._status)
         self._player.errorOccurred.connect(self._error)
 
     def play(self, wav: bytes, on_done: Callable[[str | None], None]) -> None:
         self.stop()
+        self.alignment.start(wav_floats(wav))
         self._buffer = QBuffer(QByteArray(wav), self)
         self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
         self._on_done = on_done
@@ -213,6 +265,7 @@ class Speaker(QObject):
         self._player.play()
 
     def stop(self) -> None:
+        self.alignment.stop()
         self._on_done = None
         self._player.stop()
 
@@ -224,6 +277,7 @@ class Speaker(QObject):
         self._finish(message or "The speech could not be played.")
 
     def _finish(self, error: str | None) -> None:
+        self.alignment.stop()
         callback, self._on_done = self._on_done, None
         if callback is not None:
             callback(error)

@@ -39,8 +39,9 @@ class LiveHub(Hub):
 
 
 class FakeMic:
-    def __init__(self, on_utterance):
+    def __init__(self, on_utterance, alignment=None):
         self.on_utterance = on_utterance
+        self.alignment = alignment
         self.opened = False
         self.enabled = False
         self.closed = False
@@ -64,6 +65,7 @@ class FakeSpeaker:
         self.played: list[bytes] = []
         self.done = None
         self.stops = 0
+        self.alignment = None  # the real speaker's echo reference; the fake plays no sound for the microphone to hear
 
     def play(self, wav: bytes, on_done) -> None:
         self.played.append(wav)
@@ -103,10 +105,10 @@ class Rig:
         self.speaker = FakeSpeaker()
         self.mics: list[FakeMic] = []
 
-        def mic_factory(on_utterance):
+        def mic_factory(on_utterance, alignment=None):
             if mic_error is not None:
                 raise DeviceError(mic_error)
-            mic = FakeMic(on_utterance)
+            mic = FakeMic(on_utterance, alignment)
             self.mics.append(mic)
             return mic
 
