@@ -1,0 +1,281 @@
+"""Sound and pictures for the window: the microphone (sentences the owner finishes), the dictation recorder, the voice that
+plays the hub's speech, and the camera's latest picture.
+
+The sentence finding and the WAV files are plain Python and are tested alone. The devices are Qt; they are reached only
+when the window uses them, and a computer with no microphone or camera says so instead of failing."""
+
+from __future__ import annotations
+
+import array
+import io
+import math
+import sys
+import wave
+from typing import Callable
+
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QImage
+from PySide6.QtMultimedia import (
+    QAudioFormat,
+    QAudioSource,
+    QCamera,
+    QMediaCaptureSession,
+    QMediaDevices,
+    QMediaPlayer,
+    QAudioOutput,
+    QVideoSink,
+)
+
+from mm_gui.segmenter import Segmenter, SegmenterOptions
+
+RATE = 16000  # the sound is 16-bit mono at this rate: what the hub's speech to text takes
+FRAME_MS = 100  # the level is read every tenth of a second
+PICTURE_SIDE = 768  # a picture for the chat is scaled so that neither side is longer than this
+
+
+class DeviceError(Exception):
+    """A device is missing or cannot be used; the message says so in words for the owner."""
+
+
+def wav_bytes(pcm: bytes, rate: int = RATE, channels: int = 1) -> bytes:
+    """16-bit PCM as a WAV file (what the hub's speech to text reads)."""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return out.getvalue()
+
+
+def level(pcm: bytes) -> float:
+    """The RMS of 16-bit little-endian samples: 0 for silence, 1 for full scale."""
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768.0
+
+
+class MicCore:
+    """Finds the owner's sentences in the sound, with no device in it. Feed it the sound as it comes (16-bit mono at RATE);
+    it calls `on_utterance(pcm, duration_ms)` for each sentence the owner finished. Off, nothing is heard."""
+
+    def __init__(self, on_utterance: Callable[[bytes, int], None], options: SegmenterOptions | None = None):
+        self._on_utterance = on_utterance
+        self._seg = Segmenter(options)
+        self._frame_bytes = RATE * FRAME_MS // 1000 * 2
+        self._pending = bytearray()
+        self._clip: bytearray | None = None
+        self._time = 0.0  # milliseconds of sound heard, counted from the frames (not the clock)
+        self.enabled = False
+
+    def set_enabled(self, on: bool) -> None:
+        if on == self.enabled:
+            return
+        self.enabled = on
+        if not on:
+            # An utterance in progress is dropped, and nothing is heard until the microphone is on again.
+            self._seg.reset()
+            self._clip = None
+            self._pending.clear()
+
+    def feed(self, pcm: bytes) -> None:
+        self._pending += pcm
+        while len(self._pending) >= self._frame_bytes:
+            frame = bytes(self._pending[: self._frame_bytes])
+            del self._pending[: self._frame_bytes]
+            self._time += FRAME_MS
+            self._frame(frame)
+
+    def _frame(self, frame: bytes) -> None:
+        if not self.enabled:
+            return
+        if self._clip is not None:
+            self._clip += frame
+        event = self._seg.push(level(frame), self._time)
+        if event is None:
+            return
+        if event.kind == "start":
+            self._clip = bytearray(frame)
+            return
+        clip, self._clip = self._clip, None
+        if event.keep and clip:
+            self._on_utterance(bytes(clip), event.duration_ms)
+
+
+class AudioInput(QObject):
+    """The default microphone, read as it records: `on_chunk(pcm)` gets the sound about every tenth of a second."""
+
+    def __init__(self, on_chunk: Callable[[bytes], None], parent: QObject | None = None):
+        super().__init__(parent)
+        self._on_chunk = on_chunk
+        self._source: QAudioSource | None = None
+        self._io = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(FRAME_MS)
+        self._timer.timeout.connect(self._pump)
+
+    def start(self) -> None:
+        fmt = QAudioFormat()
+        fmt.setSampleRate(RATE)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        device = QMediaDevices.defaultAudioInput()
+        if device.isNull():
+            raise DeviceError("There is no microphone on this computer.")
+        if not device.isFormatSupported(fmt):
+            raise DeviceError("The microphone does not record the sound Live needs (16 kHz, mono).")
+        self.stop()
+        self._source = QAudioSource(device, fmt, self)
+        self._io = self._source.start()
+        if self._io is None:
+            self.stop()
+            raise DeviceError("The microphone could not be opened.")
+        self._timer.start()
+
+    def _pump(self) -> None:
+        if self._io is None:
+            return
+        data = bytes(self._io.readAll())
+        if data:
+            self._on_chunk(data)
+
+    def stop(self) -> None:
+        self._timer.stop()
+        if self._source is not None:
+            self._source.stop()
+            self._source.deleteLater()
+        self._source = None
+        self._io = None
+
+
+class Microphone(QObject):
+    """The microphone for Live: its sound goes through MicCore, which says when the owner has finished a sentence."""
+
+    def __init__(self, on_utterance: Callable[[bytes, int], None], parent: QObject | None = None):
+        super().__init__(parent)
+        self._core = MicCore(on_utterance)
+        self._input = AudioInput(self._core.feed, self)
+
+    def open(self) -> None:
+        """Starts reading the microphone. DeviceError when there is none, or it cannot be used."""
+        self._input.start()
+
+    def set_enabled(self, on: bool) -> None:
+        self._core.set_enabled(on)
+
+    def close(self) -> None:
+        self._core.set_enabled(False)
+        self._input.stop()
+
+
+class Dictation(QObject):
+    """Records what the owner says, all of it, until stopped. Stopping gives the recording as WAV bytes."""
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._chunks: list[bytes] = []
+        self._input = AudioInput(self._chunks.append, self)
+
+    def start(self) -> None:
+        self._chunks = []
+        self._input.start()
+
+    def stop(self) -> bytes:
+        self._input.stop()
+        pcm, self._chunks = b"".join(self._chunks), []
+        return wav_bytes(pcm)
+
+
+class Speaker(QObject):
+    """Plays a WAV clip through the default output. `play` calls `on_done(error)` once the clip has ended (error is None)
+    or could not be played; `stop` ends it without calling back."""
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._player = QMediaPlayer(self)
+        self._output = QAudioOutput(self)
+        self._player.setAudioOutput(self._output)
+        self._buffer: QBuffer | None = None
+        self._on_done: Callable[[str | None], None] | None = None
+        self._player.mediaStatusChanged.connect(self._status)
+        self._player.errorOccurred.connect(self._error)
+
+    def play(self, wav: bytes, on_done: Callable[[str | None], None]) -> None:
+        self.stop()
+        self._buffer = QBuffer(QByteArray(wav), self)
+        self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        self._on_done = on_done
+        self._player.setSourceDevice(self._buffer)
+        self._player.play()
+
+    def stop(self) -> None:
+        self._on_done = None
+        self._player.stop()
+
+    def _status(self, status) -> None:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._finish(None)
+
+    def _error(self, _code, message: str = "") -> None:
+        self._finish(message or "The speech could not be played.")
+
+    def _finish(self, error: str | None) -> None:
+        callback, self._on_done = self._on_done, None
+        if callback is not None:
+            callback(error)
+
+
+def png_bytes(image: QImage) -> bytes:
+    """A picture as PNG bytes, scaled down so that neither side is longer than PICTURE_SIDE."""
+    if max(image.width(), image.height()) > PICTURE_SIDE:
+        image = image.scaled(PICTURE_SIDE, PICTURE_SIDE, Qt.AspectRatioMode.KeepAspectRatio)
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    buffer.close()
+    return bytes(data)
+
+
+class Camera(QObject):
+    """The default camera. `latest_png()` gives the newest picture, and `frame` is emitted with each new one."""
+
+    frame = Signal(object)  # the QImage of each new picture
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._camera: QCamera | None = None
+        self._session = QMediaCaptureSession(self)
+        self._sink = QVideoSink(self)
+        self._session.setVideoSink(self._sink)
+        self._sink.videoFrameChanged.connect(self._new_frame)
+        self._image: QImage | None = None
+
+    def start(self) -> None:
+        device = QMediaDevices.defaultVideoInput()
+        if device.isNull():
+            raise DeviceError("There is no camera on this computer.")
+        self.stop()
+        self._camera = QCamera(device, self)
+        self._session.setCamera(self._camera)
+        self._camera.start()
+
+    def stop(self) -> None:
+        if self._camera is not None:
+            self._camera.stop()
+            self._camera.deleteLater()
+        self._camera = None
+        self._image = None
+
+    def latest_png(self) -> bytes | None:
+        return png_bytes(self._image) if self._image is not None else None
+
+    def _new_frame(self, frame) -> None:
+        image = frame.toImage()
+        if not image.isNull():
+            self._image = image
+            self.frame.emit(image)
