@@ -204,6 +204,10 @@ pub struct Settings {
     pub forge_src: Option<PathBuf>,
     /// The Python that creates the Forge environment. Unset: MM_FORGE_PYTHON, else `python` on PATH.
     pub forge_python: Option<PathBuf>,
+    /// The folder that holds `ffmpeg` and `ffprobe` (video and audio input to chat models, speech to text on any
+    /// container, `media.probe`). Unset: MM_FFMPEG_DIR, then `<home>/engines/ffmpeg/` (where `media.install` puts them),
+    /// then PATH.
+    pub ffmpeg_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -254,6 +258,7 @@ impl Default for Settings {
             forge_data_dir: None,
             forge_src: None,
             forge_python: None,
+            ffmpeg_dir: None,
         }
     }
 }
@@ -832,6 +837,15 @@ impl Engine {
         std::env::split_paths(&path)
             .map(|d| d.join(exe("llama-server")))
             .find(|p| p.is_file())
+    }
+
+    /// Where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, MM_FFMPEG_DIR, `<home>/engines/ffmpeg/`, PATH), or what to
+    /// do about it. An installed build is hashed against its record on the first use and again when a file changes.
+    pub async fn ffmpeg(&self) -> std::result::Result<crate::media::ffmpeg::Located, String> {
+        let (home, setting) = (self.home.clone(), self.settings.read().ffmpeg_dir.clone());
+        tokio::task::spawn_blocking(move || crate::media::ffmpeg::locate(&home, setting.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
     }
 
     /// `rigel-server`: the `rigel_server` setting, MM_RIGEL_SERVER, the built-in one, `<home>/engines/rigel/`, PATH.

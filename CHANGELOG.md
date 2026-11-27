@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Media: an ffmpeg component and media.probe
+
+- ffmpeg is a setup component, not a download that happens by itself. `media.components` (and `GET /v1/media/components`)
+  says where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, `MM_FFMPEG_DIR`, `<home>/engines/ffmpeg/`, then PATH), their
+  version and licence (a GPL or nonfree build is reported, not refused).
+  `media.install` (owner only) puts a build into `<home>/engines/ffmpeg/`: without `confirm: true` it answers what it would
+  fetch, from where, how big, and the SHA-256 it must have; the archive's hash is checked before it is unpacked, the
+  programs are run once (`-version`) before they replace anything, every installed file's size and hash go into
+  `install.json` and are checked before the file is used (a swapped file or a folder with no record is an error that names
+  the fix, never a silent use), and an earlier install is kept as `ffmpeg.old-<time>`. Runs as a job; `wait: true` waits.
+  New setting `ffmpeg_dir`. See `docs/media.md`.
+- **No ffmpeg build is pinned yet.** `pin()` in `src/media/ffmpeg.rs` is empty until the owner picks a build (an LGPL one)
+  and someone downloads and hashes it: the media spike used BtbN's `ffmpeg-n9.0-latest-win64-lgpl-9.0.zip` (164 MB), whose
+  address is a rolling `latest` tag and cannot be pinned. Until then `media.install` takes `url` + `sha256` (https, or this
+  machine) or `file` + `sha256`, or `ffmpeg_dir` names a folder. Nothing in this change downloaded anything.
+- `media.probe` (and `POST /v1/media/probe`, JSON `{"file"}` or a multipart upload up to 512 MB): what ffprobe says about a
+  file, as the container (format, duration, size, bit rate) and every video, audio and subtitle stream (codec, size, frame
+  rate, rotation, sample rate, channels, language, cover art). Owner only; ffprobe gets `-protocol_whitelist file`.
+
 ### System awareness: the hub watches the PC and yields to it, live
 
 - Every two seconds the hub reads how pressed the machine is: CPU used by *other* programs (the machine's total less the hub's

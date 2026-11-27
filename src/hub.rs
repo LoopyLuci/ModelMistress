@@ -23,6 +23,8 @@
 //!   POST /v1/vision/classify        image recognition through ONNX Runtime (feature `vision`; see docs/vision.md)
 //!   POST /v1/vision/detect          the same: objects with boxes
 //!   POST /v1/vision/embed           the same: an embedding vector of the picture
+//!   GET  /v1/media/components       ffmpeg and speech to text: what is installed (owner only; see docs/media.md)
+//!   POST /v1/media/probe            what a media file holds, from ffprobe (owner only)
 //!
 //!   /api/*                          Ollama's server API (tags, show, chat, generate, embed, ps, pull, create...): see ollama_api.rs
 //!   GET  /v1/native/...             traces, live stream, rerun and diff (owner only; see docs/native/observability.md)
@@ -254,6 +256,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::benchmark::operations());
     all.extend(crate::sysaware::ops::operations());
     all.extend(crate::privacy::ops::operations());
+    all.extend(crate::media::ops::operations());
     all
 }
 
@@ -1242,6 +1245,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
         id if id.starts_with("system.") => crate::sysaware::ops::call(hub, id, a).await?,
         id if id.starts_with("privacy.") => crate::privacy::ops::call(hub, id, a).await?,
+        id if id.starts_with("media.") => crate::media::ops::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
         "key.create" | "key.list" | "key.revoke" | "usage.get" => {
             key_call(&hub.keys, id, a, "hub").map_err(ApiError::from)?
@@ -2453,7 +2457,10 @@ pub fn router(hub: Hub) -> Router {
             post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
         )
         // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
-        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/v1/models/import",
+            post(model_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))
@@ -2483,6 +2490,7 @@ pub fn router(hub: Hub) -> Router {
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())
         .merge(crate::misty::ops::routes())
+        .merge(crate::media::ops::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth))
         // how many routers a request has passed (`x-cf-hop`), so a request the fabric sent here is not sent back
         .layer(middleware::from_fn(crate::fabric::hop_layer));
