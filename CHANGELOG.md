@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-### Media: an ffmpeg component and media.probe
+### Media: an ffmpeg component, video and audio in chat
 
 - ffmpeg is a setup component, not a download that happens by itself. `media.components` (and `GET /v1/media/components`)
   says where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, `MM_FFMPEG_DIR`, `<home>/engines/ffmpeg/`, then PATH), their
-  version and licence (a GPL or nonfree build is reported, not refused).
+  version and licence (a GPL or nonfree build is reported, not refused), and what each projector model can be given.
   `media.install` (owner only) puts a build into `<home>/engines/ffmpeg/`: without `confirm: true` it answers what it would
   fetch, from where, how big, and the SHA-256 it must have; the archive's hash is checked before it is unpacked, the
   programs are run once (`-version`) before they replace anything, every installed file's size and hash go into
@@ -17,6 +17,18 @@
   and someone downloads and hashes it: the media spike used BtbN's `ffmpeg-n9.0-latest-win64-lgpl-9.0.zip` (164 MB), whose
   address is a rolling `latest` tag and cannot be pinned. Until then `media.install` takes `url` + `sha256` (https, or this
   machine) or `file` + `sha256`, or `ffmpeg_dir` names a folder. Nothing in this change downloaded anything.
+- Video and audio in chat. A chat message's `video_url`, `input_video`, `input_audio` and `image_url` parts reach the
+  model's llama-server. A model that has a projector is started with `--media-path <home>/media` and, when ffmpeg is there,
+  `--video-ffmpeg-dir <folder>`, each only if that llama-server lists the flag and unless the owner's own arguments set it.
+  A llama-server reads a local file only as `file://<name>` under `--media-path` (a bare path fails with HTTP 500, measured),
+  so the owner's own requests (`/v1/chat/completions`, `chat.complete`) may name a file anywhere on the machine
+  (`file:///C:/clips/a.mp4`, a plain path, `%20` decoded): the hub links or copies it to `<home>/media/staged/` and passes
+  `file://staged/<name>`. Copies nobody asked for in a day are removed. A peer key's request is never rewritten, so a peer
+  cannot read a file of the owner's machine through chat. `/v1/chat/completions` takes up to 128 MB of body (axum's 2 MB
+  refused a short clip as base64).
+- `model.list` and `/v1/models` carry `input_modalities` (`text`, `image`, `audio`, `video`): image and audio from the
+  projector's own flags (`clip.has_vision_encoder`, `clip.has_audio_encoder`), video when the model sees images, ffmpeg is
+  there and the server takes `--video-ffmpeg-dir`; `video_note` says what is missing when video is possible but not ready.
 - `media.probe` (and `POST /v1/media/probe`, JSON `{"file"}` or a multipart upload up to 512 MB): what ffprobe says about a
   file, as the container (format, duration, size, bit rate) and every video, audio and subtitle stream (codec, size, frame
   rate, rotation, sample rate, channels, language, cover art). Owner only; ffprobe gets `-protocol_whitelist file`.

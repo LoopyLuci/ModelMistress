@@ -938,6 +938,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             // `deletable`: ModelMistress downloaded it, so model.delete may remove it
             let root = crate::pull::download_root(e);
             let devices = e.gpu_devices_recent().await;
+            let video = listing_video(e).await;
             let mut out: Vec<Value> = e
                 .catalog()
                 .iter()
@@ -946,6 +947,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                     let mut v = m.summary(e.is_loaded(&m.id));
                     v["deletable"] = json!(crate::pull::is_downloaded(&root, &m.path));
                     v["hardware"] = e.hardware_json(m, &devices);
+                    crate::media::caps::annotate(&mut v, m, video);
                     v
                 })
                 .collect();
@@ -1091,6 +1093,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let body = json!({"model": a.get("model").cloned().unwrap_or(json!("")), "messages": messages,
                               "max_tokens": a.get("max_tokens").cloned().unwrap_or(json!(512)),
                               "temperature": a.get("temperature").cloned().unwrap_or(json!(0.7)), "stream": false});
+            // this operation is the owner's: a media part may name a file on this machine
+            let body = crate::media::serve::stage_for_owner(body, &e.home).await?;
             let t0 = Instant::now();
             let (model, resp, _lease) = e.forward("/v1/chat/completions", body).await?;
             let status = resp.status();
@@ -1833,10 +1837,21 @@ async fn stop(State(hub): State<Hub>) -> Json<Value> {
     Json(json!({"result": {"stopping": true}}))
 }
 
+/// Whether video can be given to a model, worked out only when some model has a projector (a catalog of text models
+/// never asks for ffmpeg or runs the server's `--help`).
+async fn listing_video(e: &Engine) -> crate::media::caps::Video {
+    if e.catalog().iter().any(|m| m.mmproj.is_some()) {
+        e.video_state().await
+    } else {
+        crate::media::caps::Video::NoFfmpeg
+    }
+}
+
 async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>) -> Json<Value> {
     let e = &hub.engine;
     let allowed = |id: &str| who.0.as_ref().is_none_or(|p| p.allows(id, id));
     let devices = e.gpu_devices_recent().await;
+    let video = listing_video(e).await;
     let mut data: Vec<Value> = e
         .catalog()
         .iter()
@@ -1847,9 +1862,12 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
                 Some(i) => i.serving(),
                 None => e.serving_preview(m),
             };
-            json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
+            let mut v = json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
                          "meta": m.summary(e.is_loaded(&m.id)), "serving": serving,
-                         "hardware": e.hardware_json(m, &devices)})
+                         "hardware": e.hardware_json(m, &devices)});
+            // what the model can be given: text, image, audio, video
+            crate::media::caps::annotate(&mut v, m, video);
+            v
         })
         .collect();
     // Misty, the agent, answers to these names (a catalog model of the same name wins)
@@ -2136,6 +2154,11 @@ async fn chat(
 
 /// A chat for one model of the catalog (or Ollama): traced when the owner asks, then forwarded.
 async fn chat_to_model(hub: Hub, who: Caller, headers: HeaderMap, mut body: Value) -> ApiResult<Response> {
+    // The owner may name a file on this machine in a media part; a server reads media only under its --media-path, so
+    // the file is linked or copied there. A peer's request is never rewritten: it can name only what is in <home>/media.
+    if who.0.is_none() {
+        body = crate::media::serve::stage_for_owner(body, &hub.engine.home).await?;
+    }
     // the owner's requests can be traced (src/trace); a peer's never are
     let scope = crate::trace::capture::wants(&hub.engine.home, &headers, &mut body);
     if let (Some(scope), true) = (scope, who.0.is_none()) {
@@ -2378,6 +2401,10 @@ const MAX_VISION_BODY: usize = vision::MAX_IMAGE_BYTES / 3 * 4 + (1 << 16);
 /// The largest audio upload (OpenAI's own limit is 25 MB; local files are often longer).
 const MAX_AUDIO_BYTES: usize = 512 << 20;
 
+/// The largest chat request: a short clip or a few pictures as base64 in the JSON (axum's own limit, 2 MB, refuses a
+/// video). A longer file is named by path instead (`file:///...`, the owner's), which is not part of the body.
+const MAX_CHAT_BODY: usize = 128 << 20;
+
 /// `POST /v1/audio/transcriptions` and `/v1/audio/translations`: multipart in, the transcript out.
 async fn speech_to_text(
     hub: Hub,
@@ -2446,7 +2473,10 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/requests/:id", get(peer_request_status))
         .route("/v1/service/stop", post(stop))
         .route("/v1/models", get(openai_models))
-        .route("/v1/chat/completions", post(chat))
+        .route(
+            "/v1/chat/completions",
+            post(chat).layer(DefaultBodyLimit::max(MAX_CHAT_BODY)),
+        )
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))

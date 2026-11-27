@@ -19,6 +19,9 @@ runs on its own.
   `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in; json, text, verbose_json, srt or vtt out)
   and `model-mistress transcribe talk.wav`. A whisper model is a `ggml-*.bin` file in a model folder
   ([docs/speech.md](docs/speech.md)).
+- **Video and audio in chat.** `video_url`, `input_video` and `input_audio` parts reach the model's llama-server, which
+  decodes the video with ffmpeg; ffmpeg is a setup component the owner installs on purpose (`media.install`), and
+  `media.probe` says what a media file holds ([docs/media.md](docs/media.md)).
 - **Text to speech, built in.** `POST /v1/audio/speech` (OpenAI's route; WAV or raw PCM out) and
   `model-mistress speak "Hello" --out hello.wav` run llama.cpp's own `llama-tts`, built from the vendored llama.cpp
   ([docs/text-to-speech.md](docs/text-to-speech.md)).

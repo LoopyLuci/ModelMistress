@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use super::ffmpeg::{self, Source, Where};
-use super::probe;
+use super::{caps, probe};
 use crate::engine::{Fail, Result};
 use crate::hub::{ApiError, Hub};
 
@@ -27,7 +27,8 @@ pub fn operations() -> Vec<Value> {
         op(
             "media.components",
             "What the media features need and what is installed: ffmpeg and ffprobe (where they are, version, licence, \
-             and the build `media.install` fetches) and speech to text (whether whisper is built, and its models)",
+             and the build `media.install` fetches), speech to text (the whisper build and its models), and what each \
+             chat model can be given (text, image, audio, video)",
             false,
             json!({}),
             &[],
@@ -106,12 +107,29 @@ async fn components(hub: &Hub) -> Value {
     let ff = tokio::task::spawn_blocking(move || ffmpeg::status(&home, setting.as_deref()))
         .await
         .unwrap_or_else(|x| json!({"id": "ffmpeg", "installed": false, "problem": x.to_string()}));
+    let video = e.video_state().await;
+    let models: Vec<Value> = e
+        .catalog()
+        .iter()
+        .filter(|m| m.mmproj.is_some())
+        .map(|m| {
+            let mut v = json!({"id": m.id});
+            caps::annotate(&mut v, m, video);
+            v
+        })
+        .collect();
     let speech = json!({"id": "whisper", "what": "speech to text (whisper.cpp)", "built": crate::speech::AVAILABLE,
                         "models": crate::speech::list_models(&e.whisper_dirs()).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
                         "note": (!crate::speech::AVAILABLE).then_some(crate::speech::NOT_BUILT)});
     json!({
         "components": [ff, speech],
-        "media_folder": super::media_dir(&e.home),
+        "video_input": {"ready": video == caps::Video::Ready,
+                        "why_not": match video {
+                            caps::Video::NoFfmpeg => json!(ffmpeg::NOT_INSTALLED),
+                            other => json!(other.note()),
+                        }},
+        "models_with_projector": models,
+        "media_folder": super::serve::media_dir(&e.home),
     })
 }
 
@@ -276,7 +294,7 @@ async fn probe_route(
             .ffmpeg()
             .await
             .map_err(|e| Fail::new(501, "not_implemented", e))?;
-        let tmp = super::media_dir(&hub.engine.home).join("tmp");
+        let tmp = super::serve::media_dir(&hub.engine.home).join("tmp");
         let out = tokio::task::spawn_blocking(move || {
             super::with_upload(&tmp, &up.file, &up.filename, |p| {
                 let raw = probe::raw(&l, p)?;

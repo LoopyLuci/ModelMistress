@@ -6,6 +6,8 @@
 //!
 //!   ffmpeg    where ffmpeg and ffprobe are, the pinned build and its install, and what each reports
 //!   probe     `media.probe`: container, streams and duration of a file, from ffprobe's JSON
+//!   caps      what a model takes (image, video, audio), from its projector and the ffmpeg component
+//!   serve     the arguments llama-server needs for media: `--media-path`, `--video-ffmpeg-dir`
 //!   ops       the `media.*` operations
 
 use std::io::Read;
@@ -15,9 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod caps;
 pub mod ffmpeg;
 pub mod ops;
 pub mod probe;
+pub mod serve;
 
 /// What a finished child process left.
 #[derive(Debug)]
@@ -147,11 +151,6 @@ pub fn exe(name: &str) -> String {
 /// Whether `path` is a regular file the caller may read.
 pub fn is_readable_file(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
-}
-
-/// The folder llama-server reads `file://` names under, and where uploads wait for ffmpeg: `<home>/media`.
-pub fn media_dir(home: &Path) -> std::path::PathBuf {
-    home.join("media")
 }
 
 /// A file written for ffmpeg to read and removed when this is dropped.
@@ -363,6 +362,20 @@ pub(crate) mod stub {
         std::fs::write(&archive, zip_of(&refs)).unwrap();
         let sha = crate::misty::setup::sha_of(&archive).unwrap();
         (archive, sha)
+    }
+
+    /// A stand-in `llama-server` that prints a help text that lists `flags`, and nothing else.
+    pub fn server_stub(dir: &Path, flags: &[&str]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let unix: String = std::iter::once("echo \"usage: llama-server [options]\"".to_string())
+            .chain(flags.iter().map(|f| format!("echo \"  {f} VALUE\"")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let windows: String = std::iter::once("echo usage: llama-server [options]".to_string())
+            .chain(flags.iter().map(|f| format!("echo   {f} VALUE")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        script(dir, "llama-server", &unix, &windows)
     }
 
     /// The arguments a stand-in tool was last called with, read from its log `log` ("" when it was not called).
