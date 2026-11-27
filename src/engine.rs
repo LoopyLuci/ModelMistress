@@ -1406,6 +1406,38 @@ impl Engine {
         }
     }
 
+    /// For the system governor, when the machine is short of memory: unloads the model that has been idle longest, if it
+    /// has been idle at least `idle_s` seconds and has no request in progress. A model the owner pinned (`keep_alive`
+    /// -1) is taken only when `pinned_too`. Returns the model and how long it had been idle. One model per call, so the
+    /// effect of each can be seen before the next goes.
+    pub fn shed_one(&self, idle_s: u64, pinned_too: bool) -> Option<(String, u64)> {
+        let victim = {
+            let loaded = self.loaded.lock();
+            loaded
+                .iter()
+                .filter(|(_, i)| {
+                    i.inflight() == 0 && i.idle_s() >= idle_s && (pinned_too || i.keep.load(Ordering::Relaxed) >= 0)
+                })
+                .max_by_key(|(_, i)| i.idle_s())
+                .map(|(id, i)| (id.clone(), i.idle_s()))
+        };
+        let (id, idle) = victim?;
+        self.unload(&id).then_some((id, idle))
+    }
+
+    /// The GPUs as they were probed in the last `max_age`, without probing again (None: not probed that recently).
+    pub fn gpu_devices_if_recent(&self, max_age: Duration) -> Option<Vec<serving::Device>> {
+        #[cfg(test)]
+        if let Some(d) = self.fake_devices.lock().clone() {
+            return Some(d);
+        }
+        self.device_cache
+            .lock()
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < max_age)
+            .map(|(_, d)| d.clone())
+    }
+
     /// Stop every model now, including those still finishing requests (shutdown).
     pub fn unload_all(&self) -> usize {
         let all: Vec<_> = self.loaded.lock().drain().map(|(_, i)| i).collect();
@@ -3720,6 +3752,60 @@ mod tests {
         assert_eq!((mib("on-gpu"), mib("on-cpu")), (5000, 0));
         // a model that is being loaded is not its own neighbour
         assert!(e.residents("on-gpu").iter().all(|r| r.model != "on-gpu"));
+    }
+
+    /// What the system governor takes when memory is short: the longest-idle model, one per call, never one that is
+    /// answering a request, and a pinned one only when the machine is critical.
+    #[test]
+    fn shedding_takes_the_longest_idle_model_that_is_not_serving_one_at_a_time() {
+        let home = crate::testing::temp_home();
+        let e = Engine::new(home.to_path_buf(), Settings::default());
+        let idle_for = |name: &str, secs: u64| {
+            let i = e.adopt(name, 1, "k", None);
+            i.last_used.store(now_s() - secs, Ordering::Relaxed);
+            i
+        };
+        idle_for("recent", 5);
+        idle_for("old", 400);
+        idle_for("older", 900);
+        idle_for("pinned", 2000).keep.store(-1, Ordering::Relaxed);
+        let busy = idle_for("busy", 3000);
+        let lease = e.lease(&busy).expect("the model is in service");
+
+        assert_eq!(e.shed_one(5000, true), None, "nothing has been idle that long");
+        let (first, idle) = e.shed_one(120, false).expect("an idle model goes");
+        assert_eq!(first, "older");
+        assert!(idle >= 900, "{idle}");
+        assert_eq!(
+            e.shed_one(120, false).map(|(m, _)| m),
+            Some("old".into()),
+            "one model per call, the next most idle"
+        );
+        assert_eq!(
+            e.shed_one(120, false),
+            None,
+            "recent is not idle enough, pinned is kept, busy has a request"
+        );
+        let left = |e: &Engine| e.loaded().iter().map(|i| i.model.clone()).collect::<Vec<_>>();
+        assert_eq!(left(&e), ["busy", "pinned", "recent"]);
+
+        assert_eq!(
+            e.shed_one(120, true).map(|(m, _)| m),
+            Some("pinned".into()),
+            "critical takes a pinned model too"
+        );
+        assert_eq!(
+            e.shed_one(120, true),
+            None,
+            "a model with a request in progress is never shed"
+        );
+        assert_eq!(left(&e), ["busy", "recent"]);
+        drop(lease);
+        assert_eq!(
+            e.shed_one(120, true).map(|(m, _)| m),
+            Some("busy".into()),
+            "once its request is done it can go"
+        );
     }
 
     #[tokio::test]

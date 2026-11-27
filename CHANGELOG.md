@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### System awareness: the hub watches the PC and yields to it, live
+
+- Every two seconds the hub reads how pressed the machine is: CPU used by *other* programs (the machine's total less the hub's
+  own tree), free memory, Windows commit headroom, free video memory, temperatures, GPU and drive load, and whether a game, a
+  full-screen program or a presentation has the screen. Level: `calm`, `busy`, `strained` or `critical`; it rises after two
+  looks and falls one step after five, so a flicker changes nothing. `system.status` lists every reason with its numbers.
+- What the governor does, by mode (`off`, `gentle`, `balanced` (default), `strict`): workers the hub started (Forge, image,
+  quantize, ffmpeg and the like) run below normal always, go to idle priority plus Windows efficiency mode when strained,
+  and are paused after `pause_after_s` of critical (at most `max_pause_s`); a model server drops to below normal when strained
+  and is never paused; any other process the hub started is lowered a step later. It only lowers, only touches descendants of
+  the hub (named by pid *and* start time), puts back exactly what it changed (level falls, mode off, hub stops) and does not
+  fight a priority someone else changed. Console hosts and other helpers the OS starts for a child are left alone.
+- Heavy jobs (`forge`, `factory`, `quantize`, `image`) do not start while the machine is strained or worse: the job exists
+  at once, says why it waits, can be cancelled, and `system.run_now` starts it anyway. `max_wait_s` (default 0: as long as it
+  takes) gives up waiting. Downloads, installs and Misty's own jobs never wait.
+- When memory, commit or video memory is the short resource and the machine is strained, the hub unloads the model that has
+  been idle longest (`shed_idle_s`, default 120 s, one per ten seconds, never one with a request in progress; a `keep_alive:
+  -1` model only at critical). `shed = false` turns it off.
+- `system.status`, `system.config.get`, `system.config.set`, `system.run_now` (owner only; `system.status` is also a core MCP
+  tool, so the core set is thirteen); `model-mistress system [status|watch|mode|config|run-now]`; settings in
+  `<home>/system.toml`, taken in on edit; `machine.status` carries a short `pressure` block. See `docs/system-awareness.md`.
+- SystemWatchdog is optional and adds GPU load, temperatures, drive activity, video memory and the foreground program, read
+  from Watchdog's new loopback feed (`GET http://127.0.0.1:7781/pressure`, read-only, Host-checked). A feed that is absent
+  costs nothing (the hub backs off to one look per 30 s); one that stops publishing is reported `stale` and its readings are
+  dropped. In return Watchdog's own action engine and core balancer skip processes descended from the hub. Watchdog changes
+  are in its repository, uncommitted.
+- Not done: no CPU affinity or thread budget; no per-process GPU priority (Windows has none; the hub can only hold heavy
+  jobs back and shed models); on Linux and macOS the hub looks, waits and sheds but changes no process priority.
+- Run on this machine: a scratch hub (own home and port, the live hubs untouched) with a real `forge.run` job through a
+  stand-in worker, a real CPU-burning Python child. Calm: below normal. Critical: idle plus efficiency mode, paused after 20 s,
+  resumed after 121 s; stepped down critical, strained, calm; mode off put both processes back to normal while they ran; a
+  heavy job waited at strained, was cancelled while waiting, and another was started with `run-now`; Watchdog's real feed class
+  on a scratch port served synthetic readings (hot GPU made the hub strained, a silent feed went stale, a changed URL connected
+  at once). The scratch run also found two faults, both fixed with tests: a console host was lowered like a program, and a
+  changed `watchdog_url` waited out the old address's backoff.
+- Not run: a real model server being lowered or a real model being shed (the scratch hub had no model; the tests use
+  stand-in instances); a Forge run on the GPU; the installed Watchdog feeding real readings (its code is changed but the
+  running program was not restarted); the live hubs.
+- `src/sysaware/` (`level`, `policy`, `probe`, `feed`, `actuate`, `governor`, `ops`, `cli`, `mod`), `Engine::shed_one`, the
+  admission gate in `Jobs::start_task`; 71 tests including a real-process loop test.
+
+### Data-broker opt-outs: f*ck_data_brokers, pinned and driven from the hub
+
+- `model-mistress privacy …` and the `privacy.*` operations drive [f*ck_data_brokers](https://github.com/gary23w/f-ck_data_brokers)
+  (MIT): public broker registries in, legal deletion and opt-out letters out (CCPA, GDPR, UK GDPR, PIPEDA, Quebec Law 25,
+  LGPD), replies read, silent brokers chased. It never sends an ID, clicks a link or solves a CAPTCHA.
+- The tool is **pinned**: commit `528fb023`, SHA-256 `dce00f90…aa093`, 85,839 bytes. `privacy install` downloads that one
+  file only when told to (`confirm: true`; or installs a copy you fetched with `--file`), keeps it only if the hash matches, and
+  checks the hash again before every call. It runs as `python -I` with a cleared environment (none of the hub's tokens reach
+  it) and its state under `<home>/privacy/`, one call at a time.
+- Nothing is sent without the owner's count: `privacy send` first lists who would get an email, and sends only when called
+  again with `confirm_count` equal to that number (the CLI asks you to type it); a queue that changed in between is refused.
+  Sending from the hub needs `FDB_SMTP_PASS` (an app password) in the hub's environment, handed to the tool for that one call
+  and never stored, logged or returned; without it the send page (one button per letter, your own mail program) needs no password.
+- Owner only: a peer key cannot reach it and Misty has no tool for it. See `docs/privacy.md`.
+- Not done: no page in `/ui`; the count `privacy send` confirms is read from the tool's state file in the pinned version's
+  format, so moving the pin means checking that reader.
+- Run on this machine, in a scratch home with a placeholder identity and `.invalid` addresses: install refused without
+  confirm and for a wrong file (hash mismatch, nothing written), installed from a local copy of the pinned file, refused after
+  the file was altered until `--force` put it back, setup, two brokers added, two letters drafted, the send preview listed both,
+  a wrong count and a missing password were refused. Nothing was sent and nothing was downloaded.
+- Not run: `brokers import` (it reads the public registries over the network), a real send through a mail server, reply
+  parsing on a real broker's mail, forms.
+- `src/privacy/` (`mod`, `ops`, `cli`, `tests`), 14 tests.
+
 ### Batch jobs: prompts in order, answers written as they finish
 
 - `batch.submit` with `model`, `prompts` (up to 10,000), and optionally `system`, `name`, `max_tokens` (1 to 8192, default
@@ -29,7 +94,7 @@
 
 ### MCP: a core tool profile
 
-- The owner's MCP session (`model-mistress mcp`) offers twelve core tools: `service_status`, `model_list`, `model_loaded`,
+- The owner's MCP session (`model-mistress mcp`) offers thirteen core tools: `service_status`, `system_status` (how pressed the machine is, see "System awareness" above), `model_list`, `model_loaded`,
   `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete`, `logs_tail` and the approval queue (`request.list`, `request.approve`, `request.deny`). Before, it offered every hub
   operation (about 94), which cost an agent context on every turn. A tool outside the set is refused as a tool that does not
   exist.

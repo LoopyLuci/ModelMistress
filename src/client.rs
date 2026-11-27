@@ -429,6 +429,7 @@ pub enum ToolSet {
 /// The core tools. Each tool costs an agent context on every turn, so the rest are behind `mcp --all-tools`.
 pub const CORE_OPS: &[&str] = &[
     "service.status",
+    "system.status",
     "model.list",
     "model.loaded",
     "model.info",

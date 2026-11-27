@@ -539,7 +539,13 @@ impl Jobs {
             Err(running) => return running,
         };
         let j = job.clone();
+        let kind = kind.to_string();
         tokio::spawn(async move {
+            // a heavy job waits while the machine is strained (see sysaware)
+            if crate::sysaware::admit(&kind, &j).await == crate::sysaware::Admit::Cancelled {
+                j.set("cancelled", "cancelled while it waited for the machine to quiet", None);
+                return;
+            }
             match work(j.clone()).await {
                 Ok(v) => j.set("done", "finished", Some(v)),
                 Err(f) if f.code == "cancelled" => j.set("cancelled", f.message, None),

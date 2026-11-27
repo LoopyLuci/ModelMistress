@@ -36,6 +36,20 @@ backend (29 MB, pinned). A scratch hub on the RX 7900 XTX loaded the 9B `PQ2_0` 
 while the 2B ran on the CPU build (48 tokens/s), both at once, and both answered correctly. `llama-bench` on the 2B: prompt
 3,205 against 211 tokens/s on the CPU, generation 100.7 against 46.8.
 
+## System awareness and data-broker opt-outs (2026-11-27)
+
+The hub reads the PC every two seconds and yields to it: workers the hub started run below normal, go to idle priority with
+efficiency mode when the machine is strained and pause when it stays critical; heavy jobs wait for it to quiet; idle models
+are unloaded when memory is short. SystemWatchdog, when it runs, adds GPU load, temperatures, drive activity, video memory and
+the foreground program. See [system-awareness.md](system-awareness.md). Run on this machine in a scratch hub with real Python
+children and Watchdog's real feed class on a scratch port (priorities lowered, paused, stepped back and restored to normal,
+a heavy job held and released, a stale feed ignored); not run: a real model server or model shed, the installed Watchdog
+feeding live readings, Linux and macOS.
+
+`model-mistress privacy` drives the pinned f*ck_data_brokers tool (letters, sending only on the owner's typed count, replies,
+chasing); see [privacy.md](privacy.md). Run in a scratch home with placeholder details: the install gates, tamper
+refusal, drafting and the send refusals; nothing downloaded or sent. Not run: the registry import, a real send, real replies.
+
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):

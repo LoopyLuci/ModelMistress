@@ -252,6 +252,8 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::fabric::operations());
     all.extend(crate::forge::operations());
     all.extend(crate::benchmark::operations());
+    all.extend(crate::sysaware::ops::operations());
+    all.extend(crate::privacy::ops::operations());
     all
 }
 
@@ -1238,6 +1240,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             forward_json(hub, "/v1/rerank", body).await?
         }
         id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
+        id if id.starts_with("system.") => crate::sysaware::ops::call(hub, id, a).await?,
+        id if id.starts_with("privacy.") => crate::privacy::ops::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
         "key.create" | "key.list" | "key.revoke" | "usage.get" => {
             key_call(&hub.keys, id, a, "hub").map_err(ApiError::from)?
@@ -2529,6 +2533,8 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     let engine = hub.engine.clone();
     let keys = hub.keys.clone();
     let heartbeat = crate::watchdog::spawn_heartbeat();
+    // the machine is looked at, and the hub's processes adjusted to it, for as long as the hub serves
+    let governor = crate::sysaware::start(hub.engine.clone());
     let housekeeping = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         loop {
@@ -2552,6 +2558,7 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     .await;
     housekeeping.abort();
     heartbeat.abort();
+    governor.stop().await; // puts back every priority it changed, and resumes anything it paused
     keys.flush();
     let n = engine.unload_all();
     let _ = std::fs::remove_file(&control);

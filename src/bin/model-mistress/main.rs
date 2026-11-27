@@ -232,6 +232,18 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// How the machine is doing and what ModelMistress is doing about it: `system` (the level and why), `system watch`,
+    /// `system mode off|gentle|balanced|strict`, `system config [key=value ...]`, `system run-now` (`system help` lists them).
+    System {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Data-broker opt-outs (f*ck_data_brokers, pinned and checked): `privacy status`, `privacy install`, `privacy setup`,
+    /// `privacy letters`, `privacy send` (`privacy help` lists them).
+    Privacy {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// The Knowledge Module factory: `factory create <goal> --author M --source dir:docs`, `factory list`,
     /// `factory get <task>`, `factory resume <task>`, `factory review` (`factory help` lists them).
     Factory {
@@ -940,6 +952,8 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
         Cmd::Factory { args } => model_mistress::factory::cli::run(&home, args).await?,
         Cmd::Misty { args } => model_mistress::misty::cli::run(&home, args).await?,
+        Cmd::System { args } => model_mistress::sysaware::cli::run(&home, args).await?,
+        Cmd::Privacy { args } => model_mistress::privacy::cli::run(&home, args).await?,
         Cmd::Forge { cmd } => {
             let c = client().await?;
             match cmd {

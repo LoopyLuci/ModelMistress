@@ -130,6 +130,34 @@ Tried through a scratch hub on the RX 7900 XTX (23280 MiB usable VRAM, about 17 
   wrong tensor shapes); not a regression.
 - Chat canvas: `docs/chat-canvas.md`. Browser check of the canvas against a live hub: see the state of the checks below.
 
+## System awareness and data-broker opt-outs (2026-11-27, uncommitted)
+
+The owner asked that runs stop interfering with the PC's performance ("ModelMistress MUST be hardware aware and dynamically
+adapt"), that SystemWatchdog be integrated so she is system aware live, and that f*ck_data_brokers be integrated.
+
+- **System awareness** (`src/sysaware/`, `docs/system-awareness.md`). A loop in the hub reads the machine every 2 s, steadies a
+  level (calm, busy, strained, critical), and a governor lowers what the hub started and puts it back. Heavy jobs wait at
+  strained (`Jobs::start_task` calls `sysaware::admit` for `forge`, `factory`, `quantize`, `image`); idle models are shed
+  when memory is short (`Engine::shed_one`). Mode `balanced` is the default, so **every hub that runs this build changes
+  priorities of its own workers from the first look**: tell the owner, and `system mode off` undoes it live.
+- **Watchdog link.** Watchdog (repo `X:\Projects\SystemWatchdog`, uncommitted: `core/pressure.py`, `integrations/feed.py`,
+  `integrations/modelmistress.py`, edits to app, config, actions, balancer, API, CLI, MCP, tests, docs) serves
+  `GET 127.0.0.1:7781/pressure` and skips processes descended from the MM hub. The two repos need to be committed and
+  released together for the cooperation to work; each works alone. The installed Watchdog is the old version until it is
+  restarted from this tree.
+- **Data brokers** (`src/privacy/`, `docs/privacy.md`). The tool is pinned by commit and SHA-256 and is not in the tree;
+  `privacy install` is the only download and runs only when the owner says so. Sending needs the owner's typed count and, from
+  the hub, `FDB_SMTP_PASS` in the hub's environment (the owner's to create; never ask for it in chat).
+- **Gotchas.** The governor's global (`sysaware::shared()`) is installed only by `hub::serve`, so tests have no gate and no
+  governor: a test that wants one makes its own `Shared`. The tests that touch real processes lower only processes they
+  started. Windows 10 does not reliably report efficiency mode back, so the governor trusts its own record. Run the scratch
+  checks from a copy of the binary (a running exe blocks the next build) and never against the live hubs; the recipe is in
+  the changelog entry (a stand-in `mm_forge` package in `<home>/forge/src` and an empty venv in `<home>/forge/env` give a real
+  Python child to govern without any model).
+- **Left for the owner:** commit and push the two repos; restart the live hub and Watchdog to pick the changes up; decide
+  whether shedding should stay on by default; try `model-mistress privacy` with their real details (nothing has been sent
+  anywhere, nothing downloaded); the next planned work is Phase 1 of `docs/media-plan.md`.
+
 ## State of the checks (update this when you run them)
 
 - 2026-11-24: `npm run check` (typecheck, tests, build) passes. Library tests with the default thread count: 574 passed,

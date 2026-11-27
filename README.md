@@ -63,6 +63,15 @@ runs on its own.
   (a loaded model is preferred), in the Chat page, the Qt window and any OpenAI client, and says which answered. Choose
   the models on the Models page, Router tab, which also edits each model's serving profile and checks a load will fit
   before it starts. See [docs/misty/USER_GUIDE.md](docs/misty/USER_GUIDE.md#the-model-router-auto-in-any-chat).
+- **Aware of the PC it runs on.** The hub reads how pressed the machine is (other programs' CPU, memory, video memory and, with
+  [SystemWatchdog](https://github.com/LoopyLuci/SystemWatchdog), GPU load, temperatures and the program in front) and adjusts
+  itself live: workers it started run below normal and yield further when the PC is strained, heavy jobs wait for it to
+  quiet, idle models are unloaded when memory is short, and all of it is undone when the pressure lifts or you switch it
+  off (`model-mistress system`). See [docs/system-awareness.md](docs/system-awareness.md).
+- **Data-broker opt-outs.** `model-mistress privacy` drives the pinned
+  [f*ck_data_brokers](https://github.com/gary23w/f-ck_data_brokers) tool: letters to data brokers in your name, replies read,
+  silent brokers chased. Nothing is downloaded until you say so and nothing is sent without you typing the count
+  ([docs/privacy.md](docs/privacy.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 - **All-in-one item listing & sales platform** — **ItemForge** (`itemforge/`): auto-organize photos into item folders,
