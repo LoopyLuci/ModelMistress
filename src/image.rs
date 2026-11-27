@@ -90,6 +90,9 @@ pub struct ImageRequest {
     pub cfg_scale: Option<f32>,
     pub seed: Option<i64>,
     pub sampler: Option<String>,
+    /// Frames of a video (`POST /v1/videos/generations`); set: the request makes a WebM with sound, not PNGs.
+    pub frames: Option<u32>,
+    pub fps: Option<u32>,
 }
 
 impl ImageRequest {
@@ -150,6 +153,18 @@ impl ImageRequest {
             None | Some(Value::Null) => None,
             Some(x) => Some(x.as_i64().ok_or("seed must be an integer")?),
         };
+        let ranged = |k: &str, lo: u64, hi: u64| -> std::result::Result<Option<u32>, String> {
+            match obj.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(x) => x
+                    .as_u64()
+                    .filter(|n| (lo..=hi).contains(n))
+                    .map(|n| Some(n as u32))
+                    .ok_or(format!("{k} must be an integer from {lo} to {hi}")),
+            }
+        };
+        let frames = ranged("frames", 1, 481)?;
+        let fps = ranged("fps", 1, 60)?;
         let sampler = text("sampler")?;
         if let Some(s) = &sampler {
             if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+') {
@@ -168,6 +183,8 @@ impl ImageRequest {
             cfg_scale,
             seed,
             sampler,
+            frames,
+            fps,
         })
     }
 }
@@ -190,6 +207,10 @@ pub struct ImageModel {
     pub clip_g: Option<PathBuf>,
     pub t5xxl: Option<PathBuf>,
     pub llm: Option<PathBuf>,
+    /// `--audio-vae`: the sound decoder of a video model (LTX, MiniMax-H3).
+    pub audio_vae: Option<PathBuf>,
+    /// `--tokenizer` (MOSS-Image takes its tokenizer as a file of its own).
+    pub tokenizer: Option<PathBuf>,
 }
 
 impl ImageModel {
@@ -214,9 +235,16 @@ fn companion_kind(file: &str) -> Option<&'static str> {
         Some("clip_g")
     } else if f.contains("t5xxl") {
         Some("t5xxl")
+    } else if f.contains("audio_vae") || f.contains("audio-vae") {
+        Some("audio_vae")
     } else if stem == "ae" || f.contains("vae") {
         Some("vae")
-    } else if f.starts_with("qwen") && (f.contains("text_encoder") || f.contains("qwen_3") || f.contains("qwen2")) {
+    } else if f == "tokenizer.json" {
+        Some("tokenizer")
+    } else if (f.starts_with("qwen") && (f.contains("text_encoder") || f.contains("qwen_3") || f.contains("qwen2")))
+        || (f.starts_with("qwen3vl") || f.starts_with("qwen3.5") || f.starts_with("qwen3_5") || f.starts_with("gemma"))
+    {
+        // the language model that encodes the prompt: Qwen3.5 (MOSS-Image), Qwen3-VL (MiniMax-H3-Image), Gemma (LTX)
         Some("llm")
     } else {
         None
@@ -243,7 +271,7 @@ fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
             if depth > 0 {
                 walk(&p, depth - 1, out);
             }
-        } else if is_weights(&p) {
+        } else if is_weights(&p) || p.file_name().is_some_and(|n| n == "tokenizer.json") {
             out.push(p);
         }
     }
@@ -264,6 +292,11 @@ fn looks_like_image_model(stem: &str) -> bool {
         "stable_diffusion",
         "diffusion",
         "flux",
+        "moss-image",
+        "moss_image",
+        "minimax_h3",
+        "minimax-h3",
+        "ltx",
     ]
     .iter()
     .any(|k| s.contains(k))
@@ -292,6 +325,8 @@ fn pair(id: String, path: PathBuf) -> ImageModel {
             Some("clip_g") => &mut m.clip_g,
             Some("t5xxl") => &mut m.t5xxl,
             Some("llm") => &mut m.llm,
+            Some("tokenizer") => &mut m.tokenizer,
+            Some("audio_vae") => &mut m.audio_vae,
             _ => continue,
         };
         slot.get_or_insert(f); // sorted by name: the first one found is used
@@ -363,6 +398,56 @@ pub fn find_model(dirs: &[PathBuf], catalog: &[ModelEntry], name: &str, preferre
 
 // ---- the tool -----------------------------------------------------------------------------------------------
 
+/// What a model family needs that the tool's own defaults get wrong. A request's own values win.
+#[derive(Debug, Default, PartialEq)]
+pub struct Preset {
+    pub steps: Option<u32>,
+    pub cfg: Option<f32>,
+    pub sampler: Option<&'static str>,
+    pub extra: &'static [&'static str],
+}
+
+/// The sampling settings the model cards give: MiniMax-H3-Image is distilled to 6 steps without guidance and with its
+/// own sigma schedule (it is large, so the weights may sit in RAM while the card does the work); MOSS-Image samples 50
+/// steps at guidance 3 with shift 5.
+pub fn preset_for(m: &ImageModel) -> Preset {
+    let id = m.id.to_lowercase();
+    if id.contains("minimax_h3_image") || id.contains("minimax-h3-image") {
+        Preset {
+            steps: Some(6),
+            cfg: Some(1.0),
+            sampler: Some("euler"),
+            extra: &["--sigmas", "minimax-h3-image", "--rng", "cpu"],
+        }
+    } else if id.contains("moss-image") || id.contains("moss_image") {
+        Preset {
+            steps: Some(50),
+            cfg: Some(3.0),
+            sampler: None,
+            // no --offload-to-cpu: with it the Vulkan compute buffers failed to allocate on a 24 GB card (768 px renders
+            // fine with the weights loaded straight to the card)
+            extra: &["--flow-shift", "5"],
+        }
+    } else if id.contains("ltx") && id.contains("distilled") {
+        // the distilled LTX-2.x video model: 8 steps, no guidance (measured: 25 frames at 512x320 in 387 s of sampling)
+        Preset {
+            steps: Some(8),
+            cfg: Some(1.0),
+            sampler: Some("euler"),
+            extra: &[],
+        }
+    } else if id.contains("ltx") {
+        Preset {
+            steps: Some(20),
+            cfg: Some(3.0),
+            sampler: Some("euler"),
+            extra: &[],
+        }
+    } else {
+        Preset::default()
+    }
+}
+
 /// The arguments of `sd-cli` for one request. `out` is a printf pattern (`image_%d.png`): `sd-cli` writes one
 /// file per image, numbered from 0. `cpu_only` keeps every part of the model off the GPU.
 pub fn tool_args(m: &ImageModel, req: &ImageRequest, seed: i64, out: &Path, cpu_only: bool) -> Vec<String> {
@@ -377,10 +462,21 @@ pub fn tool_args(m: &ImageModel, req: &ImageRequest, seed: i64, out: &Path, cpu_
         ("--clip_g", &m.clip_g),
         ("--t5xxl", &m.t5xxl),
         ("--llm", &m.llm),
+        ("--tokenizer", &m.tokenizer),
+        ("--audio-vae", &m.audio_vae),
     ] {
         if let Some(f) = file {
             a.extend([flag.into(), path(f)]);
         }
+    }
+    if let Some(frames) = req.frames {
+        a.extend([
+            "-M".into(),
+            "vid_gen".into(),
+            "--video-frames".into(),
+            frames.to_string(),
+        ]);
+        a.extend(["--fps".into(), req.fps.unwrap_or(24).to_string()]);
     }
     a.extend([
         "-p".into(),
@@ -401,15 +497,17 @@ pub fn tool_args(m: &ImageModel, req: &ImageRequest, seed: i64, out: &Path, cpu_
     if let Some(n) = &req.negative_prompt {
         a.extend(["-n".into(), n.clone()]);
     }
-    if let Some(s) = req.steps {
+    let preset = preset_for(m);
+    if let Some(s) = req.steps.or(preset.steps) {
         a.extend(["--steps".into(), s.to_string()]);
     }
-    if let Some(c) = req.cfg_scale {
+    if let Some(c) = req.cfg_scale.or(preset.cfg) {
         a.extend(["--cfg-scale".into(), c.to_string()]);
     }
-    if let Some(s) = &req.sampler {
-        a.extend(["--sampling-method".into(), s.clone()]);
+    if let Some(s) = req.sampler.as_deref().or(preset.sampler) {
+        a.extend(["--sampling-method".into(), s.to_string()]);
     }
+    a.extend(preset.extra.iter().map(|s| s.to_string()));
     if cpu_only {
         a.extend(["--backend".into(), "cpu".into()]);
     }
@@ -733,6 +831,94 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn moss_and_minimax_get_their_encoders_vae_tokenizer_and_sampling() {
+        let d = crate::testing::TestDir::new("mm-image-new");
+        let moss = touch(&d, "moss/MOSS-Image-Base-BF16.gguf");
+        let enc = touch(&d, "moss/Qwen3.5-9B-Q8_0.gguf");
+        let vae = touch(&d, "moss/moss-vae.safetensors");
+        let tok = touch(&d, "moss/tokenizer.json");
+        let m = pair("MOSS-Image-Base-BF16".into(), moss);
+        assert_eq!(
+            (m.llm.clone(), m.vae.clone(), m.tokenizer.clone()),
+            (Some(enc), Some(vae), Some(tok))
+        );
+        assert!(m.is_split());
+        let req = ImageRequest::from_json(&json!({"prompt": "a sign", "size": "1024x1024"})).unwrap();
+        let a = tool_args(&m, &req, 1, Path::new("o_%d.png"), false);
+        let at = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
+        assert_eq!(at("--diffusion-model").as_deref(), Some(m.path.to_str().unwrap()));
+        assert_eq!(
+            (
+                at("--steps").as_deref(),
+                at("--cfg-scale").as_deref(),
+                at("--flow-shift").as_deref()
+            ),
+            (Some("50"), Some("3"), Some("5"))
+        );
+        assert!(a.contains(&"--tokenizer".to_string()) && a.contains(&"--llm".to_string()));
+
+        let h3 = touch(&d, "h3/minimax_h3_image_pruned-Q8_0.gguf");
+        touch(&d, "h3/qwen3vl_32b_minimax_h3-Q4_K_M.gguf");
+        touch(&d, "h3/minimax-h3-image-vae.safetensors");
+        let other = touch(&d, "h3/minimax_h3_image_pruned-UD-Q4_K_XL.gguf");
+        let m = pair("minimax_h3_image_pruned-Q8_0".into(), h3);
+        assert!(m.llm.is_some() && m.vae.is_some() && m.tokenizer.is_none());
+        let a = tool_args(&m, &req, 1, Path::new("o_%d.png"), false);
+        let at = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
+        assert_eq!(
+            (
+                at("--steps").as_deref(),
+                at("--cfg-scale").as_deref(),
+                at("--sampling-method").as_deref()
+            ),
+            (Some("6"), Some("1"), Some("euler"))
+        );
+        assert_eq!(at("--sigmas").as_deref(), Some("minimax-h3-image"));
+        // a request's own steps win over the preset
+        let own = ImageRequest::from_json(&json!({"prompt": "x", "steps": 8})).unwrap();
+        assert_eq!(
+            tool_args(&m, &own, 1, Path::new("o.png"), false)
+                .windows(2)
+                .find(|w| w[0] == "--steps")
+                .unwrap()[1],
+            "8"
+        );
+        // the other quantisation in the folder is a model, not a companion
+        assert!(companion_kind("minimax_h3_image_pruned-UD-Q4_K_XL.gguf").is_none());
+        assert!(other.is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ltx_gets_its_encoder_both_vaes_and_the_distilled_preset() {
+        let d = crate::testing::TestDir::new("mm-image-ltx");
+        let dit = touch(&d, "ltx/ltx-2.5-22b-distilled-transformer-Q4_K_M.gguf");
+        let enc = touch(&d, "ltx/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors");
+        let vae = touch(&d, "ltx/ltx-2.5-video-vae-conv-bf16.safetensors");
+        let audio = touch(&d, "ltx/ltx-2.5-audio-vae-bf16.safetensors");
+        let m = pair("ltx-2.5-22b-distilled-transformer-Q4_K_M".into(), dit);
+        assert_eq!(
+            (m.llm.clone(), m.vae.clone(), m.audio_vae.clone()),
+            (Some(enc), Some(vae), Some(audio))
+        );
+        let req =
+            ImageRequest::from_json(&json!({"prompt": "a car", "size": "512x320", "frames": 25, "fps": 24})).unwrap();
+        let a = tool_args(&m, &req, 1, Path::new("o.webm"), false);
+        let at = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
+        assert_eq!(at("-M").as_deref(), Some("vid_gen"));
+        assert_eq!(
+            (
+                at("--steps").as_deref(),
+                at("--cfg-scale").as_deref(),
+                at("--video-frames").as_deref()
+            ),
+            (Some("8"), Some("1"), Some("25"))
+        );
+        assert!(a.contains(&"--audio-vae".to_string()));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

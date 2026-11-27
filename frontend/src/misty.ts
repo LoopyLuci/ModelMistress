@@ -88,6 +88,47 @@ export interface Source { collection: string; source: string; bytes: number; chu
 export interface ToolInfo { name: string; class: string; policy: string; description: string }
 export interface Pipeline { name: string; description?: string; steps: any[]; [k: string]: any }
 
+/** The owner's verdict on a reply (src/misty/feedback.rs). The wire names match the Android app's export. */
+export type Label = 'good' | 'bad' | 'no_tools' | 'needs_tools' | 'corrected'
+/** The verdicts a reply can get from the buttons (corrected is given with the right answer). */
+export const LABELS: { id: Label; text: string }[] = [
+  { id: 'good', text: 'Good' },
+  { id: 'bad', text: 'Bad' },
+  { id: 'no_tools', text: 'No tool needed' },
+  { id: 'needs_tools', text: 'Should have used a tool' },
+]
+export const LABEL_TEXT: Record<Label, string> = {
+  good: 'good', bad: 'bad', no_tools: 'no tool needed', needs_tools: 'should have used a tool', corrected: 'corrected',
+}
+export interface FeedbackCounts { total: number; good: number; bad: number; no_tools: number; needs_tools: number; corrected: number; training: number }
+export interface Verdict { id: number; question: string; answer: string; label: Label; tools: string[]; correction: string | null; at: number }
+export interface FeedbackList { counts: FeedbackCounts; verdicts: Verdict[] }
+export interface RateResult { id: number; label: Label; counts: FeedbackCounts }
+/** A row of the hub's run log: its session (if any) and the start of its question (200 characters). */
+export interface RunRow { id: string; session: string | null; input: string; role?: string | null; status: string; started: number; ms: number }
+/** One line of a chat. For Misty's replies, `run` is the run that made it (what a rating is about) and `rated` the verdict given. */
+export interface Turn { role: string; content: string; run?: string; rated?: Label }
+
+/**
+ * Gives each of a session's replies the run that made it. Each question is matched, in order, with the session's finished
+ * runs, oldest first; a run that failed or was cancelled gives no reply, so it is not matched. The run log keeps only the
+ * first 200 characters of a question, which is how a question is matched.
+ */
+export function pairRuns(turns: Turn[], runs: RunRow[], session: string): Turn[] {
+  const oldest = runs.filter((r) => r.session === session && r.status === 'done').reverse()
+  const out = turns.map((t) => ({ ...t }))
+  let cursor = 0
+  for (let k = 0; k < out.length; k++) {
+    if (out[k].role !== 'user') continue
+    const want = out[k].content.slice(0, 200)
+    const j = oldest.findIndex((r, i) => i >= cursor && r.input === want)
+    if (j < 0) continue
+    cursor = j + 1
+    if (out[k + 1]?.role === 'assistant') out[k + 1].run = oldest[j].id
+  }
+  return out
+}
+
 export const ROLE_LABEL: Record<string, string> = {
   reflex: 'Reflex (Needle3)', fast: 'Fast', main: 'Main', deep: 'Deep', ear: 'Ear (Whistle)', eye: 'Eye (Mirage)', embed: 'Embeddings', rerank: 'Rerank',
 }
@@ -128,6 +169,16 @@ export const misty = {
   setConfig: (patch: Record<string, unknown>) => call('misty.config.set', { patch }),
   pipelines: async (): Promise<Pipeline[]> => (await call('misty.pipeline.list', {})).pipelines || [],
   runPipeline: (name: string, inputs: Record<string, unknown>, wait = true): Promise<any> => call('misty.pipeline.run', { name, inputs, wait }),
+  /** The owner's verdict on a finished run's reply. `correction` is the right answer, given with `corrected`. */
+  rate: (run: string, label: Label, correction?: string): Promise<RateResult> =>
+    call('misty.rate', { run, label, ...(correction ? { correction } : {}) }),
+  feedback: (limit = 100): Promise<FeedbackList> => call('misty.feedback.list', { limit }),
+  forget: (id: number): Promise<{ removed: number }> => call('misty.feedback.forget', { id }),
+  forgetAll: (): Promise<{ removed: number }> => call('misty.feedback.forget', { all: true }),
+  /** The good replies and the corrections, one JSON object per line. */
+  training: (): Promise<{ count: number; jsonl: string }> => call('misty.training.export', {}),
+  /** Recent runs, newest first. */
+  runs: async (limit = 300): Promise<RunRow[]> => (await call('misty.run.list', { limit })).recent || [],
 }
 
 /** What a run's events add up to: the answer so far, the reasoning, which role answered, tool calls, citations. */

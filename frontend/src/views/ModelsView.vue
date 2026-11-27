@@ -253,6 +253,70 @@
       </template>
     </template>
 
+    <!-- Speed test ----------------------------------------------------------------------------------------------- -->
+    <template v-if="tab === 'speed'">
+      <section class="card" aria-label="Speed test">
+        <h3>Speed test</h3>
+        <p class="muted">
+          The test stresses every CPU core for about ten seconds, copies memory to measure its bandwidth, and times one short
+          reply from each installed chat model. Then it says which models suit this machine. A model that is not loaded yet
+          takes longer on its first reply, because that reply includes loading it. Close heavy programs first for a fair result.
+        </p>
+        <div class="row">
+          <button class="btn primary" type="button" :disabled="benching" @click="runBench">
+            {{ benching ? 'Testing...' : bench ? 'Test again' : 'Run the speed test' }}
+          </button>
+          <span v-if="benching" class="muted small" role="status">This takes a minute or more, and longer for large models.</span>
+        </div>
+        <p v-if="benchError" class="error-box" role="alert">{{ benchError }}</p>
+      </section>
+
+      <template v-if="bench">
+        <section class="card" aria-label="This machine">
+          <h3>This machine</h3>
+          <dl class="kv">
+            <dt>Cores</dt><dd>{{ bench.cpu.threads }}</dd>
+            <dt>RAM</dt><dd>{{ bench.ram_gb }} GB</dd>
+            <dt>Memory bandwidth</dt><dd>{{ bench.memory_gbps }} GB/s</dd>
+            <dt>Under load</dt><dd>The CPU {{ steadyText(bench.cpu.steady) }}</dd>
+          </dl>
+        </section>
+
+        <section class="card" aria-label="Suggestions">
+          <h3>What suits this machine</h3>
+          <ul class="suggest">
+            <li v-if="bench.suggestions.fastest"><strong>Fastest:</strong> {{ bench.suggestions.fastest }}</li>
+            <li v-if="bench.suggestions.balanced">
+              <strong>Balanced:</strong> {{ bench.suggestions.balanced }}, the largest that keeps up with reading ({{ bench.suggestions.reading_tokens_per_s }} tokens a second)
+            </li>
+            <li v-if="bench.suggestions.best"><strong>Best answers:</strong> {{ bench.suggestions.best }}, the largest that fits in memory</li>
+          </ul>
+          <p v-if="!bench.suggestions.fastest" class="muted small">No model could be timed yet. Install a chat model, then run the test again.</p>
+        </section>
+
+        <section class="card" aria-label="Each model">
+          <h3>Each model</h3>
+          <div class="tablewrap">
+            <table class="t">
+              <thead><tr><th>Model</th><th class="num">Size</th><th class="num">Tokens a second</th><th>Note</th></tr></thead>
+              <tbody>
+                <tr v-for="r in bench.models" :key="r.model">
+                  <td class="mono">{{ r.model }}</td>
+                  <td class="num">{{ r.size_gb }} GB</td>
+                  <td class="num">{{ (r.error || r.tokens_per_s == null) ? '-' : r.tokens_per_s }}</td>
+                  <td class="small">
+                    {{ r.error ? 'failed: ' + r.error : r.cold_start ? 'loaded for this test, so its speed includes loading and is not a suggestion' : 'was already loaded' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="!bench.models.length" class="muted small">No chat models are installed.</p>
+          <p v-if="bench.note" class="muted small">{{ bench.note }}</p>
+        </section>
+      </template>
+    </template>
+
     <!-- Find and download ---------------------------------------------------------------------------------------- -->
     <template v-if="tab === 'find'">
       <form class="card" @submit.prevent="search">
@@ -293,6 +357,16 @@
         </div>
         <p class="muted small">Downloads go to the download folder in Settings and resume if stopped.</p>
       </form>
+
+      <section class="card" aria-label="Import a model file">
+        <h3>Import a model file</h3>
+        <p class="muted small">Copies a .gguf file you already have into the models folder, where this list finds it. A large file takes a while to copy.</p>
+        <div class="row">
+          <input type="file" accept=".gguf" class="grow" aria-label="Model file to import" :disabled="importing !== ''" @change="importChosen" />
+        </div>
+        <p v-if="importing" class="muted small" role="status">Copying {{ importing }}...</p>
+        <p v-if="imported" class="muted small" role="status">{{ imported }}</p>
+      </section>
     </template>
 
     <!-- Downloads ------------------------------------------------------------------------------------------------ -->
@@ -325,11 +399,12 @@ import { useRoute } from 'vue-router'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import { call } from '@/transport'
 import { fmtBytes } from '@/util'
+import { importModel } from '@/modelImport'
 import { groupModels, isChatModel, listModels, loadedModels, type HubModel, type LoadedModel } from '@/chat/models'
 import { BRAIN_ROLES, ROLE_HELP, SOURCE_LABEL, STATUS_TEXT, pickText, routerStatus, setRole, suitsRole, type Pick, type RoleView, type RouterStatus } from '@/chat/router'
 import { FIELDS, describe, isCustom, readProfiles, saveProfile, toForm, toProfile, type Form, type Profile } from '@/chat/profiles'
 
-type TabId = 'installed' | 'router' | 'find' | 'downloads'
+type TabId = 'installed' | 'router' | 'speed' | 'find' | 'downloads'
 
 const route = useRoute()
 const models = ref<HubModel[]>([])
@@ -340,7 +415,7 @@ const busy = ref(false)
 const error = ref('')
 const note = ref('')
 const wanted = String(route.query.tab || '')
-const tab = ref<TabId>((['installed', 'router', 'find', 'downloads'] as string[]).includes(wanted) ? (wanted as TabId) : 'installed')
+const tab = ref<TabId>((['installed', 'router', 'speed', 'find', 'downloads'] as string[]).includes(wanted) ? (wanted as TabId) : 'installed')
 const loadFor = ref('')
 const loading = ref('')
 const opts = reactive<{ ctx_size: number | null; gpu_layers: number | null; cpu_moe: string; n_cpu_moe: number | null; retry_gpu: boolean }>({
@@ -384,6 +459,7 @@ const running = computed(() => jobs.value.filter((j) => j.status === 'running').
 const tabs = computed(() => [
   { id: 'installed' as const, label: 'Installed', n: models.value.length },
   { id: 'router' as const, label: 'Router', n: 0 },
+  { id: 'speed' as const, label: 'Speed test', n: 0 },
   { id: 'find' as const, label: 'Find and download', n: 0 },
   { id: 'downloads' as const, label: 'Downloads', n: running.value },
 ])
@@ -564,12 +640,13 @@ function describeFit(r: any): { text: string; tone: string } | null {
   const need = r.estimate?.total_mib as number | undefined
   const free = r.free_mib as number | undefined
   const sizes = need != null && free != null ? ` It needs about ${gb(need)}; ${gb(free)} of video memory is free.` : ''
-  const p = r.placement as { where?: string; gpu_share?: number; need_ram_mib?: number; free_ram_mib?: number } | null | undefined
+  const p = r.placement as { where?: string; gpu_share?: number; need_ram_mib?: number; free_ram_mib?: number; paged_mib?: number } | null | undefined
   // layers the hub and llama-server choose (the default): what does not fit on the GPU runs from RAM
   if (r.learned_cpu) return { tone: 'warn', text: `It starts on the CPU: ${r.learned_cpu}. Tick "Try the GPU again" to give the GPU another go.` }
   if (p?.where === 'split') return { tone: 'warn', text: `About ${Math.round((p.gpu_share ?? 0) * 100)}% of it goes on the GPU and the rest runs from system memory, which is slower.${sizes}` }
   if (p?.where === 'cpu') return { tone: 'warn', text: `Next to no video memory is free, so it runs on the CPU.${sizes}` }
-  if (p?.where === 'none') return { tone: 'bad', text: `This does not fit this machine: it needs about ${gb(p.need_ram_mib ?? 0)} of system memory and ${gb(p.free_ram_mib ?? 0)} are free. A smaller context, fewer parallel requests or a smaller quantisation helps.${sizes}` }
+  if (p?.where === 'paged') return { tone: 'bad', text: `Too big for this machine's memory: about ${gb(p.paged_mib ?? 0)} of it is read from disk as the model runs. Expect seconds per token, and a slow start.${sizes}` }
+  if (p?.where === 'none') return { tone: 'bad', text: `This does not fit this machine: it needs about ${gb(p.need_ram_mib ?? 0)} of system memory and ${gb(p.free_ram_mib ?? 0)} are free. A smaller context, fewer parallel requests or a smaller quantisation helps. To try it from disk (very slow), turn on the setting for it and the model's "Load from disk" option.${sizes}` }
   switch (r.verdict) {
     case 'fits': return { tone: 'ok', text: `This fits.${sizes}` }
     case 'fits_after_unloading': return { tone: 'warn', text: `This fits after unloading ${(r.unload || []).join(', ') || 'another model'}; the hub does that when you load.${sizes}` }
@@ -789,6 +866,51 @@ function pullByName() {
   // org/name and hf.co/... are Hugging Face; a plain name is the Ollama library's
   pull({ model: n, ...(n.startsWith('hf.co/') || n.includes('/') ? {} : { source: 'ollama' }) })
 }
+const importing = ref('')
+const imported = ref('')
+/** A model file picked here is copied into the models folder, and the list is read again after it. */
+async function importChosen(e: Event) {
+  const el = e.target as HTMLInputElement
+  const f = el.files?.[0]
+  el.value = ''
+  if (!f) return
+  error.value = ''
+  imported.value = ''
+  importing.value = f.name
+  try {
+    const got = await importModel(f)
+    imported.value = `${got.name} is in the models folder (${fmtBytes(got.bytes)}).`
+    await reload(true)
+  } catch (err: any) {
+    error.value = `Could not import ${f.name}: ${err?.message || err}`
+  } finally {
+    importing.value = ''
+  }
+}
+// ---- speed test ----------------------------------------------------------------------------------------------------
+const bench = ref<any>(null)
+const benching = ref(false)
+const benchError = ref('')
+/** The speed test: a CPU stress, a memory copy, and one short reply from each chat model hub-side (system.bench). */
+async function runBench() {
+  benching.value = true
+  benchError.value = ''
+  try {
+    bench.value = await call('system.bench', {})
+  } catch (e: any) {
+    benchError.value = `The speed test did not finish: ${e?.message || e}`
+  } finally {
+    benching.value = false
+  }
+}
+/** How the CPU held up under the stress: 1 is the same speed at the end as at the start. */
+function steadyText(s: number): string {
+  const pct = Math.round(s * 100)
+  if (s >= 0.9) return `held its speed (${pct}% at the end of the test)`
+  if (s >= 0.7) return `slowed a little (${pct}% at the end)`
+  return `slowed down (${pct}% at the end): it may throttle under sustained load`
+}
+
 async function cancelJob(id: string) {
   try {
     await call('job.cancel', { job: id })
@@ -802,7 +924,7 @@ async function cancelJob(id: string) {
 watch(
   () => route.query.tab,
   (t) => {
-    if (typeof t === 'string' && (['installed', 'router', 'find', 'downloads'] as string[]).includes(t)) tab.value = t as TabId
+    if (typeof t === 'string' && (['installed', 'router', 'speed', 'find', 'downloads'] as string[]).includes(t)) tab.value = t as TabId
   },
 )
 
@@ -838,5 +960,7 @@ onBeforeUnmount(() => {
 .roles td { vertical-align: top; }
 .tryout { margin-top: 10px; }
 .tryout ul { margin: 4px 0 8px 1.2em; }
+.suggest { margin: 0 0 0 1.2em; padding: 0; }
+.suggest li { margin: 4px 0; }
 tr.chosen td { background: var(--panel-2); }
 </style>

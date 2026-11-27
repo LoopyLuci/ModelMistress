@@ -140,6 +140,6 @@ def test_the_window_remembers_its_size_and_opens_its_first_page(app, tmp_path, a
     assert again.height() == 500
     assert again.stack.currentWidget() is again.pages[0]
     assert again.heading.text() == "Status"
-    again.nav.setCurrentRow(3)
+    again.nav.setCurrentRow(4)  # Status, Models, Chat, Misty, Settings
     assert again.heading.text() == "Settings"
     again.close()

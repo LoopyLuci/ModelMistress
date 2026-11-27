@@ -88,6 +88,31 @@ chat can repeat or fix the last thing you sent anywhere. In a message of several
 usual, and only on the first line (Up) or the last (Down) do they walk the history. Typing something walks you back out
 of it. Ctrl+Enter sends from the Misty box, as in Chat.
 
+## Ratings, and what she learns
+
+Under each reply on the **Misty** page are the ratings: **Good**, **Bad**, **No tool needed**, **Should have used a
+tool**, and **Correct it...**, which opens a box for the right answer. A rated reply shows its rating. Each rating is kept
+on this machine with the question, the reply, the tools that were offered for it, and the time. **Should have used a
+tool** is refused for a reply that was offered no tools, because there is no tool for it to point at.
+
+What she does with them:
+
+- **No tool needed** and **Should have used a tool** change routing for similar questions. After "No tool needed" she
+  offers no tools. After "Should have used a tool" or "Good" she offers the tools that were offered on the rated reply.
+  A question is similar when at least 60% of the distinct meaningful words the two share (common words and single
+  letters are ignored). The newest matching rating wins.
+- **Correct it...** does not change routing. When a similar question comes up, the two most similar corrections are
+  given to her as a note: the earlier question, the wrong reply (its first 300 characters), and the correct answer. She
+  is told to follow the correction and not to repeat the wrong reply.
+- A request that names its tools (`tools` or `no_tools` in the API) overrides the ratings.
+
+She keeps the newest 500 ratings, and a stored reply is cut at 1000 characters.
+
+**Learning tab.** On **Setup and status**, the **Learning** tab shows how many ratings she holds. It exports them as
+chat-format JSON lines (`misty-training.jsonl`), and it forgets one rating or all of them after a confirmation. The export
+holds the **Good** replies (the question and the reply) and the **Corrected** replies (the question, with the correction
+as the answer and the wrong reply in `metadata.rejected`). The other ratings are kept but not exported.
+
 ## Documents
 
 Misty keeps her own index (SQLite, keyword search, plus vectors when an embedding model is installed):
@@ -402,7 +427,7 @@ Tested with unit and integration tests (scripted models, no real ones): the rout
 retries, citations, cancellation), retrieval, the policy and file/secret/SSRF guards, pipelines, the REST, SSE and
 OpenAI-virtual-model surfaces, peer rules, the setup planner (against pinned metadata), the ternary-engine guard, the
 CLI, the ABP client, tools and routes, environments and working folders (the policy, folder and variables a session
-gets from its environment, the folder browser), and the Qt page.
+gets from its environment, the folder browser), the ratings and what she learns from them (the store, the operations, the export), and the Qt page, including its queue, steering, ratings and "What she learns" dialog.
 
 **Run for real** (Windows 10, Ryzen 9 5900X, 2026-11-21, a separate hub and home): the starter set was installed with its
 size and SHA-256 checks; `misty doctor` passed; Bonsai 2B and 9B ran on the Prism engine; Needle3, Whistle and Mirage ran
@@ -413,8 +438,8 @@ once as `main`.
 **Not run:** the 27B (`deep`) and so the escalation up to it and its thinking mode; the `Q2_0` and `PTQ1_0` packings;
 other operating systems and CPUs; the Misty page of the dashboard and desktop app (type-checked, unit-tested and built,
 and the desktop app attaches to a running hub, but the page was opened only in a browser, against a scratch hub: the environment bar, the folder picker, the
-Environments page and Up/Down history on 2026-11-23, not in the desktop app, and no real model ran in an environment) and of the Qt window (written
-without PySide6, so not run); ABP's dashboard and CLI (only the client module under them ran).
+Environments page and Up/Down history on 2026-11-23, not in the desktop app, and no real model ran in an environment) and of the Qt window (its pages and
+the Live, queue, steer and ratings paths run offscreen against a fake hub, in `gui/tests`; not clicked through on a screen, and no real microphone or camera); ABP's dashboard and CLI (only the client module under them ran). The ratings, the Learning tab and the export were not clicked through in the desktop app, and the export's file download was not checked in the desktop app's WebView2.
 
 **Known rough edges.** Needle chose the right tool for 15 of 21 test requests among fifteen tools and called none of
 the six requests that needed none; it is a shortcut for clear requests, not the decider. Mirage described a plain grey

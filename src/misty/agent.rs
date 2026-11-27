@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use super::config::{Config, Policy};
 use super::env::Scope;
+use super::feedback;
 use super::roster::Role;
 use super::router::{self, Features};
 use super::runs::Run;
@@ -521,6 +522,26 @@ fn add_usage(total: &mut Value, u: &Value) {
     total["calls"] = json!(total["calls"].as_u64().unwrap_or(0) + 1);
 }
 
+/// Applies the owner's verdict on a question like this one to its route. A verdict that the reply needed no tool takes
+/// the tools away; one that it needed tools offers the ones the owner chose. Returns those tools by name when a verdict
+/// applied (none means a route without tools), and says why in the route's reasons.
+pub fn apply_taught(route: &mut router::Route, question: &str, verdicts: &[feedback::Verdict]) -> Option<Vec<String>> {
+    let taught = feedback::taught(question, verdicts)?;
+    let chosen: Vec<String> = if taught.label == feedback::Label::NoTools {
+        vec![]
+    } else {
+        taught.tools.clone()
+    };
+    route.reasons.push(if chosen.is_empty() {
+        "the owner taught that questions like this need no tool".to_string()
+    } else {
+        format!("the owner taught that questions like this use {}", chosen.join(", "))
+    });
+    route.tools = !chosen.is_empty();
+    route.reflex = route.reflex && route.tools;
+    Some(chosen)
+}
+
 /// Runs a request to the end. Always finishes the run's log; failures are in the outcome, not a panic.
 pub async fn run(ctx: &Ctx, req: Req, run: Arc<Run>) -> Outcome {
     let t0 = Instant::now();
@@ -631,6 +652,15 @@ async fn inner(ctx: &Ctx, req: &Req, run: &Run, out: &mut Outcome) -> Result<(),
         return Err("nothing to answer: the request has no text, audio or image".into());
     }
 
+    // the owner's verdicts: they route similar questions, and their corrections are notes beside them
+    let verdicts = match ctx.misty.state.feedback_all() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("misty: the owner's verdicts did not load: {e}");
+            vec![]
+        }
+    };
+
     // 2. route
     let (fleet, _) = ctx.misty.fleet(&ctx.hub).await;
     let mut f = Features::of(&input);
@@ -650,6 +680,12 @@ async fn inner(ctx: &Ctx, req: &Req, run: &Run, out: &mut Outcome) -> Result<(),
         route.tools = false;
         route.reflex = false;
     }
+    // a verdict the owner gave on a similar question decides its tools, unless this request names its own
+    let taught_tools = if req.tools.is_none() && !req.no_tools {
+        apply_taught(&mut route, &input, &verdicts)
+    } else {
+        None
+    };
     run.emit(
         json!({"type": "route", "role": route.role, "scores": route.scores, "reasons": route.reasons, "rag": route.rag,
                     "tools": route.tools, "reflex": route.reflex, "escalate_to": route.escalate_to, "features": f}),
@@ -672,15 +708,23 @@ async fn inner(ctx: &Ctx, req: &Req, run: &Run, out: &mut Outcome) -> Result<(),
     }
     out.citations = cites;
 
-    // 4. messages
+    // 4. messages. A correction the owner gave for a similar question is a note beside this one.
     let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system_prompt(&cfg, &scope, req, &docs)})];
     messages.extend(history);
-    messages.push(json!({"role": "user", "content": input}));
-    let specs = if route.tools || req.tools.is_some() {
+    let question = match feedback::correction_note(&input, &verdicts) {
+        Some(note) => format!("{input}\n\n{note}"),
+        None => input.clone(),
+    };
+    messages.push(json!({"role": "user", "content": question}));
+    let mut specs = if route.tools || req.tools.is_some() {
         offered(&cfg, req)
     } else {
         vec![]
     };
+    if let Some(names) = &taught_tools {
+        specs.retain(|s| names.iter().any(|n| n.as_str() == s.name));
+    }
+    run.emit(json!({"type": "offer", "tools": specs.iter().map(|s| s.name).collect::<Vec<_>>()}));
     let tool_defs: Vec<Value> = specs.iter().map(|s| s.openai()).collect();
 
     // 5. reflex: Needle picks an obvious tool; its calls run before the brain is asked anything
@@ -1052,6 +1096,119 @@ pub mod tests {
         assert_eq!(r.ctx.misty.state.history(&session, 10).unwrap().len(), 2);
         assert!(r.ctx.misty.state.run(&o.run).unwrap().is_some());
         assert!(run.is_done());
+    }
+
+    #[tokio::test]
+    async fn a_verdict_that_no_tool_was_needed_keeps_the_tools_off_for_a_similar_question() {
+        let r = rig(&MODELS, 0);
+        let v = crate::misty::feedback::Verdict::new(
+            "calculate 17*23 for me",
+            "391",
+            crate::misty::feedback::Label::NoTools,
+            vec![],
+            None,
+            1,
+        )
+        .unwrap();
+        r.ctx.misty.state.save_feedback(&v).unwrap();
+        r.llm.say("It is 391.");
+        let (o, run) = go(
+            &r,
+            Req {
+                input: "calculate 17*23 for me".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(o.status, "done", "{:?}", o.error);
+        let seen = r.llm.seen.lock();
+        assert!(
+            seen[0].1["tools"].as_array().map_or(true, |a| a.is_empty()),
+            "{}",
+            seen[0].1
+        );
+        drop(seen);
+        assert!(run
+            .events()
+            .iter()
+            .any(|e| e["type"] == "route" && e["reasons"].to_string().contains("need no tool")));
+    }
+
+    #[tokio::test]
+    async fn a_verdict_that_a_tool_was_needed_offers_the_tools_the_owner_chose_for_a_similar_question() {
+        let r = rig(&MODELS, 0);
+        let v = crate::misty::feedback::Verdict::new(
+            "hello there friend",
+            "Hi.",
+            crate::misty::feedback::Label::NeedsTools,
+            vec!["calc".into()],
+            None,
+            1,
+        )
+        .unwrap();
+        r.ctx.misty.state.save_feedback(&v).unwrap();
+        r.llm.say("Hi.");
+        let (o, run) = go(
+            &r,
+            Req {
+                input: "hello there friend".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(o.status, "done", "{:?}", o.error);
+        let seen = r.llm.seen.lock();
+        let names: Vec<&str> = seen[0].1["tools"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t["function"]["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, vec!["calc"]);
+        drop(seen);
+        assert!(run
+            .events()
+            .iter()
+            .any(|e| e["type"] == "offer" && e["tools"] == json!(["calc"])));
+    }
+
+    #[tokio::test]
+    async fn a_correction_the_owner_gave_is_a_note_beside_a_similar_question() {
+        let r = rig(&MODELS, 0);
+        let v = crate::misty::feedback::Verdict::new(
+            "capital of france",
+            "Lyon",
+            crate::misty::feedback::Label::Corrected,
+            vec![],
+            Some("Paris"),
+            1,
+        )
+        .unwrap();
+        r.ctx.misty.state.save_feedback(&v).unwrap();
+        r.llm.say("Paris.");
+        let (o, _) = go(
+            &r,
+            Req {
+                input: "capital of france".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(o.status, "done", "{:?}", o.error);
+        let seen = r.llm.seen.lock();
+        let user = seen[0].1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "user")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(seen);
+        assert!(
+            user.starts_with("capital of france") && user.contains("Correct answer: Paris"),
+            "{user}"
+        );
     }
 
     #[tokio::test]

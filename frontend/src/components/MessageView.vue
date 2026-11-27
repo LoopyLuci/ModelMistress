@@ -5,6 +5,7 @@
       <span v-if="msg.route?.role" class="pill good" title="The router chose this model for the message">router: {{ msg.route.role }}</span>
       <span class="grow"></span>
       <button v-if="msg.role === 'assistant' && msg.content" class="mini" type="button" @click="copyAll">{{ copied === 'all' ? 'Copied' : 'Copy' }}</button>
+      <button v-if="msg.role === 'assistant' && parts.answer" class="mini" type="button" :disabled="speaking" title="Hear this reply (the hub's voice)" @click="readAloud">{{ speaking ? 'Reading...' : 'Read aloud' }}</button>
       <button v-if="canRetry" class="mini" type="button" @click="emit('retry')">Regenerate</button>
     </header>
 
@@ -17,12 +18,26 @@
       <div class="thinktext">{{ parts.reasoning }}</div>
     </details>
 
-    <div v-if="msg.role === 'user'" class="usertext">{{ msg.content }}</div>
+    <template v-if="msg.role === 'user'">
+      <div v-if="msg.files?.length" class="filechips" aria-label="Attached files">
+        <span v-for="f in msg.files" :key="f.name" class="fchip">{{ f.name }}<span v-if="f.cut" class="muted small"> (cut to 2000 characters)</span></span>
+      </div>
+      <div class="usertext">{{ userText }}</div>
+    </template>
     <!-- eslint-disable-next-line vue/no-v-html -->
     <div v-else-if="parts.answer" class="md" @click="onClick" v-html="html"></div>
     <p v-else-if="streaming && !msg.error" class="muted wait">{{ waiting }}</p>
 
+    <div v-if="assets.length" class="assets" aria-label="Media in this reply">
+      <button v-for="a in assets" :key="a.id" class="asset" type="button" :title="`Open ${a.title} in the canvas`" @click="emit('open-asset', a.id)">
+        <img v-if="a.kind === 'image' && !isHubPath(a.src)" :src="a.src" :alt="a.title" loading="lazy" />
+        <span v-else class="glyph" aria-hidden="true">{{ glyph(a.kind) }}</span>
+        <span class="aname">{{ a.title }}</span>
+      </button>
+    </div>
+
     <p v-if="msg.error" class="error-box" role="alert">{{ msg.error }}</p>
+    <p v-if="speakError" class="error-box small" role="alert">{{ speakError }}</p>
     <p v-if="msg.stopped" class="muted small">Stopped.</p>
 
     <details v-if="msg.route?.why?.length" class="why muted small">
@@ -45,12 +60,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { renderMarkdown, splitThink } from '@/chat/markdown'
 import type { Msg } from '@/chat/store'
+import { extractAssets, isHubPath, type AssetKind } from '@/chat/media'
+import { notInBuild, speakClip } from '@/speech'
 
-const props = defineProps<{ msg: Msg; streaming?: boolean; canRetry?: boolean; waiting?: string }>()
-const emit = defineEmits<{ (e: 'retry'): void }>()
+const props = defineProps<{ msg: Msg; streaming?: boolean; canRetry?: boolean; waiting?: string; index?: number }>()
+const emit = defineEmits<{ (e: 'retry'): void; (e: 'open-asset', id: string): void }>()
+// the same ids the canvas uses: `<message index>-<n>`
+const assets = computed(() => (props.msg.role === 'assistant' ? extractAssets(props.msg.content || '', String(props.index ?? 0)) : []))
+const glyph = (k: AssetKind) => ({ image: 'IMG', video: 'VID', audio: 'AUD', model: '3D', svg: 'SVG', html: 'WEB', pdf: 'PDF', text: 'TXT', file: 'FILE' })[k]
 
 const parts = computed(() => {
   const m = props.msg
@@ -59,7 +79,36 @@ const parts = computed(() => {
   return { reasoning, answer: t.answer, thinking: t.thinking || (!!m.reasoning && !t.answer) }
 })
 const html = computed(() => renderMarkdown(parts.value.answer))
+/** The message as typed: the attached files' text (which follows it) is shown as chips, not as a block of text. */
+const userText = computed(() => {
+  const t = props.msg.content || ''
+  if (!props.msg.files?.length) return t
+  const i = t.indexOf('[File: ')
+  return i >= 0 ? t.slice(0, i).trimEnd() : t
+})
 const sec = (ms: number) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`)
+
+// ---- read aloud: the reply's words, spoken by the hub's voice ----------------------------------------------------------
+const speaking = ref(false)
+const speakError = ref('')
+let player: HTMLAudioElement | null = null
+async function readAloud() {
+  speakError.value = ''
+  speaking.value = true
+  try {
+    const clip = await speakClip(parts.value.answer)
+    const url = URL.createObjectURL(clip)
+    player?.pause()
+    player = new Audio(url)
+    player.onended = () => URL.revokeObjectURL(url)
+    await player.play()
+  } catch (e: any) {
+    speakError.value = notInBuild(e) ? 'Read aloud is not available in this build.' : `Read aloud: ${e?.message || e}`
+  } finally {
+    speaking.value = false
+  }
+}
+onBeforeUnmount(() => player?.pause())
 
 const copied = ref('')
 async function copy(text: string): Promise<boolean> {
@@ -103,6 +152,14 @@ async function onClick(e: MouseEvent) {
 .mini { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; font-size: 0.75rem; color: var(--muted); }
 .mini:hover { border-color: var(--accent); color: var(--text); }
 .usertext { white-space: pre-wrap; word-break: break-word; }
+.filechips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.fchip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 0.85rem; }
+.assets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.asset { display: flex; align-items: center; gap: 6px; max-width: 220px; padding: 3px 8px 3px 3px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; font-size: 0.8rem; color: var(--text); }
+.asset:hover { border-color: var(--accent); }
+.asset img { height: 44px; width: 44px; object-fit: cover; border-radius: 5px; }
+.glyph { display: inline-flex; align-items: center; justify-content: center; height: 44px; width: 44px; border-radius: 5px; background: var(--bg); font-size: 0.7rem; color: var(--muted); }
+.aname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .imgs img { max-height: 140px; max-width: 100%; border-radius: 8px; border: 1px solid var(--border); }
 .think { margin: 4px 0 8px; border: 1px dashed var(--border); border-radius: 8px; padding: 4px 10px; color: var(--muted); }

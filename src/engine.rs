@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 use crate::catalog::{self, ModelEntry, Roots};
 use crate::serving::{self, Plan, Resident, Resolved, ServeFlags, ServeProfile, Serving};
 
+/// The least a load that runs from disk (`paged`) is given to start, in seconds: it reads the whole file once.
+const PAGED_LOAD_TIMEOUT_S: u64 = 1800;
+
 /// An error with the HTTP status the hub should answer with.
 #[derive(Debug)]
 pub struct Fail {
@@ -126,6 +129,18 @@ pub struct Settings {
     /// MiB of each GPU's memory that models never use, left for the system (the desktop, the driver): the models
     /// together hold at most the card's total minus this (24,560 MiB card, 2048 reserved: 22,512 MiB, about 22 GB).
     pub vram_reserve_mib: u64,
+    /// Let a model that is bigger than the free RAM plus the VRAM models may use be loaded anyway, with its weights read
+    /// from disk as it runs (very slow), when the model's own `paged` flag is set too and someone loads it with
+    /// `model.load`. Off by default: such a load is refused with `insufficient_memory`, as it always was.
+    pub allow_paged_load: bool,
+    /// A model that was to run on the CPU, but whose weights do not fit in the free RAM, puts as many layers on a card
+    /// that has room as it takes to fit (the free VRAM extends the RAM, and those layers run on the GPU too). A model
+    /// that fits in RAM stays on the CPU. Off: it is read from disk as it runs, as before.
+    pub vram_extends_ram: bool,
+    /// A mixture-of-experts model that does not fit the card whole is served by Rigel with paged experts, when Rigel is
+    /// installed and neither the profile nor the load names an engine or where the experts go. Rigel's paging measured
+    /// 2 to 3 times the speed of llama.cpp's `--cpu-moe` at the same VRAM. Off: llama.cpp, as before.
+    pub auto_rigel: bool,
     /// Give each llama-server a thread count (`-t`) that leaves the cores a CPU model and a GPU model both need (see
     /// [`serving::thread_budget`]). A thread setting of a profile, a load or `extra_args` wins. Off: llama-server's own
     /// default (all physical cores) for every server.
@@ -212,6 +227,9 @@ impl Default for Settings {
             vram_guard: true,
             vram_margin_mib: 768,
             vram_reserve_mib: 2048,
+            allow_paged_load: false,
+            vram_extends_ram: true,
+            auto_rigel: true,
             thread_budget: true,
             autoload: true,
             load_timeout_s: 300,
@@ -950,6 +968,15 @@ impl Engine {
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
+        // stable-diffusion.cpp's Vulkan cooperative-matrix kernels abort the process (0xC0000409, no message) on the
+        // RX 7900 XTX with the MOSS-Image and Qwen3.5 graphs; the plain kernels render them. A value the owner set wins.
+        if name == "sd-cli" {
+            for var in ["GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2"] {
+                if std::env::var_os(var).is_none() {
+                    cmd.env(var, "1");
+                }
+            }
+        }
         no_window(&mut cmd);
         #[cfg(target_os = "linux")]
         unsafe {
@@ -1184,6 +1211,18 @@ impl Engine {
                 format!("{} is not loaded (autoload is off)", entry.id),
             ));
         }
+        // a model that would run from disk (very slow, and it loads for minutes) is never loaded by a request: peers,
+        // Misty and `auto` reach it only through this path, so someone has to load it on purpose
+        if !explicit && self.is_paged(entry, opts).await {
+            return Err(Fail::new(
+                409,
+                "needs_explicit_load",
+                format!(
+                    "{} is bigger than the memory available and is set to run from disk, which is very slow; load it with model.load first",
+                    entry.id
+                ),
+            ));
+        }
         let _guard = self.load_lock.lock().await;
         if !reload {
             if let Some(i) = self.loaded.lock().get(&entry.id).cloned() {
@@ -1205,6 +1244,20 @@ impl Engine {
         mm.loads += 1;
         mm.last_load_ms = t0.elapsed().as_millis() as u64;
         Ok(inst)
+    }
+
+    /// Whether a load of this model would be placed as [`serving::Fit::Paged`] (needs `allow_paged_load` and the model's
+    /// `paged` flag, and a model that fits neither the GPU nor RAM).
+    pub async fn is_paged(&self, entry: &ModelEntry, opts: &LoadOpts) -> bool {
+        let s = self.settings();
+        if !s.allow_paged_load || self.resolve_serving(&s, entry, opts).flags.paged != Some(true) {
+            return false;
+        }
+        let devices = self.gpu_devices_recent().await;
+        matches!(
+            self.placement_for(entry, opts, &devices),
+            Some(serving::Fit::Paged { .. })
+        )
     }
 
     /// Put an instance into service as its model's one. One already there is retired: it takes no new requests
@@ -1255,6 +1308,20 @@ impl Engine {
         embeddings: bool,
         on_stop: Option<Box<dyn FnOnce() + Send>>,
     ) -> Arc<Instance> {
+        self.adopt_with_log(model, port, key, embeddings, PathBuf::new(), on_stop)
+    }
+
+    /// [`adopt_as`](Self::adopt_as) for a stand-in with a server log (for `logs.tail` and `model.telemetry`).
+    #[doc(hidden)]
+    pub fn adopt_with_log(
+        &self,
+        model: &str,
+        port: u16,
+        key: &str,
+        embeddings: bool,
+        log: PathBuf,
+        on_stop: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Arc<Instance> {
         let inst = Arc::new(Instance {
             model: model.to_string(),
             port,
@@ -1263,7 +1330,7 @@ impl Engine {
             child: Mutex::new(None),
             started: Instant::now(),
             args: vec![],
-            log: PathBuf::new(),
+            log,
             embeddings,
             reranking: false,
             opts: LoadOpts::default(),
@@ -1427,6 +1494,13 @@ impl Engine {
             cpu_moe,
             n_cpu_moe: opts.n_cpu_moe.unwrap_or(0) as u64,
             extra_gpu_bytes: draft,
+            kv_unified: r.flags.kv_unified.unwrap_or(false),
+            swa_full: self
+                .settings()
+                .extra_args
+                .iter()
+                .chain(opts.extra_args.iter())
+                .any(|a| a == "--swa-full"),
         };
         Some(serving::estimate_vram(&shape, &placement)).filter(|e| e.total_mib > 0)
     }
@@ -1531,6 +1605,7 @@ impl Engine {
                 ),
                 Some(serving::Fit::Cpu) => ("cpu", Some(0.0), Some(0), Some(file_mib)),
                 Some(serving::Fit::No { .. }) => ("none", None, est.map(|e| e.total_mib), None),
+                Some(serving::Fit::Paged { .. }) => ("paged", None, est.map(|e| e.total_mib), None),
                 // no estimate (the header lacks the shape): the GPU is tried first, as a load would
                 None => ("gpu", None, None, None),
             }
@@ -1541,6 +1616,7 @@ impl Engine {
             ("gpu", _) => "GPU".to_string(),
             ("cpu", _) => "CPU".to_string(),
             ("none", _) => "does not fit".to_string(),
+            ("paged", _) => "from disk (slow)".to_string(),
             _ => "?".to_string(),
         };
         json!({
@@ -1790,12 +1866,13 @@ impl Engine {
         if let Some(b) = self.learned_budget_mib(devices, &r) {
             free = free.min(b.saturating_add(s.vram_margin_mib));
         }
-        Some(serving::place(
+        Some(serving::place_with(
             &est,
             free,
             s.vram_margin_mib,
             &self.residents(&entry.id),
             free_ram_mib(),
+            s.allow_paged_load && r.flags.paged == Some(true),
         ))
     }
 
@@ -1808,7 +1885,11 @@ impl Engine {
         devices: &[serving::Device],
     ) -> Result<Option<(Vec<String>, u64)>> {
         match self.placement_for(entry, opts, devices) {
-            None | Some(serving::Fit::Gpu) | Some(serving::Fit::Split { .. }) | Some(serving::Fit::Cpu) => Ok(None),
+            None
+            | Some(serving::Fit::Gpu)
+            | Some(serving::Fit::Split { .. })
+            | Some(serving::Fit::Cpu)
+            | Some(serving::Fit::Paged { .. }) => Ok(None),
             Some(serving::Fit::GpuAfter(models, want)) => Ok(Some((models, want))),
             Some(serving::Fit::No {
                 need_ram_mib,
@@ -1819,7 +1900,7 @@ impl Engine {
                     503,
                     "insufficient_memory",
                     format!(
- "{} does not fit this machine as asked: with the {free} MiB of VRAM that models may use it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization.",
+ "{} does not fit this machine as asked: with the {free} MiB of VRAM that models may use it would still need about {need_ram_mib} MiB of RAM, and {free_ram_mib} MiB are available. Unload other models, lower ctx_size or parallel, use a smaller KV-cache type (cache_type_k/cache_type_v), or take a smaller quantization. To try it from disk, which is very slow, turn on allow_paged_load in the settings, set paged on the model's profile, and load it with model.load.",
                         entry.id
                     ),
                 ))
@@ -1847,13 +1928,84 @@ impl Engine {
 
     /// Whether llama-server can choose the GPU layers itself (`--fit`): the stock llama.cpp, in a build that has it.
     async fn fits_itself(&self, r: &Resolved) -> bool {
-        if r.flags.is_rigel() || r.flags.is_prism() {
+        if r.flags.is_prism() {
             return false;
+        }
+        if r.flags.is_rigel() {
+            // Rigel's own `--fit` (measured: it splits the layers between the card and the CPU). With paged experts the
+            // experts are Rigel's to place, so the layer count stays what was asked for.
+            if r.flags.moe_direct_io == Some(true) {
+                return false;
+            }
+            let Some(exe) = self.rigel_server() else {
+                return false;
+            };
+            return self.server_has_flag(&exe, "--fit").await;
         }
         let Some(exe) = self.llama_server() else {
             return false;
         };
         self.server_has_flag(&exe, "--fit").await
+    }
+
+    /// Whether a load should go to Rigel with paged experts, and with how many VRAM slots: a mixture-of-experts model
+    /// that does not fit the card whole, where nothing says where its experts go (see [`Settings::auto_rigel`]).
+    async fn auto_rigel(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<(u64, String)> {
+        if r.gpu_layers == 0 || opts.cpu_moe.is_some() || opts.n_cpu_moe.is_some() || self.rigel_server().is_none() {
+            return None;
+        }
+        let count = entry.experts()?;
+        let shape = serving::shape_from_meta(&entry.meta, entry.size_bytes)?;
+        if shape.expert_share <= 0.0 {
+            return None;
+        }
+        let devices = self.gpu_devices_recent().await;
+        if devices.is_empty()
+            || !matches!(
+                self.placement_for(entry, opts, &devices)?,
+                serving::Fit::Split { .. } | serving::Fit::Cpu
+            )
+        {
+            return None;
+        }
+        let mut paged = r.clone();
+        paged.flags.engine = Some("rigel".into());
+        paged.flags.moe_direct_io = Some(true);
+        paged.gpu_layers = 999;
+        let est = self.estimate_for(entry, opts, &paged)?;
+        let budget = self.plannable_free(&devices, &self.settings(), &entry.id);
+        let slots = serving::paged_slots(&shape, count, &est, budget)?;
+        Some((
+            slots,
+            format!("a mixture-of-experts model too big for the card: served by Rigel with {slots} expert slots in VRAM (auto_rigel)"),
+        ))
+    }
+
+    /// Layers to put on the card for a load that was to run on the CPU but does not fit the free RAM (see
+    /// [`Settings::vram_extends_ram`] and [`serving::spill_layers`]). None: it fits, or no card can take any.
+    async fn vram_spill(&self, entry: &ModelEntry, opts: &LoadOpts, r: &Resolved) -> Option<i32> {
+        let s = self.settings();
+        let file_mib = entry.size_bytes / (1024 * 1024);
+        if !s.vram_extends_ram || file_mib + serving::RAM_OVERHEAD_MIB <= free_ram_mib() {
+            return None;
+        }
+        let devices = self.gpu_devices_recent().await;
+        if !self.can_use_gpu(r, &devices) {
+            return None;
+        }
+        let shape = serving::shape_from_meta(&entry.meta, entry.size_bytes)?;
+        let every = Resolved {
+            gpu_layers: 999,
+            fit_target_mib: None,
+            ..r.clone()
+        };
+        let est = self.estimate_for(entry, opts, &every)?;
+        let mut free = self.plannable_free(&devices, &s, &entry.id);
+        if let Some(b) = self.learned_budget_mib(&devices, &every) {
+            free = free.min(b.saturating_add(s.vram_margin_mib));
+        }
+        let n = serving::spill_layers(&est, shape.layers, file_mib, free_ram_mib(), free, s.vram_margin_mib);
+        (n > 0).then_some(n as i32)
     }
 
     /// Whether `exe --help` lists `flag`. Only a real answer is remembered.
@@ -1866,6 +2018,15 @@ impl Engine {
         cmd.arg("--help").stdin(std::process::Stdio::null()).kill_on_drop(true);
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
+        }
+        // a HIP build cannot even print its help without the runtime on PATH
+        if exe
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("rigel"))
+        {
+            if let Some(path) = hip_runtime_path(std::env::var_os("HIP_PATH"), std::env::var_os("PATH")) {
+                cmd.env("PATH", path);
+            }
         }
         no_window(&mut cmd);
         let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(20), cmd.output()).await else {
@@ -1903,12 +2064,67 @@ impl Engine {
         } else {
             None
         };
+        // the layers the server says it put on the GPU (its log has them at verbosity 4)
+        let layers = crate::loadlog::parse(&log).summary();
         let mut sv = inst.serving.write();
         if let Some(p) = props {
             sv.apply_props(&p);
         }
         sv.vram_mib = process.map(|m| m as f64).or_else(|| serving::vram_from_log(&log));
         sv.estimated_vram_mib = estimate;
+        sv.layers = layers;
+    }
+
+    /// How a loaded model runs, for `model.telemetry`: the server's own account of the load (layers, buffers, the
+    /// memory fit, the KV cache, the compute graph, how long each stage took), what it holds on the GPU now, the
+    /// timings of its latest requests and its own counters (`/metrics`, `/slots`).
+    pub async fn telemetry(&self, inst: &Instance) -> Value {
+        // the load is at the top of the log and the latest requests at the end: a log that has grown is not read whole
+        let report = crate::loadlog::parse(&read_head(&inst.log, 1 << 20));
+        let requests = crate::loadlog::recent_requests(&read_tail(&inst.log, 256 << 10), 10);
+        let fetch = |path: &'static str| {
+            let req = self
+                .http
+                .get(format!("http://127.0.0.1:{}{path}", inst.port))
+                .bearer_auth(&inst.key)
+                .timeout(Duration::from_secs(5));
+            async move {
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => r.text().await.ok(),
+                    _ => None,
+                }
+            }
+        };
+        let counters = fetch("/metrics").await.map(|t| crate::loadlog::parse_prometheus(&t));
+        let slots = fetch("/slots")
+            .await
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .map(|v| crate::loadlog::slots_summary(&v));
+        let gpu_now = if inst.pid > 0 {
+            typeperf(&format!(r"\GPU Process Memory(pid_{}_*)\Dedicated Usage", inst.pid))
+                .await
+                .and_then(|t| serving::process_used_mib(&t))
+        } else {
+            None
+        };
+        let sv = inst.serving();
+        let hub = self.metrics.lock().get(&inst.model).cloned();
+        crate::loadlog::prune(json!({
+            "model": inst.model, "pid": inst.pid, "port": inst.port,
+            "uptime_s": inst.started.elapsed().as_secs(), "args": inst.args,
+            "placement": {
+                "where": sv.placement, "note": sv.placement_note, "layers": sv.layers,
+                "line": sv.layers.as_ref().map(crate::loadlog::describe_layers),
+                "vram_mib": sv.vram_mib, "estimated_vram_mib": sv.estimated_vram_mib,
+                "gpu_dedicated_now_mib": gpu_now,
+            },
+            "load": report.to_json(),
+            "runtime": {
+                "recent_requests": requests.iter().map(crate::loadlog::timing_json).collect::<Vec<_>>(),
+                "server_counters": counters, "slots": slots, "hub": hub,
+            },
+            "logs": log_files(&inst.log),
+        }))
     }
 
     /// The server program a load with `r` runs.
@@ -1949,11 +2165,24 @@ impl Engine {
         self.learned
             .lock()
             .get(&entry.id)
-            .filter(|l| !key.is_empty() && l.engine == key)
+            .filter(|l| !key.is_empty() && l.engine == key && !l.safe_kernels)
             .map(|l| l.why.clone())
     }
 
+    /// Whether an earlier load of this model crashed on the GPU and worked with the cooperative-matrix kernels off.
+    fn learned_safe_kernels(&self, entry: &ModelEntry, r: &Resolved) -> bool {
+        let key = self.engine_key(r);
+        self.learned
+            .lock()
+            .get(&entry.id)
+            .is_some_and(|l| !key.is_empty() && l.engine == key && l.safe_kernels)
+    }
+
     fn learn(&self, entry: &ModelEntry, r: &Resolved, why: String) {
+        self.learn_as(entry, r, why, false);
+    }
+
+    fn learn_as(&self, entry: &ModelEntry, r: &Resolved, why: String, safe_kernels: bool) {
         let mut all = self.learned.lock();
         all.insert(
             entry.id.clone(),
@@ -1961,6 +2190,7 @@ impl Engine {
                 engine: self.engine_key(r),
                 why,
                 at: now_s(),
+                safe_kernels,
             },
         );
         save_learned(&self.home, &all);
@@ -2186,11 +2416,27 @@ impl Engine {
         }
         let mut history: Vec<String> = vec![];
         let mut crash_why: Option<String> = None;
+        // Vulkan's cooperative-matrix kernels crash some graphs in the driver (measured: MOSS-Image, Qwen3.5 and
+        // Inkling 2 on an RX 7900 XTX abort with 0xC0000409 and no message). A GPU crash gets one more try on the GPU
+        // with them off before the CPU; it is remembered, so the next load starts that way.
+        let mut safe_kernels = false;
+        let mut safe_from_crash: Option<String> = None;
+        if how == Try::Asked && r.is_auto() && s.gpu_fallback && !opts.retry_gpu && self.learned_safe_kernels(entry, &r)
+        {
+            safe_kernels = true;
+            note = Some(
+                "on the GPU with Vulkan's cooperative-matrix kernels off: an earlier load crashed with them on. Load it \
+                 with retry_gpu: true to try them again"
+                    .into(),
+            );
+        }
         loop {
-            match self.spawn(entry, opts, &how, counted).await {
+            match self.spawn(entry, opts, &how, counted, safe_kernels).await {
                 Ok(inst) => {
                     if let (Some(why), Try::Cpu) = (&crash_why, &how) {
                         self.learn(entry, &r, why.clone());
+                    } else if let (Some(why), true) = (&safe_from_crash, how != Try::Cpu) {
+                        self.learn_as(entry, &r, why.clone(), true);
                     } else if opts.retry_gpu && how != Try::Cpu {
                         self.forget(&entry.id);
                     }
@@ -2202,6 +2448,12 @@ impl Engine {
                     if !history.is_empty() {
                         let tail = if how == Try::Cpu { "; it runs on the CPU" } else { "" };
                         note = Some(format!("{}{tail}", history.join("; ")));
+                    } else if let Try::Held { budget, .. } = &how {
+                        if let Some(n) =
+                            held_note_after_load(*budget, &inst.serving(), crate::loadlog::moves_tensors(&inst.args))
+                        {
+                            note = Some(n);
+                        }
                     }
                     if note.is_some() {
                         inst.serving.write().placement_note = note;
@@ -2209,6 +2461,24 @@ impl Engine {
                     return Ok(inst);
                 }
                 Err(mut f) => {
+                    if !safe_kernels
+                        && s.gpu_fallback
+                        && how != Try::Cpu
+                        && r.gpu_layers != 0
+                        && f.fields["gpu_failure"].as_str() == Some("crash")
+                    {
+                        let code = f.fields["exit_code"]
+                            .as_i64()
+                            .map(|c| format!(" (exit {:#X})", c as i32 as u32))
+                            .unwrap_or_default();
+                        let why = format!("its load on the GPU crashed llama-server{code}");
+                        history.push(format!(
+                            "{why}, so it was tried again with Vulkan's cooperative-matrix kernels off"
+                        ));
+                        safe_kernels = true;
+                        safe_from_crash = Some(why);
+                        continue;
+                    }
                     let Some((next, why, crash)) = self
                         .after_failure(&s, &r, entry, &how, &f, &ground, history.len())
                         .await
@@ -2284,13 +2554,31 @@ impl Engine {
         Some((Try::Cpu, cause, crash))
     }
 
-    async fn spawn(&self, entry: &ModelEntry, opts: &LoadOpts, how: &Try, gpu_counted: bool) -> Result<Instance> {
+    async fn spawn(
+        &self,
+        entry: &ModelEntry,
+        opts: &LoadOpts,
+        how: &Try,
+        gpu_counted: bool,
+        safe_kernels: bool,
+    ) -> Result<Instance> {
         let mut resolved = self.resolve_serving(&self.settings(), entry, opts);
         resolved
             .validate()
             .map_err(|e| Fail::invalid(format!("{}: {e}", entry.id)))?;
         if *how == Try::Cpu {
             resolved.gpu_layers = 0;
+        }
+        let mut spill_note = None;
+        // a mixture-of-experts model too big for the card goes to Rigel, which pages its experts through VRAM slots
+        if self.settings().auto_rigel && resolved.flags.engine.is_none() && !opts.embeddings && !opts.reranking {
+            if let Some((slots, note)) = self.auto_rigel(entry, opts, &resolved).await {
+                resolved.flags.engine = Some("rigel".into());
+                resolved.flags.moe_direct_io = Some(true);
+                resolved.flags.moe_slots = Some(slots as u32);
+                resolved.slots = 1;
+                spill_note = Some(note);
+            }
         }
         let rigel = resolved.flags.is_rigel();
         if !resolved.flags.is_prism() && !rigel {
@@ -2338,6 +2626,15 @@ impl Engine {
             })?
         };
         let s = self.settings();
+        // a CPU load that does not fit the free RAM borrows the card's free memory for the layers that do not fit
+        if resolved.gpu_layers == 0 && *how != Try::Cpu && !opts.embeddings && !opts.reranking {
+            if let Some(n) = self.vram_spill(entry, opts, &resolved).await {
+                spill_note = Some(format!(
+                    "the weights do not fit the free RAM: {n} layers went to the GPU's free memory (vram_extends_ram)"
+                ));
+                resolved.gpu_layers = n;
+            }
+        }
         // llama-server chooses the number of GPU layers itself where it can: it measures what is free on each device,
         // which is more exact than a header-based estimate, and it moves experts of a mixture-of-experts model to RAM.
         if resolved.is_auto() && self.fits_itself(&resolved).await {
@@ -2370,7 +2667,49 @@ impl Engine {
         {
             args.extend(["-dev".into(), "none".into()]);
         }
+        // A Prism (Bonsai) model wholly on the card keeps its weights in VRAM only: the default memory map would also keep
+        // the file in the server's working set (measured, 9B ternary: 2.2 GB of RAM against 0.45 GB with `-lm none`, the
+        // same 131 tokens/s on the card).
+        if resolved.flags.is_prism()
+            && resolved.gpu_layers >= 999
+            && !args.iter().any(|a| a == "-lm" || a == "--load-mode")
+            && self.server_has_flag(&exe, "--load-mode").await
+        {
+            args.extend(["-lm".into(), "none".into()]);
+        }
+        // Rigel wholly on the card keeps its weights in VRAM only (measured, 22 GB MoE: 1.8 GB of RAM against 22.7 GB,
+        // 60.5 against 54.1 tokens/s). Not with paged experts: they need the memory map.
+        if rigel
+            && resolved.flags.moe_direct_io != Some(true)
+            && resolved.gpu_layers >= 999
+            && !s
+                .extra_args
+                .iter()
+                .chain(opts.extra_args.iter())
+                .any(|a| a == "-lm" || a == "--load-mode")
+            && self.server_has_flag(&exe, "--load-mode").await
+        {
+            let devices = self.gpu_devices_recent().await;
+            if matches!(
+                self.placement_for(entry, opts, &devices),
+                Some(serving::Fit::Gpu) | Some(serving::Fit::GpuAfter(..))
+            ) {
+                args.extend(["-lm".into(), "none".into()]);
+            }
+        }
         args.push("--metrics".into());
+        // llama.cpp prints how it placed a model (the layers on each device, every buffer, the KV cache, the graph
+        // splits, the memory fit) at verbosity 4 only. The hub reads those lines for where the weights are and for
+        // `model.telemetry`; a verbosity the owner's own arguments set stands, and a server that does not list the
+        // flag is not given it.
+        if !rigel
+            && !resolved.flags.is_prism()
+            && !crate::loadlog::sets_verbosity(&s.extra_args)
+            && !crate::loadlog::sets_verbosity(&opts.extra_args)
+            && self.server_has_flag(&exe, "--log-verbosity").await
+        {
+            args.extend(["-lv".into(), "4".into()]);
+        }
         let user_threads =
             opts.threads.is_some() || serving::sets_threads(&s.extra_args) || serving::sets_threads(&opts.extra_args);
         if let Some(t) = opts.threads {
@@ -2380,7 +2719,10 @@ impl Engine {
                 args.extend(["-t".into(), t.to_string()]);
             }
         }
-        args.extend(moe_args(entry, opts));
+        // paged Rigel places the experts itself: `--cpu-moe` on top would take them off the card for good
+        if !(rigel && resolved.flags.moe_direct_io == Some(true)) {
+            args.extend(moe_args(entry, opts));
+        }
         if opts.reranking {
             args.push("--reranking".into());
         } else if opts.embeddings {
@@ -2400,8 +2742,12 @@ impl Engine {
         let logs = self.home.join("logs");
         let _ = std::fs::create_dir_all(&logs);
         let log = logs.join(format!("{}.log", safe_name(&entry.id)));
+        // the log of the load before this one stays as `<model>.1.log` (and so on): when a load crashed and is tried
+        // again, the crash is what the owner needs to read
+        rotate_logs(&log, LOGS_KEPT);
         let out = std::fs::File::create(&log).map_err(|e| Fail::new(500, "io", format!("{}: {e}", log.display())))?;
         let err = out.try_clone().map_err(|e| Fail::new(500, "io", e.to_string()))?;
+        let head = out.try_clone().map_err(|e| Fail::new(500, "io", e.to_string()))?;
 
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(&args)
@@ -2418,6 +2764,41 @@ impl Engine {
             if let Some(path) = hip_runtime_path(std::env::var_os("HIP_PATH"), std::env::var_os("PATH")) {
                 cmd.env("PATH", path);
             }
+        }
+        // a GPU load that crashed the server once: Vulkan's cooperative-matrix kernels off (the variables mean nothing
+        // to a server built for another backend)
+        let mut env_set = resolved.env();
+        if safe_kernels && resolved.gpu_layers != 0 {
+            for var in ["GGML_VK_DISABLE_COOPMAT", "GGML_VK_DISABLE_COOPMAT2"] {
+                if std::env::var_os(var).is_none() {
+                    cmd.env(var, "1");
+                    env_set.push((var.to_string(), "1".to_string()));
+                }
+            }
+        }
+        // what the hub runs, and why, goes first in the log: it says how the load was made even when the server dies
+        // before it prints a line
+        {
+            use std::io::Write;
+            let attempt = format!(
+                "{} {how:?}{}",
+                entry.id,
+                if safe_kernels {
+                    " (a GPU load of it crashed the server: Vulkan's cooperative-matrix kernels are off)"
+                } else {
+                    ""
+                }
+            );
+            let text = crate::loadlog::log_header(
+                env!("CARGO_PKG_VERSION"),
+                now_s(),
+                &exe.display().to_string(),
+                &args,
+                &env_set,
+                &attempt,
+            );
+            let mut head = head;
+            let _ = head.write_all(text.as_bytes());
         }
         no_window(&mut cmd);
         #[cfg(target_os = "linux")]
@@ -2474,7 +2855,13 @@ impl Engine {
             on_stop: Mutex::new(None),
         };
         // Wait until it answers /health with 200 (it answers 503 while loading).
-        let deadline = Instant::now() + Duration::from_secs(s.load_timeout_s.max(5));
+        // a model that runs from disk touches every page once before it answers
+        let timeout_s = if self.is_paged(entry, opts).await {
+            s.load_timeout_s.max(PAGED_LOAD_TIMEOUT_S)
+        } else {
+            s.load_timeout_s.max(5)
+        };
+        let deadline = Instant::now() + Duration::from_secs(timeout_s);
         let url = format!("http://127.0.0.1:{port}/health");
         let estimate = self.estimate_for(entry, opts, &resolved).map(|e| e.total_mib);
         loop {
@@ -2515,8 +2902,17 @@ impl Engine {
                         .map(|e| e.weights_mib + e.kv_mib + e.state_mib);
                     {
                         let mut sv = inst.serving.write();
-                        sv.placement =
-                            serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers);
+                        // the server's own count of the layers on the GPU, when its log has it, beats a guess from the
+                        // memory it holds (a model whose estimate is high looked "partial" while every layer was on the card)
+                        let counted = sv.layers.as_ref().and_then(|l| {
+                            crate::loadlog::placement_from_layers(l, crate::loadlog::moves_tensors(&inst.args))
+                        });
+                        sv.placement = counted.unwrap_or_else(|| {
+                            serving::placement_of(sv.vram_mib, gpu_counted, full, resolved.gpu_layers, layers)
+                        });
+                        if sv.placement_note.is_none() {
+                            sv.placement_note = spill_note;
+                        }
                     }
                     return Ok(inst);
                 }
@@ -2529,7 +2925,7 @@ impl Engine {
                     format!(
                         "{} did not finish loading in {} s:\n{}",
                         entry.id,
-                        s.load_timeout_s,
+                        timeout_s,
                         tail(&log, 15)
                     ),
                 ));
@@ -2871,6 +3267,10 @@ struct Learned {
     engine: String,
     why: String,
     at: u64,
+    /// The load crashed on the GPU, and worked there with Vulkan's cooperative-matrix kernels off: the model stays on
+    /// the GPU, started that way, instead of going to the CPU.
+    #[serde(default)]
+    safe_kernels: bool,
 }
 
 fn load_learned(home: &Path) -> BTreeMap<String, Learned> {
@@ -2936,6 +3336,97 @@ async fn typeperf(counter: &str) -> Option<String> {
 
 fn free_port() -> std::io::Result<u16> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+}
+
+/// The note of a load that was held to `budget` MiB because its estimate was over what the card allows ("the rest stays
+/// in RAM"), corrected once the server's own log shows every layer on the card: the estimate was too high, and the
+/// part that was to stay in RAM did not exist. None when the log does not say that, and the note stands.
+fn held_note_after_load(budget: u64, sv: &Serving, moves_tensors: bool) -> Option<String> {
+    let layers = sv.layers.as_ref()?;
+    if crate::loadlog::placement_from_layers(layers, moves_tensors) != Some("gpu") {
+        return None;
+    }
+    let estimate = sv
+        .estimated_vram_mib
+        .map(|e| format!("The estimate of {e} MiB"))
+        .unwrap_or_else(|| "The estimate".into());
+    let held = sv
+        .vram_mib
+        .map(|v| format!(" ({v:.0} MiB on the card)"))
+        .unwrap_or_default();
+    Some(format!(
+        "{estimate} was more than the card allows, so the load was held to {budget} MiB; llama-server's own fit then \
+         put every layer on the GPU{held}"
+    ))
+}
+
+/// Earlier loads' logs kept beside a model's current one (`<model>.1.log` is the load before this one).
+const LOGS_KEPT: usize = 3;
+
+/// `<model>.log` for 0, `<model>.1.log` for 1, and so on.
+pub fn numbered_log(log: &Path, n: usize) -> PathBuf {
+    if n == 0 {
+        log.to_path_buf()
+    } else {
+        log.with_extension(format!("{n}.log"))
+    }
+}
+
+/// Moves `<model>.log` to `<model>.1.log`, that one to `.2.log` and so on, and drops the oldest. A move that fails
+/// (a file another program holds) leaves the old log to be overwritten, as before.
+fn rotate_logs(log: &Path, keep: usize) {
+    let _ = std::fs::remove_file(numbered_log(log, keep));
+    for n in (1..keep).rev() {
+        let from = numbered_log(log, n);
+        if from.exists() {
+            let _ = std::fs::rename(&from, numbered_log(log, n + 1));
+        }
+    }
+    if log.exists() {
+        let _ = std::fs::rename(log, numbered_log(log, 1));
+    }
+}
+
+/// The logs kept for a model: path, size and when each was last written.
+fn log_files(log: &Path) -> Vec<Value> {
+    (0..=LOGS_KEPT)
+        .filter_map(|n| {
+            let p = numbered_log(log, n);
+            let meta = std::fs::metadata(&p).ok()?;
+            let at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(
+                json!({"load": if n == 0 { "this".to_string() } else { format!("{n} before") },
+                        "file": p, "bytes": meta.len(), "modified": crate::loadlog::iso_utc(at)}),
+            )
+        })
+        .collect()
+}
+
+/// At most `max` bytes from the start of a file (a server's log opens with its load).
+fn read_head(path: &Path, max: u64) -> String {
+    use std::io::Read;
+    let mut raw = vec![];
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(max).read_to_end(&mut raw);
+    }
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// At most `max` bytes from the end of a file (a server's log ends with its latest requests).
+fn read_tail(path: &Path, max: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut raw = vec![];
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(max)));
+        let _ = f.read_to_end(&mut raw);
+    }
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn safe_name(id: &str) -> String {
@@ -3995,6 +4486,7 @@ parallel = 1
                  if \"%1\"==\"--help\" goto help\r\n\
                  if \"%1\"==\"--list-devices\" exit /b 0\r\n\
                  echo %* >>\"%~dp0calls.txt\"\r\n\
+                 echo coopmat=%GGML_VK_DISABLE_COOPMAT% >>\"%~dp0env.txt\"\r\n\
                  echo %* | findstr /C:\"-dev none\" >nul\r\n\
                  if not errorlevel 1 exit /b 3\r\n\
                  if exist \"%~dp0oom\" (echo ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory& exit /b 1)\r\n\
@@ -4016,6 +4508,7 @@ parallel = 1
                  case \"$1\" in --help) echo '--fit --device'; exit 0;; --list-devices) exit 0;; esac\n\
                  here=$(dirname \"$0\")\n\
                  echo \"$@\" >> \"$here/calls.txt\"\n\
+                 echo \"coopmat=$GGML_VK_DISABLE_COOPMAT\" >> \"$here/env.txt\"\n\
                  case \"$*\" in *'-dev none'*) exit 3;; esac\n\
                  if [ -e \"$here/oom\" ]; then echo 'ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory'; exit 1; fi\n\
                  kill -SEGV $$\n",
@@ -4029,6 +4522,16 @@ parallel = 1
     /// The starts the stand-in has seen, one line each.
     fn starts(dir: &Path) -> Vec<String> {
         std::fs::read_to_string(dir.join("calls.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// What each start of the stand-in saw of `GGML_VK_DISABLE_COOPMAT`, one line each (`coopmat=` when unset).
+    fn coopmat_seen(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("env.txt"))
             .unwrap_or_default()
             .lines()
             .map(|l| l.trim().to_string())
@@ -4067,14 +4570,25 @@ parallel = 1
             f.message
         );
         assert!(
-            f.message
-                .contains("(before this: its load on the GPU crashed llama-server (exit 0xC0000409))")
-                || cfg!(not(windows)),
+            f.message.contains(
+                concat!(
+                    "(before this: its load on the GPU crashed llama-server (exit 0xC0000409), so it was tried again ",
+                    "with Vulkan's cooperative-matrix kernels off; its load on the GPU crashed llama-server (exit 0xC0000409))"
+                )
+            ) || cfg!(not(windows)),
             "{}",
             f.message
         );
         let seen = starts(&d);
-        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        // the same GPU start twice, the second with the cooperative-matrix kernels off, then the CPU
+        assert_eq!(coopmat_seen(&d), ["coopmat=", "coopmat=1", "coopmat="]);
+        let without_port = |l: &str| {
+            l.split(" --port ")
+                .map(|p| p.split_once(' ').map_or("", |x| x.1).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(without_port(&seen[0]), without_port(&seen[1]), "{seen:?}");
         // first as asked: llama-server fits the layers itself, keeping the margin free
         let margin = e.settings().vram_margin_mib.max(512);
         assert!(
@@ -4089,14 +4603,277 @@ parallel = 1
         );
         // then nothing on the GPU, and no GPU backend either
         assert!(
-            seen[1].contains("-ngl 0") && seen[1].contains("-dev none"),
+            seen[2].contains("-ngl 0") && seen[2].contains("-dev none"),
             "{}",
-            seen[1]
+            seen[2]
         );
-        assert!(!seen[1].contains("--fit"), "{}", seen[1]);
+        assert!(!seen[2].contains("--fit"), "{}", seen[2]);
         // a crash is remembered only when the CPU start worked, and here it did not
         assert!(!d.join("placements.json").exists());
         assert_eq!(e.loaded().len(), 0);
+
+        // the log of each start is kept: the one that is left is the CPU's, the GPU starts before it are `.1` and `.2`,
+        // and each opens with what the hub ran
+        let log = d.join("logs").join("m.log");
+        let [now, before, first] =
+            [0, 1, 2].map(|n| std::fs::read_to_string(numbered_log(&log, n)).unwrap_or_default());
+        assert!(now.starts_with("# mm "), "{now}");
+        assert!(now.contains("# mm args: ") && now.contains("-dev none"), "{now}");
+        assert!(before.starts_with("# mm ") && !before.contains("-dev none"), "{before}");
+        assert!(before.contains("cooperative-matrix kernels are off"), "{before}");
+        assert!(before.contains("# mm env: GGML_VK_DISABLE_COOPMAT=1"), "{before}");
+        assert!(
+            first.starts_with("# mm ") && !first.contains("cooperative-matrix"),
+            "{first}"
+        );
+        assert!(!numbered_log(&log, 3).exists(), "only the two earlier starts exist");
+    }
+
+    /// The details of a load are printed at verbosity 4 only: the hub asks for them when the server has the flag, and
+    /// leaves the owner's own verbosity alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_load_details_are_asked_for_unless_the_owner_chose_a_verbosity() {
+        let d = crate::testing::TestDir::new("mm-verbosity");
+        let server = gpu_crashing_server(&d);
+        // the same stand-in, which now lists the flag in its `--help`
+        let text = std::fs::read_to_string(&server).unwrap();
+        std::fs::write(
+            &server,
+            text.replace("--fit --device", "--fit --device --log-verbosity"),
+        )
+        .unwrap();
+        let e = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(server),
+                ollama_url: String::new(),
+                gpu_fallback: false,
+                ..Default::default()
+            },
+        );
+        let entry = stand_in_entry(&d, 1);
+        let _ = e.ensure_loaded(&entry, &LoadOpts::default(), true).await;
+        let _ = e
+            .ensure_loaded(
+                &entry,
+                &LoadOpts {
+                    extra_args: vec!["-lv".into(), "2".into()],
+                    ..Default::default()
+                },
+                true,
+            )
+            .await;
+        let seen = starts(&d);
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen[0].contains(" -lv 4"), "{}", seen[0]);
+        let last = seen.last().unwrap();
+        assert!(last.contains("-lv 2") && !last.contains("-lv 4"), "{last}");
+    }
+
+    /// A server without the flag (an older build, another engine) is started as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_without_the_verbosity_flag_is_not_given_it() {
+        let d = crate::testing::TestDir::new("mm-no-verbosity");
+        let e = ladder_engine(&d, false);
+        let _ = e
+            .ensure_loaded(&stand_in_entry(&d, 1), &LoadOpts::default(), true)
+            .await;
+        let seen = starts(&d);
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|l| !l.contains("-lv")), "{seen:?}");
+    }
+
+    /// An instance whose server is gone (nothing listens on its port) but whose log is there: all `telemetry` and
+    /// `learn_serving` need of it.
+    fn instance_with_log(d: &Path, log: &str, args: &[&str]) -> Instance {
+        let path = d.join("logs").join("m.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, log).unwrap();
+        Instance {
+            model: "m".into(),
+            port: free_port().unwrap(),
+            pid: 0,
+            key: "k".into(),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            log: path,
+            embeddings: false,
+            reranking: false,
+            opts: LoadOpts::default(),
+            extras: Extras::default(),
+            serving: RwLock::new(Serving::default()),
+            last_used: AtomicU64::new(now_s()),
+            keep: AtomicI64::new(0),
+            inflight: AtomicUsize::new(0),
+            retired: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            on_stop: Mutex::new(None),
+        }
+    }
+
+    /// What the server's log says about the layers is learned once the server is up, and is what `model.telemetry`
+    /// reports, with the log's own request timings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_layers_in_the_servers_log_are_learned_and_reported() {
+        let d = crate::testing::TestDir::new("mm-telemetry");
+        let e = ladder_engine(&d, false);
+        let partial = include_str!("../tests/fixtures/llama/small-partial.txt");
+        let inst = instance_with_log(&d, partial, &["-m", "m.gguf", "-ngl", "10"]);
+        e.learn_serving(&inst, Some(900)).await;
+        let l = inst
+            .serving()
+            .layers
+            .expect("the log says how many layers went to the GPU");
+        assert_eq!((l.total, l.offloaded), (25, 10));
+        assert_eq!(
+            crate::loadlog::placement_from_layers(&l, false),
+            Some("partial"),
+            "the layer counts, not a guess from the memory held"
+        );
+
+        // an earlier load's log is listed too
+        std::fs::write(numbered_log(&inst.log, 1), "# mm 0.0.0 earlier\n").unwrap();
+        let t = e.telemetry(&inst).await;
+        assert_eq!(t["model"], "m");
+        assert_eq!(t["load"]["layers"]["offloaded"], 10);
+        assert_eq!(t["load"]["model"]["arch"], "qwen35");
+        assert_eq!(t["placement"]["layers"]["total"], 25);
+        assert!(
+            t["placement"]["line"].as_str().unwrap().contains("10"),
+            "{}",
+            t["placement"]["line"]
+        );
+        assert_eq!(t["load"]["graphs"][0]["splits"], 257);
+        let logs = t["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert_eq!(
+            (logs[0]["load"].as_str(), logs[1]["load"].as_str()),
+            (Some("this"), Some("1 before"))
+        );
+        // nothing is listening, so the counters are left out rather than reported as zero
+        assert!(
+            t["runtime"].get("server_counters").is_none() && t["runtime"].get("slots").is_none(),
+            "{t}"
+        );
+
+        // a long-running server's log has the load at its top and the requests at its end
+        let gpu = include_str!("../tests/fixtures/llama/small-gpu.txt");
+        let load: String = gpu
+            .lines()
+            .take_while(|l| !l.contains("new prompt"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let request: String = gpu
+            .lines()
+            .skip_while(|l| !l.contains("new prompt"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let filler = "0.05.000.000 I srv  filler: a line a server prints between its requests, a hundred bytes or so\n";
+        let long = format!("{load}{}{request}", filler.repeat(14_000));
+        assert!(
+            long.len() > (1 << 20) + (256 << 10),
+            "the log is longer than the parts the hub reads"
+        );
+        let inst = instance_with_log(&d, &long, &[]);
+        let t = e.telemetry(&inst).await;
+        assert_eq!(t["load"]["layers"]["offloaded"], 25);
+        let requests = t["runtime"]["recent_requests"]
+            .as_array()
+            .expect("the request at the end is found");
+        assert_eq!(requests.len(), 1, "{t}");
+        assert_eq!(requests[0]["generated_tokens"], 300);
+    }
+
+    /// A log at the default verbosity gives no layers: the hub's guess from the memory held stays in force.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_log_without_the_details_leaves_the_placement_to_the_memory_guess() {
+        let d = crate::testing::TestDir::new("mm-telemetry-bare");
+        let e = ladder_engine(&d, false);
+        let inst = instance_with_log(&d, include_str!("../tests/fixtures/llama/default-verbosity.txt"), &[]);
+        e.learn_serving(&inst, None).await;
+        assert!(inst.serving().layers.is_none());
+        let t = e.telemetry(&inst).await;
+        assert!(t["load"]["notes"][0].as_str().unwrap().contains("-lv 4"), "{t}");
+        assert!(t["placement"].get("layers").is_none());
+    }
+
+    /// A load held to a budget by an estimate that proved too high says so once the log shows every layer on the card,
+    /// instead of promising that part of the model stays in RAM. (The numbers are the old estimate of a sliding-window
+    /// model, 42,450 MiB for a load that took 14,540; the estimate is right for those now, and this stays the check on
+    /// the architectures it does not know.)
+    #[test]
+    fn a_held_load_that_the_log_shows_wholly_on_the_card_is_not_said_to_spill_into_ram() {
+        let gemma = include_str!("../tests/fixtures/llama/gemma.txt");
+        let partial = include_str!("../tests/fixtures/llama/small-partial.txt");
+        let mut sv = Serving {
+            estimated_vram_mib: Some(42450),
+            vram_mib: Some(14540.0),
+            ..Default::default()
+        };
+        // nothing known of the layers: the note made before the load stands
+        assert_eq!(held_note_after_load(22512, &sv, false), None);
+        sv.layers = crate::loadlog::parse(gemma).summary();
+        let n = held_note_after_load(22512, &sv, false).expect("every layer is on the card");
+        assert!(
+            n.contains("42450 MiB") && n.contains("22512 MiB") && n.contains("every layer"),
+            "{n}"
+        );
+        assert!(
+            n.contains("14540 MiB on the card") && !n.contains("stays in RAM"),
+            "{n}"
+        );
+        // experts moved off the card by the owner's arguments: a part is in RAM after all
+        assert_eq!(held_note_after_load(22512, &sv, true), None);
+        // some layers on the CPU: the load was split, and the note stands
+        sv.layers = crate::loadlog::parse(partial).summary();
+        assert_eq!(held_note_after_load(22512, &sv, false), None);
+    }
+
+    /// Rotating keeps the loads before the current one, and the oldest goes.
+    #[test]
+    fn the_logs_of_the_loads_before_are_kept_and_the_oldest_goes() {
+        let d = crate::testing::TestDir::new("mm-rotate");
+        let log = d.join("m.log");
+        for n in 1..=5 {
+            rotate_logs(&log, LOGS_KEPT);
+            std::fs::write(&log, format!("load {n}")).unwrap();
+        }
+        let read = |n| std::fs::read_to_string(numbered_log(&log, n)).ok();
+        assert_eq!(
+            [read(0), read(1), read(2), read(3), read(4)],
+            [
+                Some("load 5".into()),
+                Some("load 4".into()),
+                Some("load 3".into()),
+                Some("load 2".into()),
+                None
+            ]
+        );
+        // a model id with dots keeps them
+        let dotted = d.join("Qwen3.5-0.8B.log");
+        assert_eq!(numbered_log(&dotted, 2), d.join("Qwen3.5-0.8B.2.log"));
+    }
+
+    /// A model that worked on the GPU only with the cooperative-matrix kernels off keeps starting that way, and is
+    /// not sent to the CPU; a CPU placement is a different thing and stays one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_that_needs_the_kernels_off_is_remembered_as_that_and_not_as_a_cpu_model() {
+        let d = crate::testing::TestDir::new("mm-ladder-safe");
+        let e = ladder_engine(&d, true);
+        let entry = stand_in_entry(&d, 1);
+        let r = e.resolve_serving(&e.settings(), &entry, &LoadOpts::default());
+        assert!(!e.learned_safe_kernels(&entry, &r));
+        e.learn_as(&entry, &r, "crashed".into(), true);
+        assert!(e.learned_safe_kernels(&entry, &r));
+        assert_eq!(e.learned_why(&entry, &r), None);
+        e.learn(&entry, &r, "crashed".into());
+        assert!(!e.learned_safe_kernels(&entry, &r));
+        assert_eq!(e.learned_why(&entry, &r).as_deref(), Some("crashed"));
+        // a placements.json from before the field existed is a CPU placement
+        let old = r#"{"m": {"engine": "x", "why": "w", "at": 1}}"#;
+        std::fs::write(d.join("placements.json"), old).unwrap();
+        assert!(load_learned(&d).values().all(|l| !l.safe_kernels && l.why == "w"));
     }
 
     /// An out-of-memory error first gets more room on the GPU, and only then the CPU.
@@ -4191,6 +4968,75 @@ parallel = 1
         assert_eq!(targets[0], Some(1_648), "{targets:?}");
         // when that run out of memory too, the next try keeps more free still
         assert!(targets[1].is_some_and(|t| t > 1_648), "{targets:?}");
+    }
+
+    /// A model of 4 PiB fits no memory this machine has, so it is "bigger than RAM plus VRAM" whatever the machine is.
+    fn paged_engine(d: &Path, allow: bool) -> (Arc<Engine>, ModelEntry, LoadOpts) {
+        let e = Engine::new(
+            d.to_path_buf(),
+            Settings {
+                llama_server: Some(gpu_crashing_server(d)),
+                ollama_url: String::new(),
+                allow_paged_load: allow,
+                ..Default::default()
+            },
+        );
+        *e.fake_devices.lock() = Some(card(24_000, 23_000));
+        let mut entry = sized_entry(d);
+        entry.size_bytes = 1 << 52;
+        let opts = LoadOpts {
+            serve: ServeFlags {
+                paged: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (e, entry, opts)
+    }
+
+    /// With paging off (the default) a model bigger than the memory is refused as it always was, even when its own
+    /// `paged` flag is set, and the refusal says how to try it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_model_is_refused_unless_paging_is_allowed() {
+        let d = crate::testing::TestDir::new("mm-paged-off");
+        let (e, entry, opts) = paged_engine(&d, false);
+        assert!(!e.is_paged(&entry, &opts).await);
+        let f = e.ensure_loaded(&entry, &opts, true).await.err().expect("refused");
+        assert_eq!(f.code, "insufficient_memory", "{}", f.message);
+        assert!(f.message.contains("allow_paged_load"), "{}", f.message);
+        assert!(starts(&d).is_empty());
+    }
+
+    /// With both switches on, a request never loads the model (409), `model.load` does, and the load is allowed the
+    /// longer deadline. Without the model's own flag nothing changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paged_model_is_loaded_on_purpose_only() {
+        let d = crate::testing::TestDir::new("mm-paged-on");
+        let (e, entry, opts) = paged_engine(&d, true);
+        assert!(e.is_paged(&entry, &opts).await);
+        assert!(
+            !e.is_paged(&entry, &LoadOpts::default()).await,
+            "the model's flag is needed too"
+        );
+        let f = e
+            .ensure_loaded(&entry, &opts, false)
+            .await
+            .err()
+            .expect("not by a request");
+        assert_eq!((f.status, f.code), (409, "needs_explicit_load"), "{}", f.message);
+        assert!(starts(&d).is_empty(), "a request must not start a server");
+        // on purpose: it is placed (not refused) and the server is started; the stand-in then crashes
+        let f = e
+            .ensure_loaded(&entry, &opts, true)
+            .await
+            .err()
+            .expect("the stand-in never answers");
+        assert_ne!(f.code, "insufficient_memory", "{}", f.message);
+        assert!(!starts(&d).is_empty(), "the load was started");
+        // the model's plan says where it goes
+        let devices = e.gpu_devices().await;
+        let fit = e.placement_for(&entry, &opts, &devices).unwrap();
+        assert_eq!(serving::fit_json(&fit)["where"], "paged");
     }
 
     /// An out-of-memory error is answered with a split held lower each time, then the CPU; what failed is kept, and the
@@ -4435,16 +5281,19 @@ parallel = 1
             "{}",
             seen[0]
         );
-        // retry_gpu: the GPU first (it crashes again), then the CPU
+        // retry_gpu: the GPU first (it crashes), the GPU again with the cooperative-matrix kernels off (it crashes
+        // again), then the CPU
         let opts = LoadOpts {
             retry_gpu: true,
             ..Default::default()
         };
         assert!(e.ensure_loaded(&entry, &opts, true).await.is_err());
         let seen = starts(&d);
-        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen.len(), 4, "{seen:?}");
         assert!(seen[1].contains("--fit on"), "{}", seen[1]);
-        assert!(seen[2].contains("-dev none"), "{}", seen[2]);
+        assert!(seen[2].contains("--fit on"), "{}", seen[2]);
+        assert!(seen[3].contains("-dev none"), "{}", seen[3]);
+        assert_eq!(coopmat_seen(&d), ["coopmat=", "coopmat=", "coopmat=1", "coopmat="]);
     }
 
     /// A tool (speech, images) that failed on the GPU for the GPU's reasons is run again on the CPU, once.

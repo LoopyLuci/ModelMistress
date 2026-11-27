@@ -2,6 +2,141 @@
 
 ## Unreleased
 
+### Desktop app: Misty, chat and speech
+
+- Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are
+  kept in Misty's database (`misty.rate`, `misty.feedback.list`, `misty.feedback.forget`). "No tool needed" and "Should have
+  used a tool" route similar questions, and a correction is given to her as a note for similar questions. A Good or Bad rating routes nothing, so it does not switch tools on or off (`src/misty/feedback.rs`, `src/misty/agent.rs`).
+- Learning tab on Setup and status: the rating counts, an export as chat-format JSON lines (`misty.training.export`), and
+  forgetting one rating or all of them.
+- Chat: a message written during a reply waits and is sent after it; "Jump to latest" when scrolled up; Dictate (the
+  microphone into the message box); "Read aloud" under each reply.
+- Speech page: dictation works. Recordings are written as WAV in the browser before upload, because the hub reads WAV and
+  MP3 but not WebM (`frontend/src/wav.ts`).
+- Chat, dashboard and native window: top-k and seed; text, source and PDF files attached to a message (a PDF's text comes
+  from the hub); a camera button for photos; steering a reply mid-sentence (the text so far is kept, the note goes next);
+  and Live, a conversation by voice (each sentence is written down and sent, the reply is read aloud a sentence at a time,
+  talking over it stops it, and a spoken correction is saved for Misty). Live takes the reply out of the microphone where it can: the native window measures the delay from its speaker to its
+  microphone from the sound and runs an echo filter, and it lowers steady background noise; the web asks the browser for
+  echo cancellation and says so when the browser does not apply it. Not yet checked on a real microphone and speaker.
+- Misty page: a message written during a reply waits and is sent after it, on the dashboard and the native window.
+- Models, dashboard and native window: "Import model file" copies a `.gguf` into the models folder with progress; the
+  speed test times this machine and each installed chat model, then suggests the fastest, the one that keeps up with
+  reading, and the best that fits in memory (`system.bench`).
+- Native window (`gui/`): brought to the same features as the dashboard for these pages: the Chat page (Live, queue,
+  steer, attachments, camera, dictation, read-aloud, top-k, seed), the Misty page (queue, steer, ratings, "No tools", What
+  she learns) and the Models page (import, speed test). Its tests run offscreen with fake sound and a fake hub.
+- Parity with the Android app: `docs/android-parity.md`. Open: echo cancellation on a real microphone and speaker (checked offline only; a headset is
+  advised), steering a reply gives no rating for the cut reply, and the web Live cannot interrupt a reply early.
+- Tests: `cargo test` passes on every target (651 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
+  and the native window's pytest suite (169 tests and 1 skipped; with `MM_HUB_EXE` set, the real-hub test runs too). Not run on a real microphone,
+  camera, speaker or large model file.
+
+### Fixes from the review of this branch
+
+- A request that the fabric served for this hub is counted in the peer key's usage when it succeeds, as a failed one already
+  was (`src/hub.rs`, `passthrough`). The count has no tokens: the other node's usage is not read here.
+- The build script trusts only this checkout for git (`src/build.rs`), not every directory on the machine.
+
+### Android app (`android/`, version 0.1.0)
+
+- Live conversation: the phone listens while the model speaks, so talking over it stops it. The phone's own voice is matched
+  against the last 160 words it said, so it is not taken as the owner's. A finished sentence waits about 1.5 seconds with
+  Cancel send, or "cancel" spoken, before it is sent. Edit before send keeps it in an editable box until Send now. Listen
+  pauses the microphone without ending a reply. Live stays open when the phone rotates.
+- Voice corrections: a sentence that starts with "correction", "that's wrong" or "not quite" is saved against the last reply
+  for Misty, not sent as a message. The Misty panel counts the training examples and exports them as chat-format JSON lines.
+- Default model is LFM2-2.6B-Q4_0 (1.4 GB).
+- Not yet checked on the phone: Send now, corrections, the training export, and the echo matching over a full session.
+  See `android/docs/FEATURE_MAP.md`.
+
+### Fabric: ModelMistress in a ComputeFabric
+
+- New `machine.status` operation: each GPU's free memory, what models may use of it (`vram_usable_mib`, held to
+  `vram_reserve_mib` and the Windows commit), free RAM and what is running. ComputeFabric reads it to decide where a model
+  fits.
+- New `fabric.*` operations (`fabric.status`, `fabric.nodes`, `fabric.models`, `fabric.route`, `fabric.set`) and
+  `<home>/fabric.json`: a hub joined to a ComputeFabric passes a request it cannot serve (no room for the model, or no free
+  slot with `fail_fast_busy`) to the fabric's OpenAI endpoint instead of failing. A request that came through the fabric
+  (`x-cf-hop`) is never passed on again; the answer carries `x-mm-offloaded` and `x-mm-node`. Off until `fabric.set` is
+  used. See `docs/fabric.md`. Tests: `fabric::tests`, and six in `tests_upstream.rs` (busy hub offloads, hop guard, offload
+  off, unreachable fabric, `fabric.set` checks, `machine.status`).
+
+- **The server log says how a model's layers were placed, and `model.telemetry` reads it** (`src/loadlog.rs`, `src/engine.rs`,
+  `src/hub.rs`, `src/serving.rs`; [serving](docs/serving.md#the-server-log-and-model-telemetry)). llama.cpp b12726 prints its
+  load details (devices, memory fit, layers on the GPU, every buffer, KV cache and state, compute graph and its splits, stage
+  times) only at verbosity 4, so a stock llama-server is now started with `-lv 4` unless the owner's `extra_args` set a
+  verbosity (about 19 KB per load, 2.8 KB per request; Rigel and Prism are unchanged). Each log opens with `# mm` lines:
+  what the hub ran, with which environment, and why. The logs of the three loads before the current one are kept
+  (`<model>.1.log` to `.3.log`), so the crash that caused a retry on the CPU can be read; `logs.tail` takes `previous`.
+  New operation `model.telemetry`: the load report, the placement with layer counts, the latest request timings, the
+  server's `/metrics` and `/slots`, and the GPU memory the process holds now. The placement label now follows the layer
+  counts in the log: gemma-4-31B (every layer on the card) was labelled `partial` from a memory estimate and is now `gpu`,
+  and its note no longer says that 19.9 GB of it stay in RAM (the estimate for a sliding-window model was 42 GB against
+  14.5 GB measured). Measured through a debug hub with the b12726 engine on an RX 7900 XTX, 900-token replies:
+  Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL 37.8 tokens/s (66/66 layers, 16.6 GB, 52.6 s to load from an SSD),
+  gemma-4-31B-it-UD-Q2_K_XL 41.2 tokens/s (61/61 layers, 14.5 GB, 109 s from a hard drive).
+
+- **The VRAM estimate knows sliding-window attention** (`src/serving.rs`, `src/catalog.rs`; [serving](docs/serving.md#the-vram-planner)).
+  The estimate took every layer for full attention with 32 KV heads of 512 (the query heads, because the GGUF reader
+  skipped every list and gemma 4 keeps its KV heads per layer): gemma-4-31B came to 42,450 MiB for a load that took
+  14,540 and was held back from the card for it. The reader now keeps short lists of numbers and flags (at most 1,024 entries), and
+  the shape takes the heads, the head sizes (`key_length_swa`) and the window layers (`sliding_window_pattern`) per
+  layer, plus layers that share the cache of earlier ones (`shared_kv_layers`). The window layers are sized as
+  llama.cpp sizes them: the window and a batch, rounded to 256, for each slot (one window for all with `--kv-unified`),
+  or the whole context with `--swa-full`. For gemma 2, gemma 3, gemma 3n, cohere2, gpt-oss, olmo2, afmoe and plamo3,
+  whose files may lack the pattern, the period llama.cpp builds in is used (read from `engines/llama.cpp`); any other
+  architecture with no pattern in its file stays full attention, which is the safe side. Checked against the real file:
+  gemma-4-31B at 4,096 tokens now estimates 1,520 MiB of KV (the server printed 320 MiB for the 10 full layers and
+  1,200 MiB for the 50 window layers) and 13,250 MiB in all, against 12,918 MiB projected by the server; Huihui
+  Qwen3.8-27B (no window) is unchanged at 17,886 MiB. A 32k context on gemma now costs 3,760 MiB of KV, not 30 GB.
+
+- **llama.cpp b12726 (Inkling 2), and a GPU crash gets a second try with the Vulkan cooperative-matrix kernels off**
+  (`engines/llama.cpp`, `engines/patches/mm-routing.patch`, `src/engine.rs`). The pinned llama.cpp moved from 7fee17846 to
+  the tag b12726, which runs `inkling2_loop`; the routing patch was re-based. A load that crashes llama-server on the GPU
+  with 0xC0000409 is started once more on the GPU with `GGML_VK_DISABLE_COOPMAT` and `GGML_VK_DISABLE_COOPMAT2` set, and only
+  then goes to the CPU; a model that works that way is remembered (`placements.json`: `safe_kernels`) and stays on the GPU.
+  Measured on an RX 7900 XTX: Inkling-2-Mini-UD-Q8_K_XL 38.2 tokens/s on the GPU, 3.0 on the CPU it used to land on.
+
+- **A model bigger than the memory can be loaded from disk, on purpose** (`src/serving.rs`, `src/engine.rs`; [serving](docs/serving.md)).
+  New setting `allow_paged_load` (default off) and profile field `paged`: with both, a model that fits neither the GPU nor
+  RAM is placed as `paged` (`model.plan` says `where: paged`) instead of refused, and `model.load` starts it with a
+  30-minute minimum load deadline. A request, Misty and `auto` never load it (`409 needs_explicit_load`). With either
+  switch off nothing changes. Rigel now lives in its own repository, `LoopyLuci/Rigel` (a standalone snapshot; the patch is gone). The Rigel build can pin an older MSVC toolset (`MM_RIGEL_MSVC_TOOLSET`), which the newest one needs.
+  Rigel option `layer_readahead` (`--layer-readahead N`, off by default): reads the next layers of a memory-mapped dense model while the
+  current one computes (3% cost on a model that fits, at most about 10% gain on a cold read; a test with most of the RAM held back
+  was inconclusive because the model stayed cached; see docs/rigel.md).
+  Rigel option `layer_resident_mib` (`--layer-resident-mib N`, off by default; -1 = what is free): locks the first layers of a dense model in memory
+  and streams the rest (measured under a hard working-set cap: about 2 to 3 times the speed of none; noisy single runs).
+  Rigel now uses its own `--fit` for the GPU/CPU split (it passed `-ngl 999`), and new setting `vram_extends_ram` (default on) puts layers on a
+  card that has room when a load meant for the CPU does not fit the free RAM.
+  A Prism (Bonsai) model wholly on the card is loaded with `-lm none`, so its weights are in VRAM only (RAM 0.45 GB against 2.2 GB).
+  New setting `auto_rigel` (default on): a mixture-of-experts model too big for the card is served by Rigel with paged experts (22 GB model: 65.7 tokens/s in 19 GB of VRAM against 53.7 with llama.cpp's fit);
+  a Rigel load wholly on the card gets `-lm none` (RAM 1.8 GB instead of 22.7 GB).
+  AirLLM Phase 0 results: [airllm-spike-results](docs/airllm-spike-results.md).
+- **MOSS-Image, MiniMax-H3-Image and LTX-2.5 work in ModelMistress, and the chat has a media canvas** (`src/image.rs`,
+  `src/hub.rs`, `src/engine.rs`, `src/build.rs`, `frontend/src/chat/media.ts`, `frontend/src/components/MediaCanvas.vue`,
+  `ModelViewer.vue`; [images](docs/images.md), [chat-canvas](docs/chat-canvas.md)).
+  - *Engine.* `engines/stable-diffusion.cpp` is at master-1127-79dc7ca. The bundled build turns on WebP and WebM.
+  - *Models.* Companion files are found by name: the MOSS tokenizer (`tokenizer.json`), a Qwen3.5 / Qwen3-VL / Gemma encoder
+  and an audio VAE (`--tokenizer`, `--llm`, `--audio-vae`). MOSS-Image takes 50 steps, guidance 3, shift 5; MiniMax-H3-Image takes
+  6 steps, guidance 1, euler, its own sigma schedule and `--rng cpu` (the request's own values win).
+  Measured on the RX 7900 XTX: MOSS BF16 768 px, 30 steps, 232 s of sampling; MiniMax UD-Q4_K_XL 1024 px, 6 steps, 2.9 s a step.
+  - *Vulkan.* `sd-cli` is started with `GGML_VK_DISABLE_COOPMAT=1` and `GGML_VK_DISABLE_COOPMAT2=1` (unless set): with the
+  cooperative-matrix kernels it aborts without a message (0xC0000409) on the MOSS and Qwen3.5 graphs. `--offload-to-cpu` is no longer
+  passed for these two models (a 1 GB compute buffer failed to allocate with it).
+  - *Video.* `POST /v1/videos/generations` (and `frames`, `fps` on the image request) runs `sd-cli -M vid_gen` and returns a `.webm`
+  with its sound; the file is served as `video/webm`.
+  - *Canvas.* The chat has a Canvas pane: pictures, video, audio, 3D (GLB, glTF, OBJ, STL with three.js, loaded only when one is
+  shown), drawings, PDF, sandboxed pages and text, taken from the messages (markdown pictures, links, bare URLs, fenced
+  `svg` / `html`). Only http(s), data: and hub paths are accepted; pages run with scripts off. The page policy now allows `blob:` for
+  pictures, media, fetches and frames (the canvas shows hub files from blob URLs; it was blocked before), and a file on another site
+  is offered as a link, not loaded. LTX-2.x has sampling presets (distilled: 8 steps, guidance 1; dev: 20 steps, guidance 3).
+  Measured LTX-2.5 distilled Q4_K_M, 25 frames at 512x320 with sound: 387 s of sampling; the Gemma 12B BF16 encoder (26 GB) took 19.7 minutes
+  to encode the prompt on its first run, because it streams through the card in 50 segments.
+
+### The tests
+
 - **The tests no longer depend on the machine they run on** (`src/engine.rs`).
   - *Why nine tests failed.* `Engine::roots` added the folders found from the environment: `OLLAMA_MODELS`, the home
   folder's `.ollama` and the Hugging Face caches. On a machine with its own models (here `OLLAMA_MODELS` points at a

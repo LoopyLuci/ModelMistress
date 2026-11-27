@@ -12,10 +12,12 @@
   "dependencies": {
     "pinia": "^4.0.2",
     "pinia-plugin-persistedstate": "^4.7.1",
+    "three": "^0.170.0",
     "vue": "^3.4.0",
     "vue-router": "^4.6.4"
   },
   "devDependencies": {
+    "@types/three": "^0.170.0",
     "@vitejs/plugin-vue": "^5.0.0",
     "@vue/test-utils": "^2.5.1",
     "jsdom": "^26.1.0",

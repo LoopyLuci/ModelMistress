@@ -136,6 +136,7 @@ fn peer_route(path: &str) -> bool {
             | "/v1/audio/transcriptions"
             | "/v1/audio/translations"
             | "/v1/images/generations"
+            | "/v1/videos/generations"
             | "/v1/images/edits"
             | "/v1/vision/classify"
             | "/v1/vision/detect"
@@ -238,7 +239,9 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::factory::ops::operations());
     all.extend(crate::misty::ops::operations());
     all.extend(crate::misty::auto::operations());
+    all.extend(crate::fabric::operations());
     all.extend(crate::forge::operations());
+    all.extend(crate::benchmark::operations());
     all
 }
 
@@ -264,6 +267,9 @@ fn core_operations() -> Vec<Value> {
         "cache_reuse": {"type": "integer", "minimum": 0, "description": "smallest chunk to reuse from the cache by KV shifting (--cache-reuse)"},
         "cache_ram_mib": {"type": "integer", "minimum": -1, "description": "RAM for prompt caches outside the slots (--cache-ram; 0 = off, -1 = no limit)"},
         "kv_unified": {"type": "boolean", "description": "one KV buffer shared by all slots (--kv-unified)"},
+        "layer_readahead": {"type": "integer", "minimum": 0, "description": "Rigel only: dense layers to read ahead from the memory-mapped model file while the current one computes (--layer-readahead; 0 = off); for a dense model bigger than the free memory"},
+        "layer_resident_mib": {"type": "integer", "minimum": -1, "description": "Rigel only: MiB of dense layer weights to lock in memory so they are never evicted, the rest streamed from the memory-mapped model file (--layer-resident-mib; -1 = what is free minus a margin, 0 = off); for a dense model bigger than the free memory"},
+        "paged": {"type": "boolean", "description": "allow a model bigger than the free RAM plus VRAM to load with its weights read from disk as it runs (very slow); needs the allow_paged_load setting and model.load, never a request"},
         "batch_size": {"type": "integer", "minimum": 1, "description": "logical batch size (-b)"},
         "ubatch_size": {"type": "integer", "minimum": 1, "description": "physical batch size (-ub)"},
         "jinja": {"type": "boolean", "description": "Jinja chat template engine (--jinja), needed for tool calls"},
@@ -475,12 +481,25 @@ fn core_operations() -> Vec<Value> {
         ),
         op(
             "logs.tail",
-            "The last lines of a loaded model's llama-server log",
+            "The last lines of a loaded model's llama-server log (the log starts with what the hub ran and why; \
+             `previous` reads the load before, such as an attempt that crashed and was tried again)",
             false,
             false,
             json!({
-                "model": model, "lines": {"type": "integer", "minimum": 1, "maximum": 2000}
+                "model": model, "lines": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "previous": {"type": "integer", "minimum": 0, "maximum": 3,
+                             "description": "0: this load's log (default); 1: the load before it, 2: the one before that"}
             }),
+            &["model"],
+        ),
+        op(
+            "model.telemetry",
+            "How a loaded model runs, from its server's own log and counters: layers on the GPU, every buffer, the KV \
+             cache and recurrent state, the compute graph and its splits, the memory fit, flash attention, how long \
+             each stage of the load took, what the GPU holds now, and the speed of the latest requests",
+            false,
+            false,
+            json!({"model": model}),
             &["model"],
         ),
         op(
@@ -975,7 +994,26 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 .into_iter()
                 .find(|i| i.model == m.id)
                 .ok_or_else(|| Fail::new(409, "not_loaded", format!("{} is not loaded", m.id)))?;
-            json!({"model": m.id, "log": inst.log, "text": crate::engine::tail(&inst.log, n)})
+            let previous = a["previous"].as_u64().unwrap_or(0).min(3) as usize;
+            let log = crate::engine::numbered_log(&inst.log, previous);
+            if previous > 0 && !log.exists() {
+                return Err(Fail::new(
+                    404,
+                    "no_such_log",
+                    format!("{} has no log from {previous} load(s) ago", m.id),
+                )
+                .into());
+            }
+            json!({"model": m.id, "log": log, "previous": previous, "text": crate::engine::tail(&log, n)})
+        }
+        "model.telemetry" => {
+            let m = llama_entry(hub, s(a, "model")?)?;
+            let inst = e
+                .loaded()
+                .into_iter()
+                .find(|i| i.model == m.id)
+                .ok_or_else(|| Fail::new(409, "not_loaded", format!("{} is not loaded", m.id)))?;
+            e.telemetry(&inst).await
         }
         "model.pull" => {
             let spec = s(a, "model")?;
@@ -1104,6 +1142,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("factory.") => crate::factory::ops::call(hub, id, a).await?,
         id if id.starts_with("misty.") => crate::misty::ops::call(hub, id, a).await?,
         id if id.starts_with("router.") => crate::misty::auto::call(hub, id, a).await?,
+        id if id.starts_with("fabric.") || id == "machine.status" => crate::fabric::call(hub, id, a).await?,
+        "system.bench" => crate::benchmark::call(hub, id, a).await?,
         _ => return Err(Fail::not_found(format!("no operation {id}")).into()),
     })
 }
@@ -1252,9 +1292,13 @@ async fn run_image(
         Some(s) if s >= 0 => s,
         _ => rand::random::<u32>() as i64,
     };
-    let pattern = std::path::absolute(&dir)
-        .unwrap_or(dir)
-        .join(format!("image-{}_%d.png", uuid::Uuid::new_v4().simple()));
+    // a video is one WebM file (with its sound); images are numbered PNGs
+    let name = if req.frames.is_some() {
+        format!("video-{}.webm", uuid::Uuid::new_v4().simple())
+    } else {
+        format!("image-{}_%d.png", uuid::Uuid::new_v4().simple())
+    };
+    let pattern = std::path::absolute(&dir).unwrap_or(dir).join(name);
     let args_for = |cpu: bool| image::tool_args(&model, req, seed, &pattern, cpu);
     let _one_at_a_time = e.tool_lock.lock().await;
     let t0 = Instant::now();
@@ -1305,7 +1349,7 @@ fn sweep_generated(dir: &std::path::Path) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > day);
-        if old && f.path().extension().is_some_and(|x| x == "png") {
+        if old && f.path().extension().is_some_and(|x| x == "png" || x == "webm") {
             let _ = std::fs::remove_file(f.path());
         }
     }
@@ -1782,9 +1826,22 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
     let asked = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     check_model(&hub, &who, &asked)?;
     let t0 = Instant::now();
+    // a request kept for the fabric: copied only when this hub is joined to one and may offload
+    let spare = crate::fabric::offers(&hub).then(|| body.clone());
     let (model, resp, lease) = match hub.engine.forward(path, body).await {
         Ok(x) => x,
         Err(f) => {
+            // no room here (or busy): another node of the fabric may have it
+            if let (Some(spare), true) = (&spare, crate::fabric::capacity_failure(&f)) {
+                if let Some(r) = crate::fabric::offload(&hub, path, spare).await {
+                    hub.engine.record(&asked, true, t0.elapsed().as_millis() as u64, None);
+                    // the other node's usage is not read here, so this success is counted without tokens
+                    if let Some(p) = &who.0 {
+                        p.finish(&asked, true, 0, 0);
+                    }
+                    return Ok(r);
+                }
+            }
             if let Some(p) = &who.0 {
                 p.finish(&asked, false, 0, 0);
             }
@@ -1960,6 +2017,36 @@ async fn speech(
     Ok(([("content-type", req.format.content_type())], bytes).into_response())
 }
 
+/// The largest PDF a chat message takes.
+const MAX_DOCUMENT_BODY: usize = 64 << 20;
+
+/// `POST /v1/documents/text`: the body is a PDF; the reply is its text (see `documents`), for a chat message.
+async fn document_text(Extension(_who): Extension<Caller>, body: Bytes) -> ApiResult<Response> {
+    let (text, truncated) = crate::documents::pdf_text(&body).map_err(Fail::invalid)?;
+    Ok(Json(json!({"text": text, "truncated": truncated})).into_response())
+}
+
+/// `POST /v1/models/import`: a `.gguf` file as the body, named in `x-file-name`, copied into the models folder (see
+/// `model_import`). The model list finds it on its next refresh.
+async fn model_import(
+    State(hub): State<Hub>,
+    Extension(_who): Extension<Caller>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    let raw = headers.get("x-file-name").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let name = crate::model_import::file_name(raw).map_err(Fail::invalid)?;
+    let dir = crate::model_import::folder(&hub.engine.home);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Fail::new(500, "io", format!("could not create the models folder: {e}")))?;
+    let dest = dir.join(&name);
+    if dest.exists() {
+        return Err(Fail::new(409, "conflict", format!("{name} is already in the models folder")).into());
+    }
+    let bytes = crate::model_import::save(body, &dest).await.map_err(Fail::invalid)?;
+    Ok(Json(json!({"name": name, "bytes": bytes, "path": dest.display().to_string()})).into_response())
+}
+
 /// `POST /v1/images/generations`: JSON in, the PNGs out (as base64, or as urls of `/v1/images/files/`).
 async fn image_generations(
     State(hub): State<Hub>,
@@ -1997,12 +2084,32 @@ async fn image_generations(
 
 /// `GET /v1/images/files/{name}`: an image that a `url` answer points to (they are removed after a day).
 async fn image_file(State(hub): State<Hub>, Path(name): Path<String>) -> ApiResult<Response> {
-    let ok = name.ends_with(".png") && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    let video = name.ends_with(".webm");
+    let ok = (name.ends_with(".png") || video) && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
     if !ok || name.contains("..") {
         return Err(Fail::not_found("no such image").into());
     }
     let bytes = std::fs::read(hub.engine.generated_dir().join(&name)).map_err(|_| Fail::not_found("no such image"))?;
-    Ok(([("content-type", "image/png")], bytes).into_response())
+    Ok((
+        [("content-type", if video { "video/webm" } else { "image/png" })],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /v1/videos/generations`: like the image route, for a video model: `frames` (default 49) and `fps` (default 24) in,
+/// a WebM with sound out (as base64 or as a url of `/v1/images/files/`).
+async fn video_generations(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> ApiResult<Response> {
+    if let Some(o) = body.as_object_mut() {
+        o.entry("frames").or_insert(json!(49));
+        o.entry("n").or_insert(json!(1));
+    }
+    image_generations(State(hub), Extension(who), headers, Json(body)).await
 }
 
 /// `POST /v1/images/edits`: not available. sd.cpp's image-to-image and inpainting exist, but OpenAI's mask marks the
@@ -2161,7 +2268,14 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
         .route("/v1/audio/speech", post(speech))
+        .route(
+            "/v1/documents/text",
+            post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
+        )
+        // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
+        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
         .route("/v1/images/generations", post(image_generations))
+        .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))
         .route("/v1/images/files/:name", get(image_file))
         .route(
@@ -2189,7 +2303,9 @@ pub fn router(hub: Hub) -> Router {
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())
         .merge(crate::misty::ops::routes())
-        .route_layer(middleware::from_fn_with_state(hub.clone(), auth));
+        .route_layer(middleware::from_fn_with_state(hub.clone(), auth))
+        // how many routers a request has passed (`x-cf-hop`), so a request the fabric sent here is not sent back
+        .layer(middleware::from_fn(crate::fabric::hop_layer));
     Router::new()
         .route("/v1/health", get(health))
         .merge(crate::trace::ui::routes())
@@ -2710,6 +2826,56 @@ unrelated line
         let v = get("/v1/models").await;
         assert_eq!(v["data"][0]["meta"]["loaded"], true);
         assert!(v["data"][0]["serving"].is_object());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `model.telemetry` and `logs.tail` read the log of a loaded model, and the logs of the loads before it.
+    #[tokio::test]
+    async fn the_servers_log_and_its_telemetry_are_read_through_the_hub() {
+        let home = crate::testing::temp_home();
+        let h = hub_without_tools(&home, &["tiny"]);
+        // not loaded: nothing to read, and the answer says so
+        for op in ["model.telemetry", "logs.tail"] {
+            let (code, v) = json_post(&h, &format!("/v1/call/{op}"), json!({"model": "tiny"})).await;
+            assert_eq!(code, 409, "{op}: {v}");
+        }
+        let log = home.join("logs").join("tiny.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, include_str!("../tests/fixtures/llama/small-partial.txt")).unwrap();
+        std::fs::write(
+            crate::engine::numbered_log(&log, 1),
+            "# mm 0.4.2 tiny GpuAsked\nggml_vulkan: the load before this one crashed\n",
+        )
+        .unwrap();
+        h.engine.adopt_with_log("tiny", 1, "k", false, log, None);
+
+        let (code, v) = json_post(&h, "/v1/call/model.telemetry", json!({"model": "tiny"})).await;
+        assert_eq!(code, 200, "{v}");
+        let r = &v["result"];
+        assert_eq!(
+            (&r["load"]["layers"]["offloaded"], &r["load"]["layers"]["total"]),
+            (&json!(10), &json!(25))
+        );
+        assert_eq!(r["load"]["model"]["arch"], "qwen35");
+        assert!(r["load"]["buffers"].as_array().is_some_and(|b| b.len() > 5), "{r}");
+        assert_eq!(r["logs"].as_array().map(Vec::len), Some(2), "{r}");
+
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "lines": 2000})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(
+            v["result"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("offloaded 10/25 layers to GPU"),
+            "{v}"
+        );
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "previous": 1})).await;
+        assert_eq!(code, 200, "{v}");
+        assert!(v["result"]["text"].as_str().unwrap().contains("crashed"), "{v}");
+        assert_eq!(v["result"]["previous"], 1);
+        // there is no log two loads back
+        let (code, v) = json_post(&h, "/v1/call/logs.tail", json!({"model": "tiny", "previous": 2})).await;
+        assert_eq!(code, 404, "{v}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -192,6 +192,42 @@
         <p class="muted small">Run one with <span class="mono">model-mistress misty pipeline run NAME --input key=value</span>.</p>
       </div>
     </div>
+
+    <!-- LEARNING: the owner's ratings of replies (src/misty/feedback.rs) -->
+    <div v-if="tab === 'learn'">
+      <div class="card">
+        <h3>What Misty has learned from your ratings</h3>
+        <p class="muted small">
+          Each rating on a reply is kept here. A rating on a question teaches her how to route similar questions; a correction is
+          given to her as a note for similar questions. Everything stays on this machine unless you export it.
+        </p>
+        <dl v-if="feedback" class="kv">
+          <dt>ratings</dt><dd>{{ feedback.counts.total }}</dd>
+          <dt>good / bad</dt><dd>{{ feedback.counts.good }} / {{ feedback.counts.bad }}</dd>
+          <dt>no tool needed</dt><dd>{{ feedback.counts.no_tools }}</dd>
+          <dt>should have used a tool</dt><dd>{{ feedback.counts.needs_tools }}</dd>
+          <dt>corrections</dt><dd>{{ feedback.counts.corrected }}</dd>
+          <dt>training examples</dt><dd>{{ feedback.counts.training }}</dd>
+        </dl>
+        <div class="row">
+          <button class="btn" type="button" :disabled="busy || !feedback?.counts.training" @click="exportTraining">Export training data (JSON lines)</button>
+          <button class="btn danger" type="button" :disabled="busy || !feedback?.counts.total" @click="forgetAll">Forget all ratings</button>
+        </div>
+      </div>
+      <div v-if="feedback?.verdicts.length" class="card">
+        <h3>Recent ratings</h3>
+        <ul class="plain verdicts">
+          <li v-for="v in feedback.verdicts" :key="v.id">
+            <span class="pill">{{ LABEL_TEXT[v.label] }}</span>
+            <span class="small"> {{ v.question }}</span>
+            <div v-if="v.correction" class="small muted">right answer: {{ v.correction }}</div>
+            <div v-if="v.tools.length" class="small muted mono">tools: {{ v.tools.join(', ') }}</div>
+            <button class="btn" type="button" :disabled="busy" :aria-label="`Forget the rating of ${v.question}`" @click="forget(v)">Forget</button>
+          </li>
+        </ul>
+      </div>
+      <p v-else-if="feedback" class="muted">No ratings yet. Rate a reply in the Misty chat with the buttons under it.</p>
+    </div>
   </div>
 </template>
 
@@ -199,13 +235,17 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { call } from '@/transport'
 import { fmtBytes } from '@/util'
-import { misty, ROLE_LABEL, type Hit, type MistyStatus, type Pipeline, type SetupPlan, type Source, type ToolInfo } from '@/misty'
+import {
+  LABEL_TEXT, misty, ROLE_LABEL,
+  type FeedbackList, type Hit, type MistyStatus, type Pipeline, type SetupPlan, type Source, type ToolInfo, type Verdict,
+} from '@/misty'
 
 const TABS = [
   { id: 'status', label: 'Status' },
   { id: 'setup', label: 'Setup' },
   { id: 'docs', label: 'Documents' },
   { id: 'tools', label: 'Tools' },
+  { id: 'learn', label: 'Learning' },
 ]
 const tab = ref('status')
 const status = ref<MistyStatus | null>(null)
@@ -215,6 +255,7 @@ const jobs = ref<any[]>([])
 const sources = ref<{ sources: Source[]; collections: { collection: string; sources: number; chunks: number }[] }>({ sources: [], collections: [] })
 const tools = ref<{ tools: ToolInfo[]; policy: Record<string, string> } | null>(null)
 const pipelines = ref<Pipeline[]>([])
+const feedback = ref<FeedbackList | null>(null)
 const hits = ref<Hit[]>([])
 const query = ref('')
 const ingestPath = ref('')
@@ -245,6 +286,7 @@ async function load() {
     if (tab.value === 'status') status.value = await misty.status()
     if (tab.value === 'setup') plan.value = await misty.setupPlan()
     if (tab.value === 'docs') sources.value = await misty.sources()
+    if (tab.value === 'learn') feedback.value = await misty.feedback(200)
     if (tab.value === 'tools') {
       tools.value = await misty.tools()
       pipelines.value = await misty.pipelines()
@@ -300,6 +342,37 @@ async function unindex(s: Source) {
   if (!window.confirm(`Remove ${s.source} from the index? The file itself is not touched.`)) return
   await guard(() => misty.removeSource(s.source, s.collection))
   sources.value = await misty.sources()
+}
+
+async function forget(v: Verdict) {
+  if (!window.confirm(`Forget this rating? Misty stops using it for questions like "${v.question}".`)) return
+  const r = await guard(() => misty.forget(v.id))
+  if (r) {
+    note.value = 'Forgotten.'
+    feedback.value = await misty.feedback(200)
+  }
+}
+
+async function forgetAll() {
+  if (!window.confirm('Forget every rating Misty has learned from? This cannot be undone.')) return
+  const r = await guard(() => misty.forgetAll())
+  if (r) {
+    note.value = `Forgot ${r.removed} rating(s).`
+    feedback.value = await misty.feedback(200)
+  }
+}
+
+/** Saves the good replies and corrections as JSON lines, one example per line. */
+async function exportTraining() {
+  const r = await guard(() => misty.training())
+  if (!r) return
+  const url = URL.createObjectURL(new Blob([r.jsonl], { type: 'application/x-ndjson' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'misty-training.jsonl'
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  note.value = `Exported ${r.count} example(s).`
 }
 
 watch(tab, load)

@@ -64,8 +64,9 @@ change in the same commit.
 - Commit messages: `area: summary`, a lowercase area (`keys`, `errors`, `gui`, `docs`), then a body that says why.
 - Do not remove a screen, option or command without the owner's decision.
 - `ci/reports/` is written by the pipeline; leave it out of commits unless the change is about it.
-- `engines/llama.cpp` and `engines/rigel` are submodules. Do not commit changes inside them from here; our changes live
-  in `engines/patches/` (`mm-routing.patch`, `rigel.patch`), which `build.rs` applies to the working tree.
+- `engines/llama.cpp` is a submodule. Do not commit changes inside it from here; our changes live in
+  `engines/patches/mm-routing.patch`, which `build.rs` applies to the working tree. `engines/rigel` is our own repository
+  (LoopyLuci/Rigel, a standalone snapshot with its own history; no patch).
 - Never create folders outside this repository without the owner's permission (no drive-root `CARGO_TARGET_DIR`, no
   extra worktrees beside it), and clean up what you create. See `AGENTS.md` at the drive root.
 
@@ -73,9 +74,8 @@ change in the same commit.
 
 - A serving profile with `engine = "rigel"` runs the model on Rigel: a llama.cpp fork ported to Windows and AMD HIP,
   with paged MoE experts. The feature `rigel-engine` builds it in (needs `HIP_PATH`; GPUs from `MM_RIGEL_GPU_TARGETS`).
-- To change Rigel: edit `engines/rigel`, then regenerate `engines/patches/rigel.patch` against the pinned commit, with
-  new files included (a temporary index: `GIT_INDEX_FILE=… git read-tree HEAD && git add -A && git diff --cached
-  --binary -M HEAD`). Check that it applies to a clean checkout and in reverse to the working tree.
+- To change Rigel: edit `engines/rigel`, commit and push it to LoopyLuci/Rigel (the owner's repository; ask before pushing),
+  then commit the new submodule pointer here. It has no upstream remote: merge Betelgeuse changes by hand, on purpose.
 - Open: paged decoding is slow until the VRAM slots warm up (measurements in `docs/rigel.md`). Forcing a GPU wait after
   each graph made it worse and was reverted. Try `moe_profile` seeding or more `moe_slots` next.
 - Builds with the bundled engines need a short `CARGO_TARGET_DIR` (rc.exe path limit): ask the owner where.

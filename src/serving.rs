@@ -82,6 +82,25 @@ pub struct ServeFlags {
     /// Rigel: pinned host memory (MiB) that keeps evicted experts (the `MOE_CACHE_MIB` variable); 0 = off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moe_cache_mib: Option<u32>,
+    /// Rigel: dense layers to read ahead from the memory-mapped file while the current layer computes
+    /// (`--layer-readahead`; 0 = off). For a dense model bigger than the free memory, whose weights the operating system
+    /// pages in: the next layers are read in large ordered requests instead of one page fault at a time. Costs a few
+    /// percent on a model that fits, so leave it off for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_readahead: Option<u32>,
+    /// Rigel: MiB of dense layer weights to lock in memory so the operating system never evicts them, the rest being
+    /// streamed from the memory-mapped file (`--layer-resident-mib`; -1 = what is free minus a margin, 0 = off). For a
+    /// dense model bigger than the free memory: a walk over every layer for every token makes least-recently-used
+    /// eviction throw out each page just before it is needed, so the whole model is read from disk for every token;
+    /// with the first layers locked only the rest is. Works with `layer_readahead`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_resident_mib: Option<i32>,
+    /// Allow this model to be loaded although it is bigger than the free RAM plus the VRAM models may use: the weights
+    /// that do not fit are read from disk by the operating system as the model runs (llama.cpp memory-maps the file).
+    /// Slow: every token may read from disk. It also needs the hub's `allow_paged_load` setting, and the model is only
+    /// ever loaded on purpose (`model.load`), never by a request, Misty or `auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged: Option<bool>,
 }
 
 /// The engines a model can be served by (`engine` in a serving profile).
@@ -116,6 +135,12 @@ impl ServeFlags {
         if self.moe_cache_mib.is_some() {
             v.push("moe_cache_mib");
         }
+        if self.layer_readahead.is_some() {
+            v.push("layer_readahead");
+        }
+        if self.layer_resident_mib.is_some() {
+            v.push("layer_resident_mib");
+        }
         v
     }
 }
@@ -145,6 +170,9 @@ impl ServeFlags {
             moe_pack_dir: self.moe_pack_dir.clone().or_else(|| base.moe_pack_dir.clone()),
             moe_profile: self.moe_profile.clone().or_else(|| base.moe_profile.clone()),
             moe_cache_mib: self.moe_cache_mib.or(base.moe_cache_mib),
+            layer_readahead: self.layer_readahead.or(base.layer_readahead),
+            layer_resident_mib: self.layer_resident_mib.or(base.layer_resident_mib),
+            paged: self.paged.or(base.paged),
         }
     }
 }
@@ -268,6 +296,13 @@ impl ServeProfile {
                 drop("ubatch_size", format!("{ub} is larger than batch_size {b}"));
             }
         }
+        if f.layer_resident_mib.is_some_and(|n| n < -1) {
+            f.layer_resident_mib = None;
+            drop(
+                "layer_resident_mib",
+                "must be -1 (what is free), 0 (off) or a size in MiB".into(),
+            );
+        }
         if f.cache_ram_mib.is_some_and(|n| n < -1) {
             f.cache_ram_mib = None;
             drop(
@@ -333,6 +368,9 @@ pub fn validate_flags(f: &ServeFlags, parallel: Option<u32>) -> Result<(), Strin
         if ub > b {
             return Err(format!("ubatch_size {ub} is larger than batch_size {b}"));
         }
+    }
+    if f.layer_resident_mib.is_some_and(|n| n < -1) {
+        return Err("layer_resident_mib must be -1 (what is free), 0 (off) or a size in MiB".into());
     }
     if f.cache_ram_mib.is_some_and(|n| n < -1) {
         return Err("cache_ram_mib must be -1 (no limit), 0 (off) or a size in MiB".into());
@@ -509,6 +547,12 @@ impl Resolved {
             if let Some(p) = &f.moe_profile {
                 a.extend(["--moe-profile".into(), p.display().to_string()]);
             }
+            if let Some(n) = f.layer_readahead.filter(|n| *n > 0) {
+                a.extend(["--layer-readahead".into(), n.to_string()]);
+            }
+            if let Some(n) = f.layer_resident_mib.filter(|n| *n != 0) {
+                a.extend(["--layer-resident-mib".into(), n.to_string()]);
+            }
         }
         a
     }
@@ -538,6 +582,10 @@ pub struct Serving {
     /// Where the weights went: "gpu" (all on the GPU), "partial" (some layers on the GPU, the rest on the CPU), "cpu",
     /// or "unknown" (not measured: no GPU counters, or not loaded yet).
     pub placement: &'static str,
+    /// What the server's own log says about the layers: how many it put on the GPU, the buffers on each side, the
+    /// graph splits. This decides `placement` when it is there (the server prints it at verbosity 4, which the hub
+    /// asks for).
+    pub layers: Option<crate::loadlog::LayerSummary>,
     /// Why it is where it is, when that is not what was asked for (a retry on the CPU after the GPU failed, a
     /// remembered failure).
     pub placement_note: Option<String>,
@@ -573,6 +621,7 @@ impl Serving {
             vram_mib: None,
             estimated_vram_mib: None,
             placement: if r.gpu_layers == 0 { "cpu" } else { "unknown" },
+            layers: None,
             placement_note: None,
             source: "requested",
         }
@@ -626,18 +675,36 @@ pub fn vram_from_log(text: &str) -> Option<f64> {
 
 // ---- estimating ----------------------------------------------------------------------------------------------
 
+/// What one token adds to the cache of the layers of one kind: the elements of K and of V, summed over those layers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct KvElems {
+    pub k: u64,
+    pub v: u64,
+}
+
+impl KvElems {
+    fn is_empty(&self) -> bool {
+        self.k == 0 && self.v == 0
+    }
+}
+
 /// What the planner needs to know about a model, read from its GGUF header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelShape {
     pub file_bytes: u64,
     /// Transformer layers that are served (the multi-token-prediction layer a file may carry is left out).
     pub layers: u64,
-    /// Of those, the ones with a KV cache (a hybrid model has attention in every Nth layer only).
+    /// Of those, the ones with a KV cache (a hybrid model has attention in every Nth layer only, and a model that shares
+    /// the cache of its last layers has none there).
     pub attn_layers: u64,
     pub n_embd: u64,
-    pub n_head_kv: u64,
-    pub key_len: u64,
-    pub val_len: u64,
+    /// Per token, over the layers that attend over the whole context.
+    pub kv_full: KvElems,
+    /// Per token, over the layers that attend over a sliding window. Their cache holds the window (and a batch), not the
+    /// context: that is most of the layers of a Gemma, and why a long context costs so little there.
+    pub kv_swa: KvElems,
+    /// Tokens of the window (0: no layer has one).
+    pub swa_window: u64,
     /// Bytes of recurrent state one slot needs (0 for a pure transformer).
     pub state_bytes_per_slot: u64,
     /// Fraction of the weights that are expert tensors (0 for a dense model).
@@ -648,23 +715,127 @@ fn meta_u64(meta: &Map<String, Value>, key: &str) -> Option<u64> {
     meta.get(key).and_then(Value::as_u64)
 }
 
+/// A setting that may be one number or one per layer (`head_count_kv` of a model whose layers differ): the number, or
+/// the largest of the list.
+fn meta_num(meta: &Map<String, Value>, key: &str) -> Option<u64> {
+    match meta.get(key)? {
+        Value::Array(a) => a.iter().filter_map(Value::as_u64).max(),
+        v => v.as_u64(),
+    }
+}
+
+/// One number per layer, when the file lists them.
+fn meta_per_layer(meta: &Map<String, Value>, key: &str) -> Option<Vec<u64>> {
+    let a = meta.get(key)?.as_array()?;
+    Some(a.iter().map(|v| v.as_u64().unwrap_or(0)).collect())
+}
+
+/// How llama.cpp builds the sliding-window pattern of the architectures that have one built in (`load_swa_pattern`
+/// in each model's loader): the period (every Nth layer attends over the whole context, the others over the window),
+/// whether the first layer of a period is the full one, and the window when the file does not give one.
+const SWA_BUILT_IN: &[(&str, u64, bool, u64)] = &[
+    ("gemma2", 2, false, 4096),
+    ("gemma3", 6, false, 0),
+    ("gemma3n", 5, false, 0),
+    ("cohere2", 4, false, 0),
+    ("gpt-oss", 2, false, 0),
+    ("olmo2", 4, false, 0),
+    ("afmoe", 4, false, 0),
+    ("plamo3", 8, false, 0),
+];
+
+/// Which of the first `n` layers attend over a window only, and how wide it is. The file's own list wins
+/// (`sliding_window_pattern`, one flag per layer: Gemma 4), then its period, then the one built into llama.cpp for the
+/// architecture. A model with none of them (or no window) is taken as all full attention, which is the safe side.
+fn swa_layers(meta: &Map<String, Value>, arch: &str, n: u64) -> (Vec<bool>, u64) {
+    let built_in = SWA_BUILT_IN.iter().find(|(a, ..)| *a == arch);
+    let window = meta_u64(meta, &format!("{arch}.attention.sliding_window"))
+        .filter(|w| *w > 0)
+        .or_else(|| built_in.map(|b| b.3).filter(|w| *w > 0));
+    let Some(window) = window else {
+        return (vec![false; n as usize], 0);
+    };
+    let by_period = |period: u64, dense_first: bool| -> Vec<bool> {
+        (0..n)
+            .map(|il| {
+                period == 0
+                    || if dense_first {
+                        il % period != 0
+                    } else {
+                        il % period < period - 1
+                    }
+            })
+            .collect()
+    };
+    let flags = match meta.get(&format!("{arch}.attention.sliding_window_pattern")) {
+        Some(Value::Array(a)) => (0..n as usize)
+            .map(|i| match a.get(i) {
+                Some(Value::Bool(b)) => *b,
+                Some(v) => v.as_u64().unwrap_or(0) != 0,
+                None => false,
+            })
+            .collect(),
+        Some(v) if v.as_u64().is_some() => by_period(v.as_u64().unwrap_or(0), false),
+        _ => match built_in {
+            Some((_, period, dense_first, _)) => by_period(*period, *dense_first),
+            None => vec![false; n as usize],
+        },
+    };
+    if flags.iter().any(|f| *f) {
+        (flags, window)
+    } else {
+        (flags, 0)
+    }
+}
+
 /// The shape from the scalar GGUF metadata (`<arch>.*`). None when the layers or widths are not in it.
 pub fn shape_from_meta(meta: &Map<String, Value>, file_bytes: u64) -> Option<ModelShape> {
     let arch = meta.get("general.architecture")?.as_str()?;
     let k = |s: &str| meta_u64(meta, &format!("{arch}.{s}"));
+    let kn = |s: &str| meta_num(meta, &format!("{arch}.{s}"));
     let blocks = k("block_count")?;
     let nextn = k("nextn_predict_layers").unwrap_or(0);
     let layers = blocks.saturating_sub(nextn).max(1);
     let n_embd = k("embedding_length")?;
-    let n_head = k("attention.head_count")?.max(1);
-    let n_head_kv = k("attention.head_count_kv").unwrap_or(n_head);
+    let n_head = kn("attention.head_count")?.max(1);
+    let n_head_kv = kn("attention.head_count_kv").unwrap_or(n_head);
     let key_len = k("attention.key_length").unwrap_or(n_embd / n_head);
     let val_len = k("attention.value_length").unwrap_or(key_len);
+    let key_len_swa = k("attention.key_length_swa").unwrap_or(key_len);
+    let val_len_swa = k("attention.value_length_swa").unwrap_or(val_len);
     let interval = k("full_attention_interval").filter(|n| *n > 1);
-    let attn_layers = match interval {
-        Some(n) => layers / n,
-        None => layers,
+    // the layers that keep a cache of their own: the first ones, when the last share the cache of earlier layers
+    let with_cache = match arch {
+        "gemma3n" => layers.min(20),
+        _ => layers
+            .saturating_sub(k("attention.shared_kv_layers").unwrap_or(0))
+            .max(1),
     };
+    let heads_kv = meta_per_layer(meta, &format!("{arch}.attention.head_count_kv"));
+    let (swa, window) = swa_layers(meta, arch, layers);
+    let (mut kv_full, mut kv_swa) = (KvElems::default(), KvElems::default());
+    let mut attn_layers = 0;
+    for il in 0..layers {
+        // a hybrid has attention in every Nth layer only; a list of heads per layer says it with zeros
+        let attends = il < with_cache && interval.is_none_or(|n| (il + 1) % n == 0);
+        let heads = match &heads_kv {
+            Some(h) => h.get(il as usize).copied().unwrap_or(0),
+            None => n_head_kv,
+        };
+        if !attends || heads == 0 {
+            continue;
+        }
+        attn_layers += 1;
+        let is_swa = swa[il as usize];
+        let (kl, vl) = if is_swa {
+            (key_len_swa, val_len_swa)
+        } else {
+            (key_len, val_len)
+        };
+        let into = if is_swa { &mut kv_swa } else { &mut kv_full };
+        into.k += heads * kl;
+        into.v += heads * vl;
+    }
     let state_bytes_per_slot = match (interval, k("ssm.state_size"), k("ssm.inner_size")) {
         // gated delta-net layers: a state_size x inner_size recurrent matrix plus the convolution window, in f32
         (Some(_), Some(state), Some(inner)) => {
@@ -688,15 +859,15 @@ pub fn shape_from_meta(meta: &Map<String, Value>, file_bytes: u64) -> Option<Mod
         layers,
         attn_layers,
         n_embd,
-        n_head_kv,
-        key_len,
-        val_len,
+        kv_full,
+        kv_swa,
+        swa_window: if kv_swa.is_empty() { 0 } else { window },
         state_bytes_per_slot,
         expert_share,
     })
 }
 
-/// Bytes one element of a KV type takes.
+// Bytes one element of a KV type takes.
 pub fn kv_bytes_per_elem(t: &str) -> f64 {
     match t {
         "f32" => 4.0,
@@ -725,6 +896,10 @@ pub struct Placement {
     pub n_cpu_moe: u64,
     /// Extra bytes already known to sit on the GPU (a draft model's file).
     pub extra_gpu_bytes: u64,
+    /// `--kv-unified`: one cache for all the slots.
+    pub kv_unified: bool,
+    /// `--swa-full`: the sliding-window layers keep the whole context, as the others do.
+    pub swa_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -740,6 +915,22 @@ const MIB: f64 = 1_048_576.0;
 /// Fixed cost of a context on the GPU (driver, command buffers) and the compute graph per 512 tokens of ubatch.
 const CONTEXT_OVERHEAD_MIB: f64 = 200.0;
 const COMPUTE_MIB_PER_512_UBATCH: f64 = 300.0;
+
+/// Cells the cache of the sliding-window layers has, as llama.cpp sizes it (`llama_kv_cache_iswa`): the window plus a
+/// batch, rounded up to 256, for each slot (or for all of them together, with a unified cache), and never more than the
+/// context. With `--swa-full` it is the whole context.
+fn swa_cells(window: u64, p: &Placement) -> u64 {
+    if window == 0 || p.swa_full {
+        return p.ctx_total;
+    }
+    let pad = |n: u64| n.div_ceil(256) * 256;
+    let slots = p.slots.max(1);
+    if p.kv_unified {
+        pad(p.ctx_total.min(window * slots + p.ubatch))
+    } else {
+        slots * pad((p.ctx_total / slots).min(window + p.ubatch))
+    }
+}
 
 /// VRAM a load takes, from the shape, the context and the KV types. An estimate, within a few hundred MiB for
 /// the models measured (see docs/serving.md); the planner keeps a margin for that.
@@ -770,11 +961,11 @@ pub fn estimate_vram(shape: &ModelShape, p: &Placement) -> VramEstimate {
         weights -= weights * on_cpu;
     }
     weights = weights * on_gpu + p.extra_gpu_bytes as f64;
-    let per_token = shape.attn_layers as f64
-        * shape.n_head_kv as f64
-        * (shape.key_len as f64 * kv_bytes_per_elem(&p.cache_type_k)
-            + shape.val_len as f64 * kv_bytes_per_elem(&p.cache_type_v));
-    let kv = per_token * p.ctx_total as f64 * on_gpu;
+    let per_token =
+        |e: &KvElems| e.k as f64 * kv_bytes_per_elem(&p.cache_type_k) + e.v as f64 * kv_bytes_per_elem(&p.cache_type_v);
+    let kv = (per_token(&shape.kv_full) * p.ctx_total as f64
+        + per_token(&shape.kv_swa) * swa_cells(shape.swa_window, p) as f64)
+        * on_gpu;
     let state = shape.state_bytes_per_slot as f64 * p.slots as f64 * on_gpu;
     let compute = COMPUTE_MIB_PER_512_UBATCH * p.ubatch as f64 / 512.0 + CONTEXT_OVERHEAD_MIB;
     let r = |b: f64| (b / MIB).ceil() as u64;
@@ -853,6 +1044,10 @@ pub enum Fit {
     Cpu,
     /// The CPU's part does not fit in the memory that is available either.
     No { need_ram_mib: u64, free_ram_mib: u64 },
+    /// More than the RAM and the GPU hold, and paging was allowed: `paged_mib` of the weights are read from disk as the
+    /// model runs (slow: expect seconds per token). What cannot be paged (the KV cache, the state, the server's buffers)
+    /// does fit in RAM. `need_ram_mib` is what the load would need if it all fitted.
+    Paged { paged_mib: u64, need_ram_mib: u64 },
 }
 
 /// Memory the server program itself and its buffers take on the CPU side, beyond the model.
@@ -861,6 +1056,18 @@ pub const RAM_OVERHEAD_MIB: u64 = 768;
 /// Chooses between the GPU, a split and the CPU. Unlike [`plan`] it never refuses for want of VRAM alone: what does not
 /// fit on the GPU runs from RAM, and only a model that fits neither is turned down.
 pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: &[Resident], free_ram_mib: u64) -> Fit {
+    place_with(est, free_vram_mib, margin_mib, resident, free_ram_mib, false)
+}
+
+/// [`place`], where a model that fits neither the GPU nor RAM may be placed as [`Fit::Paged`] when `allow_paged`.
+pub fn place_with(
+    est: &VramEstimate,
+    free_vram_mib: u64,
+    margin_mib: u64,
+    resident: &[Resident],
+    free_ram_mib: u64,
+    allow_paged: bool,
+) -> Fit {
     match plan(est.total_mib, free_vram_mib, margin_mib, resident) {
         Plan::Fits => Fit::Gpu,
         Plan::Evict(models) => Fit::GpuAfter(models, est.total_mib + margin_mib),
@@ -869,7 +1076,14 @@ pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: 
             let usable = free_vram_mib.saturating_sub(margin_mib + est.compute_mib);
             let on_gpu = usable.min(movable);
             let need_ram_mib = movable - on_gpu + RAM_OVERHEAD_MIB;
-            if need_ram_mib > free_ram_mib {
+            // the weights can be paged from disk; the cache, the state and the server's own buffers cannot
+            let fixed_mib = est.kv_mib + est.state_mib + RAM_OVERHEAD_MIB;
+            if need_ram_mib > free_ram_mib && allow_paged && fixed_mib <= free_ram_mib {
+                Fit::Paged {
+                    paged_mib: need_ram_mib - free_ram_mib,
+                    need_ram_mib,
+                }
+            } else if need_ram_mib > free_ram_mib {
                 Fit::No {
                     need_ram_mib,
                     free_ram_mib,
@@ -885,6 +1099,46 @@ pub fn place(est: &VramEstimate, free_vram_mib: u64, margin_mib: u64, resident: 
     }
 }
 
+/// Layers a load that was to run on the CPU should put on the card because its weights do not fit the free RAM: the
+/// fewest that leave the rest in RAM, and no more than the free VRAM holds (what still does not fit is read from disk, as
+/// a CPU load always was). 0 when the file fits in RAM, or when the card has no room for even one layer. `est` is the
+/// estimate with every layer on the card (weights, cache, state and the compute buffers, which a card load needs once).
+pub fn spill_layers(
+    est: &VramEstimate,
+    layers: u64,
+    file_mib: u64,
+    free_ram_mib: u64,
+    free_vram_mib: u64,
+    margin_mib: u64,
+) -> u64 {
+    let need_ram = file_mib + RAM_OVERHEAD_MIB;
+    if layers == 0 || need_ram <= free_ram_mib {
+        return 0;
+    }
+    let ram_per_layer = (file_mib / layers).max(1);
+    let wanted = (need_ram - free_ram_mib).div_ceil(ram_per_layer).min(layers);
+    let movable = est.weights_mib + est.kv_mib + est.state_mib;
+    let vram_per_layer = movable.div_ceil(layers).max(1);
+    let usable = free_vram_mib.saturating_sub(margin_mib + est.compute_mib);
+    wanted.min(usable / vram_per_layer)
+}
+
+/// VRAM expert slots (`--moe-slots`) a paged Rigel load of a mixture-of-experts model can afford in `budget_mib`: what is
+/// left after the non-expert weights, the cache and the compute buffers (`paged`: the estimate with the experts left out),
+/// at 90 %, divided by the size of one expert slot. Measured on a 22 GB Q8_0 MoE: 1536 slots 19 GB and 65.7 tokens/s,
+/// 1024 slots 14.4 GB and 35.8, 512 slots 10.6 GB and 21.6. None when fewer than 64 fit (paging would thrash), and never
+/// more than the model has experts (then nothing needs paging).
+pub fn paged_slots(shape: &ModelShape, expert_count: u64, paged: &VramEstimate, budget_mib: u64) -> Option<u64> {
+    let all = shape.layers.checked_mul(expert_count)?;
+    if all == 0 || shape.expert_share <= 0.0 {
+        return None;
+    }
+    let slot_mib = shape.file_bytes as f64 / MIB * shape.expert_share / all as f64;
+    let room = budget_mib.saturating_sub(paged.total_mib) as f64 * 0.9;
+    let slots = (room / slot_mib.max(0.01)) as u64;
+    (slots >= 64).then_some(slots.min(all))
+}
+
 /// A JSON view of a placement for the API (`model.plan`).
 pub fn fit_json(f: &Fit) -> Value {
     match f {
@@ -898,6 +1152,12 @@ pub fn fit_json(f: &Fit) -> Value {
             need_ram_mib,
             free_ram_mib,
         } => json!({"where": "none", "need_ram_mib": need_ram_mib, "free_ram_mib": free_ram_mib}),
+        Fit::Paged {
+            paged_mib,
+            need_ram_mib,
+        } => json!({
+            "where": "paged", "paged_mib": paged_mib, "need_ram_mib": need_ram_mib,
+            "note": "disk-bound: part of the weights is read from disk as the model runs; expect seconds per token"}),
     }
 }
 
@@ -1257,6 +1517,8 @@ mod tests {
             cpu_moe: false,
             n_cpu_moe: 0,
             extra_gpu_bytes: 0,
+            kv_unified: false,
+            swa_full: false,
         }
     }
 
@@ -1278,6 +1540,161 @@ mod tests {
             estimate_vram(&shape, &place(65536, 1, "f16", "f16")).kv_mib,
             f16.kv_mib * 2
         );
+    }
+
+    /// The header of gemma-4-31B-it as the file has it: 60 layers, every sixth one full attention (4 KV heads of 512),
+    /// the rest a 1024-token window (16 KV heads of 256).
+    fn gemma4_meta() -> Map<String, Value> {
+        let heads: Vec<u64> = (0..60).map(|il| if il % 6 == 5 { 4 } else { 16 }).collect();
+        let pattern: Vec<bool> = (0..60).map(|il| il % 6 != 5).collect();
+        meta(&[
+            ("general.architecture", json!("gemma4")),
+            ("gemma4.block_count", json!(60)),
+            ("gemma4.embedding_length", json!(5376)),
+            ("gemma4.attention.head_count", json!(32)),
+            ("gemma4.attention.head_count_kv", json!(heads)),
+            ("gemma4.attention.key_length", json!(512)),
+            ("gemma4.attention.value_length", json!(512)),
+            ("gemma4.attention.key_length_swa", json!(256)),
+            ("gemma4.attention.value_length_swa", json!(256)),
+            ("gemma4.attention.sliding_window", json!(1024)),
+            ("gemma4.attention.sliding_window_pattern", json!(pattern)),
+            ("gemma4.attention.shared_kv_layers", json!(0)),
+        ])
+    }
+
+    #[test]
+    fn a_sliding_window_model_is_sized_as_the_server_sizes_it() {
+        let shape = shape_from_meta(&gemma4_meta(), 11_213 << 20).unwrap();
+        assert_eq!((shape.layers, shape.attn_layers, shape.swa_window), (60, 60, 1024));
+        // 10 full layers x 4 heads x 512, 50 window layers x 16 heads x 256
+        assert_eq!(shape.kv_full, KvElems { k: 20_480, v: 20_480 });
+        assert_eq!(shape.kv_swa, KvElems { k: 204_800, v: 204_800 });
+        // what llama-server printed for this file at -c 4096, one slot, f16: 4096 cells over 10 layers (320 MiB) and
+        // 1536 cells over 50 (1200 MiB): the window, 1024, and a batch of 512
+        let e = estimate_vram(&shape, &place(4096, 1, "f16", "f16"));
+        assert_eq!(e.kv_mib, 320 + 1200);
+        // the context grows the full layers only: at 32768 the window layers still hold 1536 cells
+        let long = estimate_vram(&shape, &place(32768, 1, "f16", "f16"));
+        assert_eq!(long.kv_mib, 2560 + 1200);
+        // treated as all full attention with 32 KV heads of 512 (what the estimate did before) the same load came to
+        // 15 GiB of cache at 4096 tokens
+        let all_full = ModelShape {
+            kv_full: KvElems {
+                k: 60 * 32 * 512,
+                v: 60 * 32 * 512,
+            },
+            kv_swa: KvElems::default(),
+            swa_window: 0,
+            ..shape.clone()
+        };
+        assert_eq!(estimate_vram(&all_full, &place(4096, 1, "f16", "f16")).kv_mib, 15_360);
+        // slots each have a window of their own; the full layers share the -c
+        let two = estimate_vram(&shape, &place(8192, 2, "f16", "f16"));
+        assert_eq!(two.kv_mib, 640 + 2400);
+        // a unified cache has one window for all the slots: 2 x 1024 + 512, rounded to 2560 cells
+        let unified = estimate_vram(
+            &shape,
+            &Placement {
+                kv_unified: true,
+                ..place(8192, 2, "f16", "f16")
+            },
+        );
+        assert_eq!(unified.kv_mib, 640 + 2000);
+        // --swa-full keeps the whole context in every layer
+        let full = estimate_vram(
+            &shape,
+            &Placement {
+                swa_full: true,
+                ..place(4096, 1, "f16", "f16")
+            },
+        );
+        assert_eq!(full.kv_mib, 320 + 3200);
+        // a context shorter than the window needs no more than the context
+        let short = estimate_vram(&shape, &place(512, 1, "f16", "f16"));
+        assert_eq!(short.kv_mib, 40 + 400);
+    }
+
+    #[test]
+    fn the_period_built_into_the_architecture_stands_in_for_a_pattern_the_file_lacks() {
+        // gemma 3 27B: 62 layers, every sixth full (10), the rest a 1024 window (52); 16 KV heads of 128, scalar
+        let m = meta(&[
+            ("general.architecture", json!("gemma3")),
+            ("gemma3.block_count", json!(62)),
+            ("gemma3.embedding_length", json!(5376)),
+            ("gemma3.attention.head_count", json!(32)),
+            ("gemma3.attention.head_count_kv", json!(16)),
+            ("gemma3.attention.key_length", json!(128)),
+            ("gemma3.attention.value_length", json!(128)),
+            ("gemma3.attention.sliding_window", json!(1024)),
+        ]);
+        let shape = shape_from_meta(&m, 16 << 30).unwrap();
+        assert_eq!(shape.kv_full.k, 10 * 16 * 128);
+        assert_eq!(shape.kv_swa.k, 52 * 16 * 128);
+        assert_eq!(shape.swa_window, 1024);
+        // no window in the file: gemma 3 is plain attention
+        let mut plain = m.clone();
+        plain.remove("gemma3.attention.sliding_window");
+        let shape = shape_from_meta(&plain, 16 << 30).unwrap();
+        assert_eq!((shape.kv_swa, shape.swa_window), (KvElems::default(), 0));
+        assert_eq!(shape.kv_full.k, 62 * 16 * 128);
+        // gemma 2 has a window of 4096 built in, on every other layer (the even ones)
+        let g2 = meta(&[
+            ("general.architecture", json!("gemma2")),
+            ("gemma2.block_count", json!(42)),
+            ("gemma2.embedding_length", json!(3584)),
+            ("gemma2.attention.head_count", json!(16)),
+            ("gemma2.attention.head_count_kv", json!(8)),
+            ("gemma2.attention.key_length", json!(256)),
+            ("gemma2.attention.value_length", json!(256)),
+        ]);
+        let shape = shape_from_meta(&g2, 5 << 30).unwrap();
+        assert_eq!(
+            (shape.kv_full.k, shape.kv_swa.k, shape.swa_window),
+            (21 * 8 * 256, 21 * 8 * 256, 4096)
+        );
+        // the file's own period wins over the built-in one, and 0 means every layer
+        let mut own = g2.clone();
+        own.insert("gemma2.attention.sliding_window_pattern".into(), json!(3));
+        let shape = shape_from_meta(&own, 5 << 30).unwrap();
+        assert_eq!(shape.kv_full.k, 14 * 8 * 256);
+        // an architecture the table does not know, with a window but no pattern: all full, the safe side
+        let mut other = g2.clone();
+        other.insert("general.architecture".into(), json!("newarch"));
+        for key in g2.keys().filter(|k| k.starts_with("gemma2.")) {
+            other.insert(key.replace("gemma2.", "newarch."), g2[key].clone());
+        }
+        other.insert("newarch.attention.sliding_window".into(), json!(4096));
+        let shape = shape_from_meta(&other, 5 << 30).unwrap();
+        assert_eq!((shape.kv_swa, shape.swa_window), (KvElems::default(), 0));
+        assert_eq!(shape.kv_full.k, 42 * 8 * 256);
+    }
+
+    #[test]
+    fn layers_that_share_the_cache_of_earlier_ones_add_none() {
+        let mut m = gemma4_meta();
+        m.insert("gemma4.attention.shared_kv_layers".into(), json!(20));
+        let shape = shape_from_meta(&m, 5 << 30).unwrap();
+        // the first 40 layers keep a cache: 6 full ones (il 5, 11, ... 35) and 34 window ones
+        assert_eq!(shape.attn_layers, 40);
+        assert_eq!(shape.kv_full.k, 6 * 4 * 512);
+        assert_eq!(shape.kv_swa.k, 34 * 16 * 256);
+    }
+
+    #[test]
+    fn a_list_of_heads_per_layer_drops_the_layers_without_attention() {
+        // a hybrid that says it with zeros instead of an interval: attention in 2 of 4 layers
+        let m = meta(&[
+            ("general.architecture", json!("lst")),
+            ("lst.block_count", json!(4)),
+            ("lst.embedding_length", json!(1024)),
+            ("lst.attention.head_count", json!(8)),
+            ("lst.attention.head_count_kv", json!([0, 2, 0, 4])),
+            ("lst.attention.key_length", json!(64)),
+        ]);
+        let shape = shape_from_meta(&m, 1 << 30).unwrap();
+        assert_eq!(shape.attn_layers, 2);
+        assert_eq!(shape.kv_full, KvElems { k: 6 * 64, v: 6 * 64 });
     }
 
     #[test]
@@ -1599,6 +2016,84 @@ Exiting, please wait...
     }
 
     #[test]
+    fn paged_slots_follow_what_the_card_has_left() {
+        let sh = ModelShape {
+            file_bytes: 22_000 * 1_048_576,
+            layers: 40,
+            attn_layers: 10,
+            n_embd: 2048,
+            kv_full: KvElems { k: 5120, v: 5120 },
+            kv_swa: KvElems::default(),
+            swa_window: 0,
+            state_bytes_per_slot: 0,
+            expert_share: 0.8,
+        };
+        // 40 layers of 256 experts: a slot is 17,600 / 10,240 MiB
+        let base = est(4_400, 600, 500);
+        let n = paged_slots(&sh, 256, &base, 22_000).unwrap();
+        assert!((7_000..9_000).contains(&n), "{n}");
+        // a small card leaves too little: no paging
+        assert_eq!(paged_slots(&sh, 256, &base, 5_800), None);
+        // never more slots than experts
+        assert_eq!(paged_slots(&sh, 2, &base, 90_000), Some(80));
+        // a dense model has none
+        let dense = ModelShape {
+            expert_share: 0.0,
+            ..sh
+        };
+        assert_eq!(paged_slots(&dense, 0, &base, 22_000), None);
+    }
+
+    #[test]
+    fn the_cards_free_memory_takes_what_the_ram_cannot() {
+        // 40 layers, a 40,000 MiB file (1,000 per layer), 32 GB of cache and state besides the weights
+        let e = est(40_000, 2_000, 500);
+        // fits in RAM: nothing moves
+        assert_eq!(spill_layers(&e, 40, 40_000, 50_000, 24_000, 512), 0);
+        // 10,000 MiB short (plus the server's own 768): 11 layers, the card has room for far more
+        assert_eq!(spill_layers(&e, 40, 40_000, 30_768, 24_000, 512), 10);
+        // the card holds fewer than are wanted: it takes what fits (20 of 1,050 MiB), the rest stays on disk
+        assert_eq!(spill_layers(&e, 40, 40_000, 10_000, 23_000, 512), 20);
+        // no room for one layer, or no layers known: stays on the CPU
+        assert_eq!(spill_layers(&e, 40, 40_000, 10_000, 900, 512), 0);
+        assert_eq!(spill_layers(&e, 0, 40_000, 10_000, 24_000, 512), 0);
+        // never more layers than the model has
+        assert_eq!(spill_layers(&e, 40, 40_000, 0, 200_000, 512), 40);
+    }
+
+    #[test]
+    fn a_model_bigger_than_the_memory_is_paged_only_when_allowed() {
+        let e = est(8000, 1000, 300);
+        let busy = [res("a", 100, 20_000, true)];
+        // not allowed: refused, exactly as place() says
+        assert_eq!(
+            super::place_with(&e, 700, 512, &busy, 4000, false),
+            super::place(&e, 700, 512, &busy, 4000)
+        );
+        // allowed: the weights beyond what RAM holds are paged
+        assert_eq!(
+            super::place_with(&e, 700, 512, &busy, 4000, true),
+            Fit::Paged {
+                paged_mib: 9768 - 4000,
+                need_ram_mib: 9768
+            }
+        );
+        // the cache, the state and the server's buffers cannot be paged: too little RAM for them is still a refusal
+        assert!(matches!(
+            super::place_with(&e, 700, 512, &busy, 1000, true),
+            Fit::No { .. }
+        ));
+        // a model that fits is placed as before, whatever is allowed
+        assert_eq!(super::place_with(&e, 20_000, 512, &[], 4000, true), Fit::Gpu);
+        let j = fit_json(&Fit::Paged {
+            paged_mib: 5768,
+            need_ram_mib: 9768,
+        });
+        assert_eq!(j["where"], "paged");
+        assert_eq!(j["paged_mib"], 5768);
+    }
+
+    #[test]
     fn a_resident_model_that_runs_on_the_cpu_is_not_unloaded_for_vram() {
         let loaded = [res("cpu-model", 9999, 0, false), res("gpu-model", 10, 8000, false)];
         assert_eq!(plan(8000, 1000, 512, &loaded), Plan::Evict(vec!["gpu-model".into()]));
@@ -1659,6 +2154,85 @@ Exiting, please wait...
     }
 
     #[test]
+    fn layer_readahead_is_a_rigel_option_and_zero_means_off() {
+        let on = ServeFlags {
+            engine: Some("rigel".into()),
+            layer_readahead: Some(4),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &on), None, &ServeProfile::default(), (0, 999, 1));
+        r.validate().unwrap();
+        assert!(r.args().join(" ").ends_with("--layer-readahead 4"), "{:?}", r.args());
+        let off = ServeFlags {
+            layer_readahead: Some(0),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &off), None, &ServeProfile::default(), (0, 999, 1));
+        assert!(!r.args().join(" ").contains("readahead"));
+        // llama.cpp does not have it
+        let plain = ServeFlags {
+            layer_readahead: Some(4),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &plain), None, &ServeProfile::default(), (0, 999, 1));
+        assert!(r.validate().unwrap_err().contains("layer_readahead is a Rigel option"));
+    }
+
+    #[test]
+    fn layer_resident_mib_is_a_rigel_option_where_zero_is_off_and_minus_one_is_what_is_free() {
+        let on = ServeFlags {
+            engine: Some("rigel".into()),
+            layer_readahead: Some(4),
+            layer_resident_mib: Some(2048),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &on), None, &ServeProfile::default(), (0, 0, 1));
+        r.validate().unwrap();
+        assert!(
+            r.args()
+                .join(" ")
+                .ends_with("--layer-readahead 4 --layer-resident-mib 2048"),
+            "{:?}",
+            r.args()
+        );
+        let auto = ServeFlags {
+            layer_resident_mib: Some(-1),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &auto), None, &ServeProfile::default(), (0, 0, 1));
+        r.validate().unwrap();
+        assert!(
+            r.args().join(" ").ends_with("--layer-resident-mib -1"),
+            "{:?}",
+            r.args()
+        );
+        let off = ServeFlags {
+            layer_resident_mib: Some(0),
+            ..on.clone()
+        };
+        let r = Resolved::new((None, None, None, &off), None, &ServeProfile::default(), (0, 0, 1));
+        assert!(!r.args().join(" ").contains("resident"));
+        // below -1 means nothing
+        let bad = ServeFlags {
+            layer_resident_mib: Some(-5),
+            ..on.clone()
+        };
+        assert!(validate_flags(&bad, Some(1))
+            .unwrap_err()
+            .contains("layer_resident_mib"));
+        // llama.cpp does not have it
+        let plain = ServeFlags {
+            layer_resident_mib: Some(2048),
+            ..Default::default()
+        };
+        let r = Resolved::new((None, None, None, &plain), None, &ServeProfile::default(), (0, 0, 1));
+        assert!(r
+            .validate()
+            .unwrap_err()
+            .contains("layer_resident_mib is a Rigel option"));
+    }
+
+    #[test]
     fn rigel_gets_one_slot_its_flags_and_its_cache_variable() {
         let rigel = ServeFlags {
             engine: Some("rigel".into()),
@@ -1667,6 +2241,7 @@ Exiting, please wait...
             moe_pack_dir: Some(PathBuf::from("bundle")),
             moe_profile: Some(PathBuf::from("bundle/profile.bin")),
             moe_cache_mib: Some(4096),
+            layer_readahead: Some(4),
             ..Default::default()
         };
         // the engine in [serving], the options in the model's profile: they still meet
@@ -1696,7 +2271,7 @@ Exiting, please wait...
         r.validate().unwrap();
         assert_eq!(
             r.args().join(" "),
-            "-c 8192 -ngl 999 -np 1 --moe-direct-io --moe-slots 5000 --moe-pack-dir bundle --moe-profile bundle/profile.bin"
+            "-c 8192 -ngl 999 -np 1 --moe-direct-io --moe-slots 5000 --moe-pack-dir bundle --moe-profile bundle/profile.bin --layer-readahead 4"
         );
         assert_eq!(r.env(), [("MOE_CACHE_MIB".to_string(), "4096".to_string())]);
         assert_eq!(Serving::from_resolved(&r).engine, "rigel");
@@ -1750,6 +2325,7 @@ Exiting, please wait...
     #[test]
     fn every_flag_is_built() {
         let f = ServeFlags {
+            paged: None,
             ctx_per_slot: None,
             cache_type_k: Some("q8_0".into()),
             cache_type_v: Some("q4_0".into()),
@@ -1768,6 +2344,8 @@ Exiting, please wait...
             moe_pack_dir: None,
             moe_profile: None,
             moe_cache_mib: None,
+            layer_readahead: None,
+            layer_resident_mib: None,
         };
         let r = Resolved::new(
             (Some(65536), Some(20), Some(3), &f),

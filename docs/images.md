@@ -102,3 +102,25 @@ Request parsing, sizes, argument building, progress parsing and model pairing ar
 ```bash
 MM_TEST_IMAGE_MODEL=<a model file> cargo test --features bundled-engine -- --ignored draws_with_a_real_model
 ```
+
+## MOSS-Image, MiniMax-H3-Image and video models (stable-diffusion.cpp master-1127)
+
+The vendored stable-diffusion.cpp is at `master-1127` (it was `master-951`, which has neither MOSS-Image nor MiniMax-H3-Image).
+Keep each model's files together in one folder (the hub pairs them by name, as for FLUX). Companions it knows:
+`tokenizer.json` (`--tokenizer`), a file with `audio_vae` or `audio-vae` in its name (`--audio-vae`), a text encoder whose name
+starts with `qwen3vl`, `qwen3.5` or `gemma` (`--llm`), besides the VAE, CLIP and T5 files above.
+
+| Model | Files in its folder | Settings the hub applies (a request's own values win) |
+|---|---|---|
+| MOSS-Image-Base (5.1B, GGUF) | `MOSS-Image-Base-<quant>.gguf`, `Qwen3.5-9B-Q8_0.gguf`, the VAE (name with `vae`), `tokenizer.json` | 50 steps, `--cfg-scale 3`, `--flow-shift 5`, `--offload-to-cpu` |
+| MiniMax-H3-Image (GGUF) | `minimax_h3_image_pruned-<quant>.gguf`, `qwen3vl_32b_minimax_h3-Q4_K_M.gguf`, the image VAE | 6 steps, cfg 1, `euler`, `--sigmas minimax-h3-image`, `--rng cpu`, `--offload-to-cpu` |
+| LTX-2.5 (video and sound) | the GGUF transformer, the Gemma 4 text encoder, the video VAE (conv) and the audio VAE | `POST /v1/videos/generations` |
+
+The `unsloth/LTX-2.5-FP8` safetensors are in torchao's layout for diffusers, which sd.cpp does not read; use the ComfyUI-format or GGUF files its
+`docs/models/ltx2.md` lists.
+
+`POST /v1/videos/generations` takes the image fields plus `frames` (1 to 481, default 49) and `fps` (1 to 60, default 24) and answers like the image
+route with a WebM that carries the sound (`b64_json` or a `url` of `/v1/images/files/<name>.webm`); `image.generate` also takes `frames` and `fps`.
+The WebP and WebM writers are on in the bundled build. A big model that does not fit the card runs with `--offload-to-cpu` (layers move between RAM
+and the card): MiniMax-H3-Image Q8_0 (22 GB) plus its 18 GB encoder is about 14 s a step on a 24 GB card by the model page; UD-Q4_K_XL (13.6 GB) fits.
+Chat shows the results in the media canvas: [chat-canvas.md](chat-canvas.md).

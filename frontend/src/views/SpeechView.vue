@@ -38,6 +38,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue'
 import { failure, hubFetch } from '@/chat/hub'
+import { toWav } from '@/wav'
 
 const sttOff = ref('')
 const ttsOff = ref('')
@@ -56,12 +57,13 @@ let tick: number | undefined
 
 const off = (e: any) => (e?.status === 501 || e?.status === 404 ? String(e.message) : '')
 
-async function transcribe(blob: Blob, name: string) {
+async function transcribe(recording: Blob) {
   sttBusy.value = true
   sttError.value = ''
   try {
+    // the hub reads WAV (not the WebM a browser records), so every clip is written out as WAV first
     const fd = new FormData()
-    fd.append('file', blob, name)
+    fd.append('file', await toWav(recording), 'speech.wav')
     const r = await hubFetch('/v1/audio/transcriptions', { method: 'POST', body: fd })
     if (!r.ok) throw await failure(r)
     transcript.value = ((await r.json()).text || '').trim()
@@ -82,7 +84,7 @@ async function record() {
     rec.ondataavailable = (e) => chunks.push(e.data)
     rec.onstop = () => {
       stream.getTracks().forEach((t) => t.stop())
-      transcribe(new Blob(chunks, { type: rec?.mimeType || 'audio/webm' }), 'speech.webm')
+      transcribe(new Blob(chunks, { type: rec?.mimeType || 'audio/webm' }))
     }
     rec.start()
     recording.value = true
@@ -100,7 +102,7 @@ function finish() {
 function onFile(e: Event) {
   const el = e.target as HTMLInputElement
   const f = el.files?.[0]
-  if (f) transcribe(f, f.name)
+  if (f) transcribe(f)
   el.value = ''
 }
 async function speak() {

@@ -1,6 +1,12 @@
 # AirLLM integration plan
 
-Status: a plan. Nothing is built and no source file was changed. Written 2026-11-23 for ModelMistress 0.4.0 on branch
+> **Superseded.** AirLLM's features were integrated into Rigel, so there is no separate AirLLM path any more: Rigel is the
+> one engine that runs a model bigger than memory from disk (`paged` loads, `layer_readahead`, `layer_resident_mib`; see
+> `docs/rigel.md`). This plan is kept as the record of the decisions and the evidence. Its open questions (section 11) are
+> answered by the Rigel integration, not by this document.
+
+Status: a plan. **Phase 0 was partly run on 2026-11-24: see [airllm-spike-results.md](airllm-spike-results.md)** (T3 and T4
+pass on a 1.7B model; AirLLM was 38 times slower; T2 and T5 still open). Nothing is built and no source file was changed. Written 2026-11-23 for ModelMistress 0.4.0 on branch
 `feat/misty`. The owner reviews it and decides; section 11 lists the decisions.
 
 AirLLM (https://github.com/lyogavin/airllm) runs a model that is bigger than GPU memory by keeping only one transformer

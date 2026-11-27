@@ -441,6 +441,23 @@ mod tests {
         assert!(main.note.contains("misty setup"));
     }
 
+    /// A model that only loads from disk (the hub's `paged` placement) is bigger than the free RAM, so Misty never picks
+    /// it by herself, and one the owner pins is shown as unfit.
+    #[test]
+    fn a_model_that_could_only_run_paged_is_never_picked_and_a_pinned_one_is_unfit() {
+        let cat = vec![
+            entry("huge-70b-Q4_K_M", 200.0, "llama"),
+            entry("qwen3-8b-Q4_K_M", 5.0, "qwen3"),
+        ];
+        let eng = Engines::default();
+        let r = resolve(&cat, &BTreeMap::new(), eng, 40 * GB, 2 * GB);
+        assert!(r.iter().all(|x| x.model.as_deref() != Some("huge-70b-Q4_K_M")));
+        let pinned = BTreeMap::from([("main".to_string(), "huge-70b-Q4_K_M".to_string())]);
+        let r = resolve(&cat, &pinned, eng, 40 * GB, 2 * GB);
+        let main = r.iter().find(|x| x.role == Role::Main).unwrap();
+        assert_eq!(main.status, "unfit");
+    }
+
     #[test]
     fn a_model_that_does_not_fit_free_ram_is_unfit_and_a_fallback_is_by_size_class() {
         let cat = vec![

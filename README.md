@@ -140,7 +140,7 @@ Everything but `/v1/health` needs `Authorization: Bearer <token>`.
 Operations: `service.status`, `backend.list`, `model.list`, `model.info`, `model.loaded`, `model.load`,
 `model.plan`, `model.unload`, `model.pull`, `model.search`, `model.files`, `model.delete`, `model.show`, `model.create`, `model.copy`, `job.list`, `job.get`, `job.cancel`,
 `chat.complete`, `speech.transcribe`, `speech.synthesize`, `image.generate`, `vision.analyze`, `quantize`, `lora`, `speculative`, `embeddings.create`,
-`rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `config.get`,
+`rerank.run`, `model.convert` (answers 501), `bench.run` (llama-bench), `metrics.get`, `logs.tail`, `model.telemetry`, `config.get`,
 `config.set`, and the families `km.*`, `factory.*` and `trace.*` (`GET /v1/operations` lists every one with its
 schema). Every operation is also an MCP tool.
 

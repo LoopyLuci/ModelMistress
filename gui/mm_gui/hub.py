@@ -9,8 +9,10 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import quote
 
 # The hub is on this machine: never send its requests through a proxy from the environment.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -57,6 +59,31 @@ def sse_events(lines: Iterable[bytes]) -> Iterator[str]:
             data.append(value[1:] if value.startswith(" ") else value)
     if data:
         yield "\n".join(data)
+
+
+class _Counted:
+    """A file as it is read to be sent, reporting how many bytes have been read so far."""
+
+    def __init__(self, f, on_bytes: Callable[[int], None]):
+        self._f = f
+        self._on_bytes = on_bytes
+        self.sent = 0
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._f.read(n)
+        self.sent += len(chunk)
+        self._on_bytes(self.sent)
+        return chunk
+
+
+def _multipart(field: str, filename: str, content_type: str, data: bytes) -> tuple[bytes, str]:
+    """One file as a multipart/form-data body, with the Content-Type header that goes with it."""
+    boundary = "----mm" + uuid.uuid4().hex
+    head = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    return head + data + f"\r\n--{boundary}--\r\n".encode("ascii"), f"multipart/form-data; boundary={boundary}"
 
 
 def _http_error(e: urllib.error.HTTPError) -> HubError:
@@ -163,10 +190,12 @@ class Hub:
         messages: list[dict],
         on_text: Callable[[str], None],
         cancel: threading.Event | None = None,
+        options: dict | None = None,
     ) -> str:
         """A streamed answer (POST /v1/chat/completions, stream on). `on_text` gets each piece as it arrives and the
-        whole text comes back. Setting `cancel` stops reading before the next piece."""
-        body = {"model": model, "messages": messages, "stream": True}
+        whole text comes back. Setting `cancel` stops reading before the next piece. `options` are sent as they are
+        (top_k, seed, and the rest of the sampling settings)."""
+        body = {"model": model, "messages": messages, "stream": True, **(options or {})}
         pieces: list[str] = []
         with self._open("POST", "/v1/chat/completions", body, timeout=600) as resp:
             for payload in sse_events(resp):
@@ -180,6 +209,42 @@ class Hub:
                     pieces.append(text)
                     on_text(text)
         return "".join(pieces)
+
+    # ---- files, speech and the benchmark (the hub's own routes; see src/hub.rs) ------------------------------------
+
+    def document_text(self, pdf: bytes) -> tuple[str, bool]:
+        """The text of a PDF, and whether it was cut short (POST /v1/documents/text). No OCR: a scan has no text."""
+        doc = self._json(self._open("POST", "/v1/documents/text", raw=pdf, headers={"Content-Type": "application/pdf"}, timeout=300))
+        return str(doc.get("text") or ""), bool(doc.get("truncated"))
+
+    def import_model(self, path: Path, on_bytes: Callable[[int], None] | None = None) -> dict:
+        """Copy a .gguf file into the hub's models folder (POST /v1/models/import). `on_bytes` hears the bytes sent so far.
+        Returns {"name", "bytes", "path"}. The file is streamed, so a multi-gigabyte model is not read into memory."""
+        size = path.stat().st_size
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(size),
+            "x-file-name": quote(path.name, safe=""),
+        }
+        with open(path, "rb") as f:
+            body = _Counted(f, on_bytes or (lambda _n: None))
+            return self._json(self._open("POST", "/v1/models/import", raw=body, headers=headers, timeout=7200))
+
+    def transcribe(self, wav: bytes) -> str:
+        """The words in a WAV clip, by the hub's speech to text (POST /v1/audio/transcriptions)."""
+        data, content_type = _multipart("file", "speech.wav", "audio/wav", wav)
+        doc = self._json(self._open("POST", "/v1/audio/transcriptions", raw=data, headers={"Content-Type": content_type}, timeout=600))
+        return str(doc.get("text") or "").strip()
+
+    def speak(self, text: str) -> bytes:
+        """`text` spoken by the hub's text to speech, as WAV bytes (POST /v1/audio/speech)."""
+        body = {"model": "tts-1", "input": text, "response_format": "wav"}
+        with self._open("POST", "/v1/audio/speech", body, timeout=600) as resp:
+            return resp.read()
+
+    def bench(self, seconds: float = 10, tokens: int = 96) -> dict:
+        """Benchmark this machine and each installed chat model (system.bench). Takes minutes on a CPU."""
+        return self.call("system.bench", {"seconds": seconds, "tokens": tokens}, timeout=1800)
 
     # ---- Misty, the agent inside the hub (misty.* operations; docs/misty/DESIGN.md) ----------------------------------
 
@@ -200,6 +265,29 @@ class Hub:
     def misty_approve(self, approval: str, allow: bool) -> Any:
         return self.call("misty.approve", {"approval": approval, "allow": allow})
 
+    def misty_rate(self, run: str, label: str, correction: str | None = None) -> dict:
+        """The owner's verdict on a reply: good, bad, no_tools, needs_tools, or corrected with the right answer."""
+        args: dict = {"run": run, "label": label}
+        if correction:
+            args["correction"] = correction
+        return self.call("misty.rate", args)
+
+    def misty_teach(self, question: str, answer: str, correction: str) -> dict:
+        """A correction given by voice on a reply that was not a Misty run (the Live conversation)."""
+        return self.call("misty.teach", {"question": question, "answer": answer, "correction": correction})
+
+    def misty_feedback(self, limit: int = 100) -> dict:
+        """The owner's verdicts, newest first, with the counts: {"verdicts": [...], "counts": {...}}."""
+        return self.call("misty.feedback.list", {"limit": limit})
+
+    def misty_forget(self, verdict: int | None = None, everything: bool = False) -> dict:
+        """Remove one verdict by its id, or all of them."""
+        return self.call("misty.feedback.forget", {"all": True} if everything else {"id": verdict})
+
+    def misty_export(self) -> dict:
+        """The good replies and the corrections as chat-format training data: {"count", "jsonl"}."""
+        return self.call("misty.training.export")
+
     def misty_run(self, args: dict, on_page: Callable[[dict], None], cancel: threading.Event | None = None) -> dict:
         """Start a run and follow it to its end. `on_page` gets {"start": the start reply} first, then each page of
         events ({"events", "pending", "done", ...}). Setting `cancel` asks the hub to stop the run; the last events
@@ -217,15 +305,17 @@ class Hub:
             if page.get("done"):
                 return page
 
-    def _open(self, method: str, path: str, body: Any = None, timeout: float | None = None):
-        headers = {"Accept": "application/json"}
-        data = None
-        if body is not None:
+    def _open(self, method: str, path: str, body: Any = None, timeout: float | None = None, *,
+              raw: Any = None, headers: dict | None = None):
+        """One request. `body` goes as JSON; `raw` goes as it is: bytes, or a file that is read as it is sent."""
+        head = {"Accept": "application/json", **(headers or {})}
+        data = raw
+        if raw is None and body is not None:
             data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+            head["Content-Type"] = "application/json"
         if path != "/v1/health":
-            headers["Authorization"] = f"Bearer {self.token}"
-        request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+            head["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(self.url + path, data=data, method=method, headers=head)
         try:
             return _OPENER.open(request, timeout=timeout or self.timeout)
         except urllib.error.HTTPError as e:

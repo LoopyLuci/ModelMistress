@@ -80,7 +80,9 @@ fn serve_file(home: &Path, rel: &str) -> Response {
                     (header::REFERRER_POLICY, "no-referrer"),
                     (
                         header::CONTENT_SECURITY_POLICY,
-                        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+                        // blob: is for the chat canvas, which fetches hub files with the token and shows them from blob URLs (pictures,
+        // video, sound, 3D, documents). Remote http(s) files are not loaded by the page.
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' blob: data:; frame-src blob: data:; frame-ancestors 'none'",
                     ),
                 ],
                 bytes,

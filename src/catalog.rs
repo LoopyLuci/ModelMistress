@@ -524,7 +524,12 @@ fn read_str(r: &mut (impl Read + Seek)) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&b).into_owned())
 }
 
-/// Reads one value. Scalars and strings come back; arrays are skipped (None).
+/// The longest list of numbers or flags that is kept (one per layer, like `head_count_kv` of a model whose layers
+/// differ, or the sliding-window pattern). Anything longer is a vocabulary or a table and is skipped.
+const MAX_KEPT_ARRAY: u64 = 1024;
+
+/// Reads one value. Scalars and strings come back, and so do short lists of numbers or flags (per layer settings);
+/// every other array is skipped (None).
 fn read_value(r: &mut BufReader<File>, ty: u32) -> std::io::Result<Option<Value>> {
     Ok(Some(match ty {
         0 => json!(read_n::<1>(r)?[0]),
@@ -540,6 +545,13 @@ fn read_value(r: &mut BufReader<File>, ty: u32) -> std::io::Result<Option<Value>
             let ety = u32::from_le_bytes(read_n(r)?);
             let n = u64::from_le_bytes(read_n(r)?);
             match scalar_size(ety) {
+                Some(_) if n <= MAX_KEPT_ARRAY => {
+                    let mut items = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        items.push(read_value(r, ety)?.unwrap_or(Value::Null));
+                    }
+                    return Ok(Some(Value::Array(items)));
+                }
                 Some(sz) => r.seek_relative((sz * n) as i64)?,
                 None if ety == 8 => {
                     for _ in 0..n {
@@ -637,6 +649,55 @@ mod tests {
         assert!(!m.contains_key("tokenizer.ggml.model"));
         std::fs::write(d.join("bad.gguf"), b"nope").unwrap();
         assert!(read_meta(&d.join("bad.gguf")).is_err());
+    }
+
+    #[test]
+    fn keeps_short_lists_of_numbers_and_flags_and_skips_long_ones() {
+        let d = tmp("lists");
+        let f = d.join("m.gguf");
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&5u64.to_le_bytes());
+        let s = |b: &mut Vec<u8>, v: &str| {
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        };
+        s(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        s(&mut b, "gemma4");
+        // one value per layer: kept
+        s(&mut b, "gemma4.attention.head_count_kv");
+        b.extend_from_slice(&9u32.to_le_bytes());
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&3u64.to_le_bytes());
+        for n in [16u32, 16, 4] {
+            b.extend_from_slice(&n.to_le_bytes());
+        }
+        s(&mut b, "gemma4.attention.sliding_window_pattern");
+        b.extend_from_slice(&9u32.to_le_bytes());
+        b.extend_from_slice(&7u32.to_le_bytes());
+        b.extend_from_slice(&3u64.to_le_bytes());
+        b.extend_from_slice(&[1, 1, 0]);
+        // a table, not a setting: skipped, and the reader stays in step for what follows it
+        s(&mut b, "gemma4.big_table");
+        b.extend_from_slice(&9u32.to_le_bytes());
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&2000u64.to_le_bytes());
+        b.extend_from_slice(&vec![0u8; 2000 * 4]);
+        s(&mut b, "gemma4.context_length");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&4096u32.to_le_bytes());
+        std::fs::write(&f, b).unwrap();
+        let m = read_meta(&f).unwrap();
+        assert_eq!(m["gemma4.attention.head_count_kv"], serde_json::json!([16, 16, 4]));
+        assert_eq!(
+            m["gemma4.attention.sliding_window_pattern"],
+            serde_json::json!([true, true, false])
+        );
+        assert!(!m.contains_key("gemma4.big_table"));
+        assert_eq!(m["gemma4.context_length"], 4096);
     }
 
     #[test]

@@ -62,7 +62,15 @@ export async function readSse(r: Response, onData: (data: string) => void): Prom
   }
 }
 
-export interface ChatParams { temperature: number; top_p: number; max_tokens: number }
+export interface ChatParams {
+  temperature: number
+  top_p: number
+  max_tokens: number
+  /** Keep only the k most likely tokens; 0 or unset is off. */
+  top_k?: number
+  /** A fixed seed makes a reply repeat; null or unset is random. */
+  seed?: number | null
+}
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
@@ -116,6 +124,8 @@ export async function streamChat(
   if (p.temperature != null) body.temperature = p.temperature
   if (p.top_p != null) body.top_p = p.top_p
   if (p.max_tokens > 0) body.max_tokens = p.max_tokens
+  if (p.top_k && p.top_k > 0) body.top_k = p.top_k
+  if (p.seed != null) body.seed = p.seed
   if (trace) body.mm_trace = true
   const t0 = performance.now()
   const r = await hubFetch('/v1/chat/completions', {

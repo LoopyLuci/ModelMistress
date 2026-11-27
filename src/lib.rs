@@ -7,15 +7,20 @@
 //! usage for peers) and `client` (the CLI's, MCP's and the desktop app's way to a running hub).
 
 pub mod audio;
+pub mod benchmark;
+pub mod documents;
+pub mod model_import;
 pub mod catalog;
 pub mod client;
 pub mod engine;
+pub mod fabric;
 pub mod factory;
 pub mod forge;
 pub mod hosting;
 pub mod hub;
 pub mod image;
 pub mod km;
+pub mod loadlog;
 pub mod machine;
 pub mod misty;
 pub mod ollama_api;

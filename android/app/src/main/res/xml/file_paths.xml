@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Photos taken by the camera app, while they are read. -->
+    <cache-path name="photos" path="photos/" />
+    <!-- The Misty training data exported from the Misty panel, shared through the share sheet. -->
+    <cache-path name="exports" path="exports/" />
+    <!-- The sandboxes: each chat's files, and the attachments kept in them. Opened in other apps from the chat. -->
+    <files-path name="sandboxes" path="environments/" />
+    <!-- The files added before sandboxes existed. -->
+    <files-path name="older" path="workspace/" />
+</paths>

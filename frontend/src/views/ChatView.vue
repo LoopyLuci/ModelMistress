@@ -1,5 +1,5 @@
 <template>
-  <div class="chat" :class="{ side: sideOpen }">
+  <div class="chat" :class="{ side: sideOpen, withcanvas: canvasOpen }">
     <aside class="list" aria-label="Conversations">
       <div class="row lh">
         <button class="btn primary grow" type="button" @click="startNew">New chat</button>
@@ -40,6 +40,7 @@
         <span v-if="cur?.vision" class="pill">vision</span>
         <span class="grow"></span>
         <label class="row small" title="Record every token and its alternatives for this chat's replies"><input v-model="conv.trace" type="checkbox" /> trace replies</label>
+        <button class="btn" type="button" :aria-pressed="canvasOpen" :title="assets.length ? 'Pictures, video, audio, 3D and files from this chat' : 'Nothing to show yet'" @click="canvasOpen = !canvasOpen">Canvas<span v-if="assets.length" class="count"> {{ assets.length }}</span></button>
         <button class="btn" type="button" :aria-expanded="showSettings" @click="showSettings = !showSettings">Settings</button>
       </header>
 
@@ -58,6 +59,12 @@
           </label>
           <label class="field">Max tokens (0 = the model's own limit)
             <input v-model.number="conv.params.max_tokens" type="number" min="0" step="64" />
+          </label>
+          <label class="field">Top-k (0 = off: every token is considered)
+            <input v-model.number="conv.params.top_k" type="number" min="0" step="1" aria-label="Top-k" />
+          </label>
+          <label class="field">Seed (empty = random; the same seed repeats a reply)
+            <input :value="conv.params.seed ?? ''" type="number" step="1" placeholder="random" aria-label="Seed" @input="setSeed" />
           </label>
         </div>
       </div>
@@ -81,8 +88,14 @@
           :streaming="busy && i === conv.messages.length - 1 && m.role === 'assistant'"
           :waiting="waiting"
           :can-retry="!busy && i === conv.messages.length - 1 && m.role === 'assistant'"
+          :index="i"
           @retry="retry"
+          @open-asset="openAsset"
         />
+      </div>
+
+      <div v-if="behind" class="jumprow">
+        <button class="btn" type="button" @click="jumpToLatest">Jump to latest</button>
       </div>
 
       <form class="composer" @submit.prevent="send">
@@ -90,15 +103,46 @@
         <div v-if="pending.length" class="thumbs">
           <span v-for="(u, i) in pending" :key="i" class="thumb"><img :src="u" alt="attached picture" /><button type="button" aria-label="Remove picture" @click="pending.splice(i, 1)">x</button></span>
         </div>
+        <div v-if="pendingFiles.length" class="filechips" aria-label="Attached files">
+          <span v-for="(f, i) in pendingFiles" :key="i" class="fchip">{{ f.name }}<span v-if="f.cut" class="muted small"> (cut to 2000 characters)</span><button class="mini" type="button" :aria-label="`Remove file ${f.name}`" @click="pendingFiles.splice(i, 1)">Remove</button></span>
+        </div>
+        <div v-if="camera" class="camera">
+          <video ref="videoEl" autoplay playsinline muted aria-label="Camera view"></video>
+          <div class="row">
+            <button class="btn primary" type="button" @click="takePicture">Take picture</button>
+            <button class="btn" type="button" @click="closeCamera">Close camera</button>
+          </div>
+        </div>
+        <p v-if="steer && steer.conv === conv?.id" class="steerpill small" role="status">
+          Steer: "{{ steer.text }}" goes in after the next sentence. The text so far is kept.
+          <button class="mini" type="button" @click="cancelSteer">Cancel steer</button>
+        </p>
+        <ul v-if="queuedHere.length" class="queued" aria-label="Queued messages">
+          <li v-for="(q, i) in queuedHere" :key="i">
+            <span class="muted small">Next:</span>
+            <span class="qtext">{{ q.text || 'Picture' }}</span>
+            <button class="mini" type="button" :aria-label="`Remove queued message ${i + 1}`" @click="unqueue(q)">Remove</button>
+          </li>
+        </ul>
         <div class="row inrow">
           <textarea ref="box" v-model="input" rows="2" class="grow" placeholder="Message (Enter sends, Shift+Enter for a new line, Up brings back an earlier message)" aria-label="Message" @keydown="onKey" @paste="onPaste"></textarea>
           <input v-if="canPicture" ref="file" type="file" accept="image/*" multiple hidden @change="onFiles" />
           <button v-if="canPicture" class="btn" type="button" :title="cur?.router ? 'Attach a picture (the router then needs a model that can see pictures)' : 'Attach a picture'" @click="file?.click()">Picture</button>
+          <button v-if="canPicture" class="btn" type="button" :aria-pressed="!!camera" title="Take a picture with the camera" @click="camera ? closeCamera() : openCamera()">{{ camera ? 'Camera on' : 'Camera' }}</button>
+          <input ref="docs" type="file" accept=".txt,.md,.markdown,.json,.csv,.tsv,.log,.py,.rs,.ts,.tsx,.js,.jsx,.vue,.html,.css,.xml,.yaml,.yml,.toml,.ini,.sh,.ps1,.sql,.go,.java,.kt,.c,.h,.cpp,.hpp,.cs,.rb,.php,.swift,.pdf,text/*,application/json,application/pdf" multiple hidden @change="onDocs" />
+          <button class="btn" type="button" title="Attach a text, source or PDF file. Its text goes in with the message as data, cut to 2000 characters." @click="docs?.click()">Attach file</button>
+          <button class="btn" type="button" :aria-pressed="listening" :disabled="transcribing" :title="listening ? 'Stop, and write down what was said' : 'Say the message instead of typing it'" @click="toggleDictation">{{ listening ? 'Stop listening' : transcribing ? 'Transcribing...' : 'Dictate' }}</button>
+          <button class="btn" type="button" :aria-pressed="liveOn" :disabled="!conv?.model && !liveOn" title="Talk with the model: each sentence you say is sent, and the reply is read aloud" @click="liveOn = !liveOn">{{ liveOn ? 'Close Live' : 'Live' }}</button>
           <button v-if="busy" class="btn danger" type="button" @click="stop">Stop</button>
+          <button v-if="busy" class="btn" type="button" :disabled="!canSteer" title="Write a note now. It goes in after the next sentence of this reply; the text so far is kept." @click="steerNow">Steer</button>
+          <button v-if="busy" class="btn primary" type="submit" :disabled="!canQueue" title="Sent after this reply">Queue</button>
           <button v-else class="btn primary" type="submit" :disabled="!canSend">Send</button>
         </div>
       </form>
+      <LiveOverlay v-if="liveOn" ref="liveRef" :send="liveSend" :stop="stop" :can-picture="canPicture" @close="liveOn = false" />
     </section>
+
+    <MediaCanvas v-if="conv && canvasOpen" class="canvaspane" :assets="assets" :active-id="activeAsset" @close="canvasOpen = false" @select="activeAsset = $event" />
 
     <ConfirmDialog :open="!!askDelete" title="Delete this conversation?" action="Delete" @confirm="doDelete" @cancel="askDelete = ''">
       It is removed from this browser; nothing else is affected.
@@ -110,7 +154,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import MessageView from '@/components/MessageView.vue'
+import MediaCanvas from '@/components/MediaCanvas.vue'
 import RouterStrip from '@/components/RouterStrip.vue'
+import { conversationAssets } from '@/chat/media'
 import { useRoute, useRouter } from 'vue-router'
 import { call } from '@/transport'
 import { splitThink } from '@/chat/markdown'
@@ -119,6 +165,11 @@ import { chatChoices, groupModels, isChatModel, modelLabel, type HubModel } from
 import { AUTO, pickFor, withoutTagsInLastUserMessage, type RouteNote } from '@/chat/router'
 import { chats, flush, lastId, newConversation, removeConversation, sorted, type Conversation, type Msg } from '@/chat/store'
 import { createRecall, entriesFor, loadSent, recallKey, remember } from '@/chat/recall'
+import { steerCut } from '@/chat/extras'
+import { readAttachment, type Attachment } from '@/chat/documents'
+import { captureFrame, startCamera, stopCamera } from '@/chat/camera'
+import { notInBuild, startRecording, transcribeClip } from '@/speech'
+import LiveOverlay from '@/live/LiveOverlay.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -132,6 +183,27 @@ const busy = ref(false)
 const error = ref('')
 const sideOpen = ref(false)
 const showSettings = ref(false)
+const canvasOpen = ref(false)
+const activeAsset = ref('')
+/** Everything in the conversation that is not text; the canvas shows it, whichever model made it. */
+const assets = computed(() => conversationAssets(conv.value?.messages || []))
+function openAsset(id: string) {
+  activeAsset.value = id
+  canvasOpen.value = true
+}
+// a new picture, video, sound or model that a reply produces opens in the canvas by itself, once
+let seenAssets = 0
+watch(
+  () => assets.value.length,
+  (n) => {
+    if (n > seenAssets && !busy.value) {
+      activeAsset.value = assets.value[n - 1].id
+      canvasOpen.value = true
+    }
+    seenAssets = n
+  },
+)
+watch(() => conv.value?.id, () => { seenAssets = assets.value.length; activeAsset.value = '' })
 const askDelete = ref('')
 const renaming = ref('')
 const renameText = ref('')
@@ -148,6 +220,30 @@ const replies = ref(0)
 let abort: AbortController | null = null
 let waitTimer: number | undefined
 let stick = true
+/** Messages written during a reply: each waits for the reply and goes next, in the chat it was written in. */
+type Queued = { conv: string; text: string; images: string[]; files: Attachment[] }
+const queue = ref<Queued[]>([])
+const queuedHere = computed(() => queue.value.filter((q) => q.conv === conv.value?.id))
+/** The reader has scrolled up from the newest message: a button brings them back. */
+const behind = ref(false)
+const listening = ref(false)
+const transcribing = ref(false)
+let recording: { stop: () => Promise<Blob> } | null = null
+/** Files attached to the message being written: their text goes in with it, as data. */
+const pendingFiles = ref<Attachment[]>([])
+const docs = ref<HTMLInputElement | null>(null)
+/** The camera for a picture: its stream, and the video element that shows it. */
+const camera = ref<MediaStream | null>(null)
+/** Live: talk with the model. The overlay runs the conversation; this page sends its sentences and feeds it the replies. */
+const liveOn = ref(false)
+const liveRef = ref<{ reply: (text: string | null, busy: boolean, error?: string | null) => void } | null>(null)
+const videoEl = ref<HTMLVideoElement | null>(null)
+/** The chat whose reply is being written (steering applies only to it). */
+const replyChat = ref('')
+/** A steering note: it goes in after the next sentence end of the reply it was written in (chat/extras.ts). */
+const steer = ref<{ conv: string; text: string; from: number } | null>(null)
+/** True once a steering note has cut the reply, so the cut is not shown as a stop. */
+let steering = false
 
 /** Up and Down in the message box: what was sent in other chats, then in this one (see chat/recall.ts). */
 const recall = createRecall(() =>
@@ -165,7 +261,11 @@ const cur = computed(() => allModels.value.find((m) => m.id === conv.value?.mode
 const known = (id: string) => allModels.value.some((m) => m.id === id)
 /** A picture can be attached to a model that sees pictures, and to the router (it picks one that does, or says it has none). */
 const canPicture = computed(() => !!cur.value?.vision || !!cur.value?.router)
-const canSend = computed(() => !busy.value && !!conv.value?.model && (!!input.value.trim() || pending.value.length > 0))
+const hasContent = computed(() => !!input.value.trim() || pending.value.length > 0 || pendingFiles.value.length > 0)
+const canSend = computed(() => !busy.value && !!conv.value?.model && hasContent.value)
+const canQueue = computed(() => busy.value && !!conv.value?.model && hasContent.value)
+/** A steering note goes into the reply on screen, while it is written, and only one may wait at a time. */
+const canSteer = computed(() => busy.value && !!conv.value && conv.value.id === replyChat.value && !!input.value.trim() && !steer.value)
 const waiting = computed(() => {
   if (routing.value) return 'The router is choosing a model...'
   const who = target.value ? `Waiting for ${target.value}...` : 'Waiting for the model...'
@@ -208,6 +308,7 @@ function open(id: string) {
   pickDefault()
   stick = true
   nextTick(() => scrollDown(true))
+  nextTick(drainQueue) // a message queued here while a reply ran in another chat goes now
 }
 
 function startNew() {
@@ -261,13 +362,19 @@ function scrollDown(force = false) {
 function onScroll() {
   const el = scroller.value
   if (el) stick = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+  behind.value = !stick
+}
+function jumpToLatest() {
+  stick = true
+  behind.value = false
+  scrollDown(true)
 }
 
 function onKey(e: KeyboardEvent) {
   if (box.value && recallKey(e, box.value, recall, (t) => (input.value = t))) return
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
-    if (canSend.value) send()
+    if (canSend.value || canQueue.value) send()
   }
 }
 function onWindowKey(e: KeyboardEvent) {
@@ -322,6 +429,70 @@ function onPaste(e: ClipboardEvent) {
 }
 
 // ---- sending ----------------------------------------------------------------------------------------------------
+/** Attached files: text-like files are read here, PDFs by the hub (chat/documents.ts). */
+async function onDocs(e: Event) {
+  const el = e.target as HTMLInputElement
+  for (const f of [...(el.files || [])]) {
+    try {
+      pendingFiles.value.push(await readAttachment(f))
+    } catch (err: any) {
+      error.value = err?.message || String(err)
+    }
+  }
+  el.value = ''
+}
+
+/** The camera: each frame taken goes into the message as a picture, like one from the disk. */
+async function openCamera() {
+  error.value = ''
+  try {
+    camera.value = await startCamera()
+    await nextTick()
+    if (videoEl.value) {
+      videoEl.value.srcObject = camera.value
+      void videoEl.value.play?.()
+    }
+  } catch (e: any) {
+    closeCamera()
+    error.value = `The camera is not available: ${e?.message || e}`
+  }
+}
+function takePicture() {
+  if (!videoEl.value) return
+  try {
+    pending.value.push(captureFrame(videoEl.value))
+  } catch (e: any) {
+    error.value = `The picture could not be taken: ${e?.message || e}`
+  }
+}
+function closeCamera() {
+  stopCamera(camera.value)
+  camera.value = null
+}
+
+/** A seed in the settings: empty means random. */
+function setSeed(e: Event) {
+  const v = (e.target as HTMLInputElement).value.trim()
+  if (conv.value) conv.value.params.seed = v === '' ? null : Math.trunc(Number(v))
+}
+
+/** A steering note: the reply is cut after its next sentence, the text so far is kept, and the note goes next. */
+function steerNow() {
+  const c = conv.value
+  const text = input.value.trim()
+  if (!c || !canSteer.value || !text) return
+  const last = c.messages[c.messages.length - 1]
+  steer.value = { conv: c.id, text, from: last?.role === 'assistant' ? last.content.length : 0 }
+  remember(text)
+  recall.reset()
+  input.value = ''
+}
+function cancelSteer() {
+  if (!steer.value) return
+  if (!input.value.trim()) input.value = steer.value.text // the note goes back into the box
+  steer.value = null
+}
+
 function historyFor(c: Conversation, upto: number): ChatMessage[] {
   const out: ChatMessage[] = []
   if (c.system.trim()) out.push({ role: 'system', content: c.system.trim() })
@@ -338,16 +509,97 @@ function historyFor(c: Conversation, upto: number): ChatMessage[] {
 
 async function send() {
   const c = conv.value
-  if (!c || !canSend.value) return
-  error.value = ''
+  if (!c) return
   const text = input.value.trim()
-  c.messages.push({ role: 'user', content: text, ...(pending.value.length ? { images: [...pending.value] } : {}) })
-  if (!c.renamed && c.messages.length === 1) c.title = (text || 'Picture').replace(/\s+/g, ' ').slice(0, 48)
+  if (busy.value) {
+    // a message written during a reply waits for it, and is sent next in this chat
+    if (!canQueue.value) return
+    queue.value.push({ conv: c.id, text, images: [...pending.value], files: [...pendingFiles.value] })
+    remember(text)
+    recall.reset()
+    input.value = ''
+    pending.value = []
+    pendingFiles.value = []
+    return
+  }
+  if (!canSend.value) return
+  error.value = ''
+  const images = [...pending.value]
+  const files = [...pendingFiles.value]
   remember(text)
   recall.reset()
   input.value = ''
   pending.value = []
+  pendingFiles.value = []
+  await sendNow(c, text, images, files)
+}
+
+/** What the model reads for a message: the text, then each attached file as data. */
+function contentOf(text: string, files: Attachment[]): string {
+  return [text, ...files.map((f) => f.text)].filter(Boolean).join('\n\n')
+}
+
+async function sendNow(c: Conversation, text: string, images: string[], files: Attachment[] = []) {
+  c.messages.push({
+    role: 'user',
+    content: contentOf(text, files),
+    ...(images.length ? { images } : {}),
+    ...(files.length ? { files: files.map((f) => ({ name: f.name, cut: f.cut })) } : {}),
+  })
+  const label = text || files.map((f) => f.name).join(', ') || 'Picture'
+  if (!c.renamed && c.messages.length === 1) c.title = label.replace(/\s+/g, ' ').slice(0, 48)
   await reply(c)
+}
+
+/** Live sends what the owner said as the next message of this chat. False when no model can answer it now. */
+function liveSend(text: string, images: string[]): boolean {
+  const c = conv.value
+  if (!c?.model || busy.value) return false
+  error.value = ''
+  void sendNow(c, text, images)
+  return true
+}
+
+/** Sends the next message queued in the chat on screen, once no reply is running. */
+function drainQueue() {
+  const c = conv.value
+  if (!c || busy.value) return
+  const i = queue.value.findIndex((q) => q.conv === c.id)
+  if (i < 0) return
+  const [next] = queue.value.splice(i, 1)
+  sendNow(c, next.text, next.images, next.files)
+}
+
+function unqueue(item: Queued) {
+  queue.value = queue.value.filter((q) => q !== item)
+}
+
+/** Dictation: the first press starts the microphone; the second writes what was said into the box. */
+async function toggleDictation() {
+  error.value = ''
+  if (listening.value) {
+    listening.value = false
+    transcribing.value = true
+    try {
+      const clip = await recording?.stop()
+      recording = null
+      const said = clip ? await transcribeClip(clip) : ''
+      if (said) input.value = [input.value.trimEnd(), said].filter(Boolean).join(' ')
+      else error.value = 'No speech was recognised.'
+    } catch (e: any) {
+      error.value = notInBuild(e) ? 'Dictation is not available in this build.' : `Dictation: ${e?.message || e}`
+    } finally {
+      transcribing.value = false
+    }
+    nextTick(() => box.value?.focus())
+    return
+  }
+  try {
+    recording = await startRecording()
+    listening.value = true
+  } catch (e: any) {
+    error.value = `The microphone is not available: ${e?.message || e}`
+  }
 }
 
 async function retry() {
@@ -364,6 +616,7 @@ async function reply(c: Conversation) {
   const a = (): Msg => c.messages[idx]
   c.updated = Date.now()
   busy.value = true
+  replyChat.value = c.id
   waitSecs.value = 0
   const t0 = Date.now()
   waitTimer = window.setInterval(() => (waitSecs.value = Math.round((Date.now() - t0) / 1000)), 1000)
@@ -392,6 +645,17 @@ async function reply(c: Conversation) {
     const stats = await streamChat(model, history, c.params, c.trace, abort.signal, {
       onContent: (d) => {
         a().content += d
+        liveRef.value?.reply(a().content, true)
+        const s = steer.value
+        if (s && s.conv === c.id && !steering) {
+          const cut = steerCut(a().content, s.from)
+          if (cut != null) {
+            // the sentence is done: the reply stops here, keeps what it said, and the note goes in next
+            a().content = a().content.slice(0, cut).trimEnd()
+            steering = true
+            abort?.abort()
+          }
+        }
         nextTick(() => scrollDown())
       },
       onReasoning: (d) => {
@@ -401,9 +665,12 @@ async function reply(c: Conversation) {
     })
     a().stats = stats
   } catch (e: any) {
-    if (e?.name === 'AbortError') a().stopped = true
+    if (e?.name === 'AbortError') {
+      if (!steering) a().stopped = true
+    }
     else a().error = String(e?.message || e)
   } finally {
+    liveRef.value?.reply(a().content, false, a().error ?? null)
     busy.value = false
     routing.value = false
     target.value = ''
@@ -415,7 +682,15 @@ async function reply(c: Conversation) {
     flush()
     replies.value++
     refreshModels()
+    replyChat.value = ''
+    // A steering note that did not cut the reply (Stop, or the reply ended first) becomes the next message, before
+    // anything queued. Otherwise the queue goes on.
+    const note = steer.value
+    steer.value = null
+    steering = false
     nextTick(() => box.value?.focus())
+    if (note) nextTick(() => sendNow(c, note.text, []))
+    else nextTick(drainQueue)
   }
 }
 
@@ -459,6 +734,11 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKey)
   window.clearInterval(waitTimer)
+  if (recording) {
+    void recording.stop() // the microphone is let go
+    recording = null
+  }
+  closeCamera()
   // A reply in progress goes on only while this page is open.
   abort?.abort()
 })
@@ -470,6 +750,9 @@ watch(
 
 <style scoped>
 .chat { display: grid; grid-template-columns: 260px minmax(0, 1fr); height: 100%; min-height: 0; }
+.chat.withcanvas { grid-template-columns: 260px minmax(0, 1fr) minmax(320px, 42%); }
+.canvaspane { min-height: 0; }
+.count { color: var(--accent); font-weight: 600; }
 .list { border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
 .lh { padding: 10px; flex: none; }
 .closer, .menu { display: none; }
@@ -500,9 +783,19 @@ watch(
 .thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .thumb { position: relative; }
 .thumb img { height: 56px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.queued { list-style: none; margin: 0 auto 6px; padding: 0; max-width: 900px; }
+.queued li { display: flex; gap: 8px; align-items: center; }
+.qtext { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jumprow { flex: none; text-align: center; padding: 4px 0; }
+.filechips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; max-width: 900px; margin-left: auto; margin-right: auto; }
+.fchip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 6px 2px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); font-size: 0.85rem; }
+.camera { max-width: 900px; margin: 0 auto 6px; display: flex; flex-direction: column; gap: 6px; }
+.camera video { width: 100%; max-height: 260px; border-radius: 8px; background: #000; }
+.steerpill { max-width: 900px; margin: 0 auto 6px; color: var(--muted); }
 .thumb button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); background: var(--panel); line-height: 1; font-size: 0.7rem; }
 @media (max-width: 800px) {
-  .chat { grid-template-columns: minmax(0, 1fr); }
+  .chat, .chat.withcanvas { grid-template-columns: minmax(0, 1fr); }
+  .canvaspane { position: fixed; inset: 8% 0 0 0; z-index: 30; border-top: 1px solid var(--border); box-shadow: 0 -2px 14px rgba(0, 0, 0, 0.3); }
   .list { position: fixed; inset: 0 25% 0 0; z-index: 20; transform: translateX(-102%); transition: transform 0.15s; box-shadow: 2px 0 14px rgba(0, 0, 0, 0.3); }
   .chat.side .list { transform: none; }
   .closer, .menu { display: inline-block; }

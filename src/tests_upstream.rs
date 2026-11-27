@@ -269,3 +269,130 @@ async fn fail_fast_busy_is_off_by_default_and_config_set_turns_it_on() {
     let (_, _, after) = call(&h, "POST", "/v1/call/config.get", json!({})).await;
     assert_eq!(after["result"]["fail_fast_busy"], true, "{after}");
 }
+
+// ---- the fabric (src/fabric.rs) ----------------------------------------------------------------------------
+
+async fn call_with(h: &Hub, path: &str, body: Value, extra: &[(&str, &str)]) -> (StatusCode, HeaderMap, Value) {
+    let mut r = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json");
+    for (k, v) in extra {
+        r = r.header(*k, *v);
+    }
+    let resp = hub::router(h.clone()).oneshot(r.body(axum::body::Body::from(body.to_string())).unwrap()).await.unwrap();
+    let (status, headers) = (resp.status(), resp.headers().clone());
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap();
+    (status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// A hub whose only server has no free slot, joined to a fabric whose endpoint is a stand-in tagged "fabric".
+async fn joined(home: &std::path::Path, offload: &str) -> (Hub, StandIn, StandIn) {
+    let busy = full_stand_in("local").await;
+    let h = serving(home, &busy, true).await;
+    let fabric = stand_in("fabric", 0).await;
+    let (st, _, v) = call(
+        &h,
+        "POST",
+        "/v1/call/fabric.set",
+        json!({"endpoint": format!("http://127.0.0.1:{}", fabric.port), "offload": offload}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    (h, busy, fabric)
+}
+
+#[tokio::test]
+async fn a_busy_hub_passes_the_request_to_the_fabric() {
+    let home = testing::temp_home();
+    let (h, busy, fabric) = joined(&home, "when_full").await;
+    let (st, headers, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(headers["x-mm-offloaded"].to_str().unwrap(), "1");
+    assert_eq!(v["choices"][0]["message"]["content"], "fabric", "the answer is the fabric's: {v}");
+    assert_eq!(busy.seen.load(Ordering::SeqCst), 0, "this hub's own server never saw it");
+    assert_eq!(fabric.seen.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_request_that_came_through_the_fabric_is_not_sent_back_to_it() {
+    let home = testing::temp_home();
+    let (h, _busy, fabric) = joined(&home, "when_full").await;
+    let (st, _, v) = call_with(&h, "/v1/chat/completions", chat(), &[("x-cf-hop", "1")]).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"]["code"], "busy", "the hub's own answer");
+    assert_eq!(fabric.seen.load(Ordering::SeqCst), 0, "nothing was passed on");
+}
+
+#[tokio::test]
+async fn offload_off_and_a_hub_that_has_not_joined_keep_the_busy_answer() {
+    let home = testing::temp_home();
+    let (h, _busy, fabric) = joined(&home, "off").await;
+    let (st, _, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(fabric.seen.load(Ordering::SeqCst), 0);
+
+    let home2 = testing::temp_home();
+    let busy = full_stand_in("local").await;
+    let h2 = serving(&home2, &busy, true).await;
+    let (st, _, v) = call(&h2, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    let (_, _, v) = call(&h2, "POST", "/v1/call/fabric.status", json!({})).await;
+    assert_eq!(v["result"]["joined"], false, "{v}");
+}
+
+#[tokio::test]
+async fn an_unreachable_fabric_leaves_the_hubs_own_error() {
+    let home = testing::temp_home();
+    let busy = full_stand_in("local").await;
+    let h = serving(&home, &busy, true).await;
+    // nothing listens on port 9
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"endpoint": "http://127.0.0.1:9"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, _, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"]["code"], "busy");
+}
+
+#[tokio::test]
+async fn fabric_set_checks_its_input_and_leave_removes_the_settings() {
+    let home = testing::temp_home();
+    let h = testing::hub(&home, &["tiny"]);
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"endpoint": "ftp://x"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"offload": "sometimes", "api": "http://127.0.0.1:7878"})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an empty set joins nothing: {v}");
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"api": "http://127.0.0.1:9/", "endpoint": "http://127.0.0.1:9"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["api"], "http://127.0.0.1:9", "a trailing slash is dropped");
+    assert_eq!(v["result"]["offload"], "when_full", "the default");
+    let (_, _, v) = call(&h, "POST", "/v1/call/fabric.status", json!({})).await;
+    assert_eq!(v["result"]["joined"], true, "{v}");
+    assert_eq!(v["result"]["endpoint_reachable"], false, "nothing answers there");
+    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.nodes", json!({})).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "the fabric does not answer: {v}");
+    let (_, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"leave": true})).await;
+    assert_eq!(v["result"]["joined"], false);
+    let (st, _, _) = call(&h, "POST", "/v1/call/fabric.nodes", json!({})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "no fabric to ask");
+}
+
+#[tokio::test]
+async fn machine_status_reports_the_room_a_load_has() {
+    let home = testing::temp_home();
+    let h = testing::hub(&home, &["tiny"]);
+    let (st, _, v) = call(&h, "POST", "/v1/call/machine.status", json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let r = &v["result"];
+    assert!(r["ram_total_mb"].as_f64().unwrap() > 0.0, "{v}");
+    assert!(r["ram_available_mb"].as_f64().unwrap() > 0.0);
+    assert!(r["vram_usable_mib"].is_u64(), "{v}");
+    assert_eq!(r["loaded"], 0);
+    assert!(r["gpus"].is_array());
+    let (_, _, ops) = call(&h, "GET", "/v1/operations", json!({})).await;
+    let ids: Vec<&str> = ops["operations"].as_array().map(|a| a.iter().filter_map(|o| o["id"].as_str()).collect()).unwrap_or_default();
+    assert!(ids.contains(&"machine.status") && ids.contains(&"fabric.set"), "{ids:?}");
+}

@@ -328,14 +328,17 @@ impl Rig {
 
     /// Waits until the task's job has ended; returns the task.
     async fn settle(&self, id: &str) -> Value {
-        for _ in 0..1200 {
+        // 300 s: with every test running at once on a busy machine a task can take over a minute to settle
+        let mut last = Value::Null;
+        for _ in 0..6000 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let t = self.ok("factory.task.get", json!({"id": id, "logs": 30})).await;
             if t["running"].is_null() && t["state"] != "running" {
                 return t;
             }
+            last = t;
         }
-        panic!("task {id} did not stop");
+        panic!("task {id} did not stop: {last}");
     }
 
     async fn run(&self, body: Value) -> (String, Value) {

@@ -11,6 +11,8 @@ export interface Msg extends ChatMessage {
   route?: RouteNote
   error?: string
   stopped?: boolean
+  /** Files attached to this message (their text is in the content, as data). */
+  files?: { name: string; cut: boolean }[]
 }
 
 export interface Conversation {

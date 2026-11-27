@@ -35,6 +35,12 @@ export const FIELDS: Field[] = [
   { key: 'cache_type_v', label: 'KV cache type (values)', kind: 'select', options: ['', ...KV_TYPES], help: 'A quantised value cache needs flash attention.' },
   { key: 'cache_prompt', label: 'Keep each slot\'s prompt', kind: 'tri', help: 'The next turn only reads what is new.' },
   { key: 'jinja', label: 'Jinja chat template', kind: 'tri', help: 'Needed for tool calls with some models.' },
+  {
+    key: 'paged',
+    label: 'Load from disk if it does not fit',
+    kind: 'tri',
+    help: 'Slow: a model bigger than the memory is read from disk as it runs, seconds per token. It also needs "Allow a model bigger than the memory to load from disk" in Settings, and you load it yourself; a request never does.',
+  },
 ]
 
 /** The form's values: every field a string, blank when the profile does not set it. */
