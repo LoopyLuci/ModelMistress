@@ -75,6 +75,14 @@
 - A request that the fabric served for this hub is counted in the peer key's usage when it succeeds, as a failed one already
   was (`src/hub.rs`, `passthrough`). The tokens are counted too, from the answer (see Fabric below).
 - The build script trusts only this checkout for git (`src/build.rs`), not every directory on the machine.
+- An approval holds a claim on its request while the model loads: a deny that comes in meanwhile is refused (409
+  `approval_in_progress`), and a second approve waits. Before, a deny could land in the middle and the model still loaded.
+- A request belongs to the peer key's id, not its name, so two keys with one name do not share requests (`src/requests.rs`).
+- `batch.submit` refuses a model this hub does not serve before it writes the job, and refuses an option of the wrong type
+  (`concurrency: "8"`, `max_tokens: -1`) rather than taking the default.
+- `batch.cancel` and a job's final write share a lock, so a job that finishes as it is cancelled is never overwritten.
+- `batch.get` and `batch.list` count only the lines appended since the last call, not the whole results file. `batch.results`
+  reads up to the end of the page it returns.
 
 ### Android app (`android/`, version 0.1.0)
 

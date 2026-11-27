@@ -7,6 +7,7 @@
 use crate::engine::Fail;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Decided requests kept in the file. Pending ones are always kept.
@@ -54,8 +55,11 @@ pub struct Request {
     pub id: u64,
     /// The model, by the name the key used.
     pub model: String,
-    /// The peer key's name: who asked.
+    /// The peer key's name: who asked, as the owner sees it.
     pub peer: String,
+    /// The peer key's id. A request belongs to the key that asked, by id, because two keys may share a name.
+    #[serde(default)]
+    pub key: String,
     /// The key's own reason, if it gave one.
     pub reason: String,
     pub state: RequestState,
@@ -79,6 +83,8 @@ struct Stored {
 pub struct Queue {
     path: Option<PathBuf>,
     st: Mutex<Stored>,
+    /// Requests the owner is approving right now. A claimed request cannot be decided until its claim is released.
+    claims: Mutex<HashSet<u64>>,
 }
 
 impl Queue {
@@ -96,23 +102,25 @@ impl Queue {
         Self {
             path: Some(path),
             st: Mutex::new(st),
+            claims: Mutex::new(HashSet::new()),
         }
     }
 
     /// A key asks for a model: a new pending request, or the one it already waits with for that model. Nothing loads.
-    pub fn ask(&self, peer: &str, model: &str, reason: &str, now: i64) -> Result<Request, Fail> {
+    /// `key` is the key's id, which the request belongs to; `peer` is its name, shown to the owner.
+    pub fn ask(&self, key: &str, peer: &str, model: &str, reason: &str, now: i64) -> Result<Request, Fail> {
         let mut st = self.st.lock();
         if let Some(r) = st
             .requests
             .iter()
-            .find(|r| r.state == RequestState::Pending && r.peer == peer && r.model == model)
+            .find(|r| r.state == RequestState::Pending && r.key == key && r.model == model)
         {
             return Ok(r.clone());
         }
         let waiting = st
             .requests
             .iter()
-            .filter(|r| r.state == RequestState::Pending && r.peer == peer)
+            .filter(|r| r.state == RequestState::Pending && r.key == key)
             .count();
         if waiting >= PENDING_PER_KEY {
             return Err(Fail::new(
@@ -128,6 +136,7 @@ impl Queue {
             id: st.next,
             model: model.to_string(),
             peer: peer.to_string(),
+            key: key.to_string(),
             reason: reason.trim().chars().take(REASON_MAX).collect(),
             state: RequestState::Pending,
             asked_at: now,
@@ -155,7 +164,37 @@ impl Queue {
         self.st.lock().requests.iter().find(|r| r.id == id).cloned()
     }
 
-    /// The owner's decision on a pending request. A request that is already decided cannot be decided again.
+    /// The owner starts approving a pending request. Until `release`, the request is claimed: it cannot be claimed again
+    /// or denied. The load runs in between, and a deny that landed then would leave a model loaded for a refused request.
+    pub fn claim(&self, id: u64) -> Result<Request, Fail> {
+        let st = self.st.lock();
+        let Some(r) = st.requests.iter().find(|r| r.id == id) else {
+            return Err(Fail::not_found(format!("no request {id} (request.list shows them)")));
+        };
+        if r.state != RequestState::Pending {
+            return Err(Fail::new(
+                409,
+                "not_pending",
+                format!("request {id} is already {}", r.state.word()),
+            ));
+        }
+        if !self.claims.lock().insert(id) {
+            return Err(Fail::new(
+                409,
+                "approval_in_progress",
+                format!("request {id} is already being approved"),
+            ));
+        }
+        Ok(r.clone())
+    }
+
+    /// Ends a claim, whatever the load did. The request stays pending unless its decision was recorded.
+    pub fn release(&self, id: u64) {
+        self.claims.lock().remove(&id);
+    }
+
+    /// The owner's decision on a pending request. A request that is already decided cannot be decided again, and a
+    /// denial waits for an approval in progress to finish.
     pub fn decide(&self, id: u64, state: RequestState, note: &str, now: i64) -> Result<Request, Fail> {
         let mut st = self.st.lock();
         let Some(r) = st.requests.iter_mut().find(|r| r.id == id) else {
@@ -166,6 +205,13 @@ impl Queue {
                 409,
                 "not_pending",
                 format!("request {id} is already {}", r.state.word()),
+            ));
+        }
+        if state == RequestState::Denied && self.claims.lock().contains(&id) {
+            return Err(Fail::new(
+                409,
+                "approval_in_progress",
+                format!("request {id} is being approved; deny it once that finishes"),
             ));
         }
         r.state = state;
@@ -215,31 +261,40 @@ mod tests {
     #[test]
     fn a_request_waits_and_asking_again_for_the_same_model_returns_it() {
         let q = Queue::default();
-        let a = q.ask("agent", "alpha", "summary pass", 10).unwrap();
+        let a = q.ask("k1", "agent", "alpha", "summary pass", 10).unwrap();
         assert_eq!(
             (a.state, a.model.as_str(), a.peer.as_str()),
             (RequestState::Pending, "alpha", "agent")
         );
-        let b = q.ask("agent", "alpha", "again", 11).unwrap();
+        let b = q.ask("k1", "agent", "alpha", "again", 11).unwrap();
         assert_eq!(a.id, b.id, "the same pending request, not a second one");
         assert_eq!(q.list(Some(RequestState::Pending)).len(), 1);
+    }
+
+    #[test]
+    fn two_keys_with_one_name_do_not_share_requests() {
+        let q = Queue::default();
+        let first = q.ask("k1", "agent", "alpha", "", 1).unwrap();
+        let second = q.ask("k2", "agent", "alpha", "", 1).unwrap();
+        assert_ne!(first.id, second.id, "the second key gets its own request");
+        assert_eq!(q.ask("k2", "agent", "alpha", "again", 2).unwrap().id, second.id);
     }
 
     #[test]
     fn each_key_has_its_own_cap_on_waiting_requests() {
         let q = Queue::default();
         for i in 0..PENDING_PER_KEY {
-            q.ask("agent", &format!("m{i}"), "", 1).unwrap();
+            q.ask("k1", "agent", &format!("m{i}"), "", 1).unwrap();
         }
-        let refused = q.ask("agent", "one-more", "", 2).unwrap_err();
+        let refused = q.ask("k1", "agent", "one-more", "", 2).unwrap_err();
         assert_eq!((refused.status, refused.code), (429, "too_many_requests"));
-        q.ask("other", "one-more", "", 2).expect("another key is not held up");
+        q.ask("k2", "other", "one-more", "", 2).expect("another key is not held up");
     }
 
     #[test]
     fn only_a_pending_request_can_be_decided_and_the_answer_is_kept() {
         let q = Queue::default();
-        let r = q.ask("agent", "alpha", "", 1).unwrap();
+        let r = q.ask("k1", "agent", "alpha", "", 1).unwrap();
         let d = q.decide(r.id, RequestState::Denied, " not this week ", 5).unwrap();
         assert_eq!(
             (d.state, d.note.as_str(), d.decided_at),
@@ -255,12 +310,34 @@ mod tests {
     }
 
     #[test]
+    fn a_claimed_request_is_not_denied_or_claimed_again_until_the_claim_is_released() {
+        let q = Queue::default();
+        let r = q.ask("k1", "agent", "alpha", "", 1).unwrap();
+        q.claim(r.id).unwrap();
+        assert_eq!(q.claim(r.id).unwrap_err().code, "approval_in_progress");
+        assert_eq!(
+            q.decide(r.id, RequestState::Denied, "no", 2).unwrap_err().code,
+            "approval_in_progress",
+            "a deny during the load must not land"
+        );
+        q.decide(r.id, RequestState::Approved, "loaded", 3).expect("the approval itself is recorded");
+        q.release(r.id);
+        assert_eq!(q.claim(r.id).unwrap_err().code, "not_pending", "decided, so it cannot be claimed");
+
+        let again = q.ask("k1", "agent", "beta", "", 4).unwrap();
+        q.claim(again.id).unwrap();
+        q.release(again.id);
+        q.decide(again.id, RequestState::Denied, "no", 5)
+            .expect("once the claim is released, a deny is recorded");
+    }
+
+    #[test]
     fn the_queue_is_kept_in_the_home_and_the_history_is_trimmed_but_pending_stays() {
         let dir = crate::testing::TestDir::new("mm-requests");
         let q = Queue::open(&dir);
-        let waiting = q.ask("agent", "keep-me", "", 1).unwrap();
+        let waiting = q.ask("k1", "agent", "keep-me", "", 1).unwrap();
         for i in 0..(KEEP + 5) {
-            let r = q.ask("other", &format!("m{i}"), "", i as i64).unwrap();
+            let r = q.ask("k2", "other", &format!("m{i}"), "", i as i64).unwrap();
             q.decide(r.id, RequestState::Approved, "", i as i64).unwrap();
         }
         let decided = q.list(None).iter().filter(|r| r.state != RequestState::Pending).count();
@@ -268,6 +345,7 @@ mod tests {
         assert!(q.get(waiting.id).is_some(), "a pending request is never dropped");
         let reopened = Queue::open(&dir);
         assert_eq!(reopened.get(waiting.id).unwrap().model, "keep-me");
+        assert_eq!(reopened.get(waiting.id).unwrap().key, "k1", "the key id is kept across a restart");
         assert_eq!(reopened.list(None).len(), KEEP + 1);
     }
 

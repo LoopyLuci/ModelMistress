@@ -871,6 +871,19 @@ fn llama_entry(hub: &Hub, name: &str) -> ApiResult<crate::catalog::ModelEntry> {
     }
 }
 
+/// `Ok` when `name` is a llama model this hub serves: what `batch.submit` checks before it writes a job.
+pub(crate) fn served_llama_model(hub: &Hub, name: &str) -> Result<(), Fail> {
+    llama_entry(hub, name).map(|_| ()).map_err(|e| e.0)
+}
+
+/// The owner's approval loads the model a peer key asked for, as `model.load` does.
+async fn load_for_approval(hub: &Hub, model: &str) -> ApiResult<Value> {
+    let m = llama_entry(hub, model)?;
+    let opts: LoadOpts = serde_json::from_value(json!({})).map_err(|x| Fail::invalid(x.to_string()))?;
+    let inst = hub.engine.ensure_loaded(&m, &opts, true).await?;
+    Ok(json!(inst.describe()))
+}
+
 /// [`call`] as a boxed future. Misty's tools call back into the hub (`hub_status`, `model_load`), and the hub calls
 /// Misty's operations: a boxed `Send` future cuts that cycle, which the compiler cannot prove `Send` through.
 pub fn call_boxed<'a>(hub: &'a Hub, id: &'a str, a: &'a Value) -> futures::future::BoxFuture<'a, ApiResult<Value>> {
@@ -966,12 +979,12 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         "model.copy" => crate::ollama_api::copy(hub, s(a, "source")?, s(a, "destination")?)?,
         "batch.submit" => crate::batch::submit(hub, a)?,
         "batch.get" => crate::batch::get(hub, s(a, "id")?)?,
-        "batch.list" => crate::batch::list(hub, a["state"].as_str().unwrap_or("all"))?,
+        "batch.list" => crate::batch::list(hub, crate::batch::opt_str(a, "state")?.unwrap_or("all"))?,
         "batch.results" => crate::batch::results(
             hub,
             s(a, "id")?,
-            a["from"].as_u64().unwrap_or(0) as usize,
-            a["limit"].as_u64().unwrap_or(100) as usize,
+            crate::batch::opt_u64(a, "from", 0)? as usize,
+            crate::batch::opt_u64(a, "limit", 100)? as usize,
         )?,
         "batch.cancel" => crate::batch::cancel(hub, s(a, "id")?)?,
         "request.list" => {
@@ -983,25 +996,27 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let id = a["id"]
                 .as_u64()
                 .ok_or_else(|| Fail::invalid("request.approve needs \"id\": the request's number"))?;
-            let asked = hub
-                .requests
-                .get(id)
-                .ok_or_else(|| Fail::not_found(format!("no request {id} (request.list shows them)")))?;
-            // Checked before the load: a request already denied must not load its model.
-            if asked.state != crate::requests::RequestState::Pending {
-                return Err(Fail::new(409, "not_pending", format!("request {id} is not pending")).into());
-            }
-            let m = llama_entry(hub, &asked.model)?;
-            let opts: LoadOpts = serde_json::from_value(json!({})).map_err(|x| Fail::invalid(x.to_string()))?;
+            // Claimed for the whole load: a deny cannot land in between, and a second approve waits for this one.
+            // A request that is already decided is refused by the claim, before anything loads.
+            let asked = hub.requests.claim(id)?;
             let t0 = Instant::now();
-            let inst = e.ensure_loaded(&m, &opts, true).await?;
-            let decided = hub.requests.decide(
-                id,
-                crate::requests::RequestState::Approved,
-                "loaded",
-                chrono::Utc::now().timestamp(),
-            )?;
-            json!({"request": decided, "loaded": inst.describe(), "load_ms": t0.elapsed().as_millis() as u64})
+            let result = match load_for_approval(hub, &asked.model).await {
+                Ok(loaded) => hub
+                    .requests
+                    .decide(
+                        id,
+                        crate::requests::RequestState::Approved,
+                        "loaded",
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .map(|decided| {
+                        json!({"request": decided, "loaded": loaded, "load_ms": t0.elapsed().as_millis() as u64})
+                    })
+                    .map_err(ApiError::from),
+                Err(err) => Err(err),
+            };
+            hub.requests.release(id);
+            result?
         }
         "request.deny" => {
             let id = a["id"]
@@ -1801,7 +1816,7 @@ async fn peer_request(
     let now = chrono::Utc::now().timestamp();
     let request = hub
         .requests
-        .ask(&key.peer, &model, args["reason"].as_str().unwrap_or(""), now)?;
+        .ask(&key.id, &key.peer, &model, args["reason"].as_str().unwrap_or(""), now)?;
     Ok((StatusCode::ACCEPTED, Json(json!({"request": request}))))
 }
 
@@ -1815,7 +1830,7 @@ async fn peer_request_status(
         return Err(Fail::invalid("a request is for a peer key").into());
     };
     match hub.requests.get(id) {
-        Some(request) if request.peer == key.peer => Ok(Json(json!({"request": request}))),
+        Some(request) if request.key == key.id => Ok(Json(json!({"request": request}))),
         _ => Err(Fail::not_found(format!("no request {id} from this key")).into()),
     }
 }

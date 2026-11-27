@@ -11,8 +11,8 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -90,6 +90,28 @@ pub struct NewJob {
     pub prompts: Vec<String>,
 }
 
+/// An optional whole number. Absent or null is the default. Anything else that is not a whole number is refused, so a
+/// value sent as a string, or with a fraction, is an error rather than a silent default.
+pub fn opt_u64(a: &Value, key: &str, default: u64) -> Result<u64, Fail> {
+    match a.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| Fail::invalid(format!("{key} must be a whole number, not {v}"))),
+    }
+}
+
+/// An optional string, with the same rule: absent or null is None, and anything else must be a string.
+pub fn opt_str<'a>(a: &'a Value, key: &str) -> Result<Option<&'a str>, Fail> {
+    match a.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| Fail::invalid(format!("{key} must be a string"))),
+    }
+}
+
 /// Check what `batch.submit` was given. Nothing is written until every check passes.
 pub fn parse_spec(a: &Value) -> Result<NewJob, Fail> {
     let model = a["model"].as_str().unwrap_or("").trim();
@@ -116,23 +138,22 @@ pub fn parse_spec(a: &Value) -> Result<NewJob, Fail> {
                 .ok_or_else(|| Fail::invalid("every prompt is a string"))
         })
         .collect::<Result<Vec<String>, Fail>>()?;
-    let concurrency = a["concurrency"].as_u64().unwrap_or(DEFAULT_CONCURRENCY as u64);
+    let concurrency = opt_u64(a, "concurrency", DEFAULT_CONCURRENCY as u64)?;
     if !(1..=MAX_CONCURRENCY as u64).contains(&concurrency) {
         return Err(Fail::invalid(format!(
             "concurrency is 1 to {MAX_CONCURRENCY}, not {concurrency}"
         )));
     }
-    let max_tokens = a["max_tokens"].as_u64().unwrap_or(DEFAULT_MAX_TOKENS);
+    let max_tokens = opt_u64(a, "max_tokens", DEFAULT_MAX_TOKENS)?;
     if !(1..=MAX_TOKENS_LIMIT).contains(&max_tokens) {
         return Err(Fail::invalid(format!(
             "max_tokens is 1 to {MAX_TOKENS_LIMIT}, not {max_tokens}"
         )));
     }
     Ok(NewJob {
-        name: a["name"].as_str().unwrap_or("").trim().chars().take(80).collect(),
+        name: opt_str(a, "name")?.unwrap_or("").trim().chars().take(80).collect(),
         model: model.to_string(),
-        system: a["system"]
-            .as_str()
+        system: opt_str(a, "system")?
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
@@ -198,19 +219,30 @@ fn io_fail(e: std::io::Error) -> Fail {
     Fail::unavailable(format!("the batch could not be written: {e}"))
 }
 
+/// What has been counted of a job's results file: the bytes read so far, and the items in them.
+#[derive(Default)]
+struct Tally {
+    offset: u64,
+    done: usize,
+    failed: usize,
+}
+
 /// The batch folder under the hub's home, and the jobs that are being cancelled.
 #[derive(Default)]
 pub struct Batches {
     /// `<home>/batches`. None for a hub with no home (tests): no batch can be submitted.
     dir: Option<PathBuf>,
+    /// Jobs being cancelled. Also the lock that `cancel` and a job's final write share, so neither overwrites the other.
     cancelled: Mutex<HashSet<String>>,
+    /// How far each job's results file has been counted, so progress reads only what was appended since.
+    tallies: Mutex<HashMap<String, Tally>>,
 }
 
 impl Batches {
     pub fn open(home: &Path) -> Self {
         Self {
             dir: Some(home.join(DIR)),
-            cancelled: Mutex::new(HashSet::new()),
+            ..Default::default()
         }
     }
 
@@ -248,15 +280,41 @@ fn view(job: &Job, done: usize, failed: usize) -> Value {
            "created": job.created, "finished": job.finished})
 }
 
-/// The progress of a job, from its results file: (items finished, items that failed).
-fn progress(dir: &Path) -> (usize, usize) {
-    let results = read_results(&dir.join(RESULTS));
-    (results.len(), results.iter().filter(|r| !r.ok).count())
+/// The progress of a job: (items finished, items that failed). Only the lines appended since the last call are read, so
+/// polling `batch.get` on a long job costs what is new, not the whole file. Only whole lines are counted: a line still
+/// being written is read on the next call.
+fn progress(batches: &Batches, id: &str, dir: &Path) -> (usize, usize) {
+    let mut tallies = batches.tallies.lock();
+    let t = tallies.entry(id.to_string()).or_default();
+    if let Ok(bytes) = read_from(&dir.join(RESULTS), t.offset) {
+        let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        for line in bytes[..whole].split(|b| *b == b'\n') {
+            if let Ok(r) = serde_json::from_slice::<ItemResult>(line) {
+                t.done += 1;
+                if !r.ok {
+                    t.failed += 1;
+                }
+            }
+        }
+        t.offset += whole as u64;
+    }
+    (t.done, t.failed)
+}
+
+/// The bytes of a file from an offset on. A file that is not there yet has none.
+fn read_from(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// `batch.submit`: check the job, write its folder, and start it. Returns at once, with the job's id.
 pub fn submit(hub: &Hub, a: &Value) -> Result<Value, Fail> {
     let spec = parse_spec(a)?;
+    // A model this hub does not serve is refused here, not once per item after thousands of prompts were queued.
+    crate::hub::served_llama_model(hub, &spec.model)?;
     let root = hub.batches.root()?.to_path_buf();
     let job = Job {
         id: format!("b{}", uuid::Uuid::new_v4().simple()),
@@ -281,7 +339,7 @@ pub fn submit(hub: &Hub, a: &Value) -> Result<Value, Fail> {
 /// `batch.get`: the job's state and progress.
 pub fn get(hub: &Hub, id: &str) -> Result<Value, Fail> {
     let job = hub.batches.load(id)?;
-    let (done, failed) = progress(&hub.batches.job_dir(id)?);
+    let (done, failed) = progress(&hub.batches, id, &hub.batches.job_dir(id)?);
     Ok(view(&job, done, failed))
 }
 
@@ -301,7 +359,7 @@ pub fn list(hub: &Hub, state: &str) -> Result<Value, Fail> {
     let rows: Vec<Value> = jobs
         .iter()
         .map(|job| {
-            let (done, failed) = progress(&root.join(&job.id));
+            let (done, failed) = progress(&hub.batches, &job.id, &root.join(&job.id));
             view(job, done, failed)
         })
         .collect();
@@ -312,15 +370,30 @@ pub fn list(hub: &Hub, state: &str) -> Result<Value, Fail> {
 /// `next` is the position to ask from next, or null when there are no more.
 pub fn results(hub: &Hub, id: &str, from: usize, limit: usize) -> Result<Value, Fail> {
     hub.batches.load(id)?;
-    let all = read_results(&hub.batches.job_dir(id)?.join(RESULTS));
-    let end = all.len().min(from.saturating_add(limit.clamp(1, 1000)));
-    let page: &[ItemResult] = if from < all.len() { &all[from..end] } else { &[] };
-    let next = (end < all.len()).then_some(end);
+    let dir = hub.batches.job_dir(id)?;
+    let (total, _) = progress(&hub.batches, id, &dir);
+    let end = total.min(from.saturating_add(limit.clamp(1, 1000)));
+    // Lines are read only up to the end of the page, so an early page does not read the whole file.
+    let page: Vec<ItemResult> = match std::fs::File::open(dir.join(RESULTS)) {
+        Ok(f) => BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str::<ItemResult>(&l).ok())
+            .skip(from)
+            .take(end.saturating_sub(from))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let next = (end < total).then_some(end);
     Ok(json!({"results": page, "next": next}))
 }
 
 /// `batch.cancel`: stop a running job. The items already running finish; no item after them starts.
 pub fn cancel(hub: &Hub, id: &str) -> Result<Value, Fail> {
+    let dir = hub.batches.job_dir(id)?;
+    // Held with the final write in `run`, so a job that finishes as it is cancelled ends up cancelled or done, and
+    // neither write overwrites the other.
+    let mut stopping = hub.batches.cancelled.lock();
     let mut job = hub.batches.load(id)?;
     if job.state != JobState::Running {
         return Err(Fail::new(
@@ -329,12 +402,12 @@ pub fn cancel(hub: &Hub, id: &str) -> Result<Value, Fail> {
             format!("batch {id} is {:?}, not running", job.state),
         ));
     }
-    let dir = hub.batches.job_dir(id)?;
-    hub.batches.cancelled.lock().insert(id.to_string());
+    stopping.insert(id.to_string());
     job.state = JobState::Cancelled;
     job.finished = Some(now());
     save_job(&dir, &job).map_err(io_fail)?;
-    let (done, failed) = progress(&dir);
+    drop(stopping);
+    let (done, failed) = progress(&hub.batches, id, &dir);
     Ok(view(&job, done, failed))
 }
 
@@ -408,7 +481,9 @@ async fn run(hub: Hub, job: Job, answered: HashSet<usize>) {
         }
     }
     let mut finished = job.clone();
-    finished.state = if batches.is_cancelled(&job.id) {
+    // Read and written under the lock `cancel` takes, so a cancel that arrives now is seen here, or sees this write.
+    let stopping = batches.cancelled.lock();
+    finished.state = if stopping.contains(&job.id) {
         JobState::Cancelled
     } else {
         JobState::Done
@@ -417,6 +492,7 @@ async fn run(hub: Hub, job: Job, answered: HashSet<usize>) {
     if let Err(e) = save_job(&dir, &finished) {
         eprintln!("batch {}: its final state could not be written: {e}", job.id);
     }
+    drop(stopping);
 }
 
 /// One item: the prompt goes through `chat.complete`, as the owner's own chat does. A failure is recorded, not raised.
@@ -466,6 +542,12 @@ mod tests {
         assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": 0})).is_err());
         assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": MAX_CONCURRENCY + 1})).is_err());
         assert!(spec(json!({"model": "m", "prompts": ["p"], "max_tokens": 0})).is_err());
+        // a value of the wrong type is an error, not the default
+        assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": "8"})).is_err());
+        assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": 2.5})).is_err());
+        assert!(spec(json!({"model": "m", "prompts": ["p"], "max_tokens": -1})).is_err());
+        assert!(spec(json!({"model": "m", "prompts": ["p"], "name": 3})).is_err());
+        assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": null})).is_ok(), "null is the default");
         let ok =
             spec(json!({"model": " m ", "prompts": ["a", "b"], "name": " nightly ", "system": " be brief "})).unwrap();
         assert_eq!(
@@ -530,6 +612,13 @@ mod tests {
         assert!(batches.job_dir("b0123abc").is_ok());
         assert_eq!(JobState::filter("running").unwrap(), Some(JobState::Running));
         assert_eq!(JobState::filter("all").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_is_refused_before_a_job_is_written() {
+        let hub = crate::testing::hub(&crate::testing::temp_home(), &["alpha"]);
+        assert!(submit(&hub, &json!({"model": "no-such-model", "prompts": ["p"]})).is_err());
+        assert!(list(&hub, "all").unwrap()["batches"].as_array().unwrap().is_empty());
     }
 
     /// Poll a job until it stops running, for a minute at most.
