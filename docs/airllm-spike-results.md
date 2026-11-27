@@ -1,5 +1,8 @@
 # AirLLM Phase 0 spike: results (2026-11-24)
 
+> **Superseded.** AirLLM's features are now in Rigel (see `docs/rigel.md`). These results are the record of why the spike
+> ran; AirLLM itself was 38 times slower on the 1.7B test model, and the open items T2 and T5 are no longer tracked here.
+
 Part of [airllm-integration-plan.md](airllm-integration-plan.md) (section 4.4). Run by an agent on the owner's yes ("download to
 the drive with the largest free space"). **Nothing in the hub, the Forge environment or `home/` was changed**, and no source
 file in this repository changed. This is a partial spike: it answers T3 and T4 and gives one speed point. It does **not**
