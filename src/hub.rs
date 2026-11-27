@@ -2002,13 +2002,18 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
         Err(f) => {
             // no room here (or busy): another node of the fabric may have it
             if let (Some(spare), true) = (&spare, crate::fabric::capacity_failure(&f)) {
-                if let Some(r) = crate::fabric::offload(&hub, path, spare).await {
+                if let Some(off) = crate::fabric::offload(&hub, path, spare).await {
                     hub.engine.record(&asked, true, t0.elapsed().as_millis() as u64, None);
-                    // the other node's usage is not read here, so this success is counted without tokens
-                    if let Some(p) = &who.0 {
-                        p.finish(&asked, true, 0, 0);
-                    }
-                    return Ok(r);
+                    // the caller's key is charged for what the other node answered, as for a request served here
+                    let mut tracker = Tracker {
+                        _lease: None,
+                        who: who.0.clone(),
+                        model: asked.clone(),
+                        ok: true,
+                        tail: String::new(),
+                        events: 0,
+                    };
+                    return Ok(off.into_response(move |b| tracker.observe(b)));
                 }
             }
             if let Some(p) = &who.0 {

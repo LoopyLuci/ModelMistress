@@ -73,7 +73,7 @@
 ### Fixes from the review of this branch
 
 - A request that the fabric served for this hub is counted in the peer key's usage when it succeeds, as a failed one already
-  was (`src/hub.rs`, `passthrough`). The count has no tokens: the other node's usage is not read here.
+  was (`src/hub.rs`, `passthrough`). The tokens are counted too, from the answer (see Fabric below).
 - The build script trusts only this checkout for git (`src/build.rs`), not every directory on the machine.
 
 ### Android app (`android/`, version 0.1.0)
@@ -99,6 +99,9 @@
   (`x-cf-hop`) is never passed on again; the answer carries `x-mm-offloaded` and `x-mm-node`. Off until `fabric.set` is
   used. See `docs/fabric.md`. Tests: `fabric::tests`, and six in `tests_upstream.rs` (busy hub offloads, hop guard, offload
   off, unreachable fabric, `fabric.set` checks, `machine.status`).
+- An offloaded request is charged to the caller's key with the tokens in the fabric's answer (as one served here is, and
+  counting against its quotas), and `fabric.status` gains `offloaded_by_node`. Tests: the offload test checks the count, and
+  `an_offloaded_request_is_charged_to_the_callers_key_with_the_tokens_the_fabric_answered`.
 
 - **The server log says how a model's layers were placed, and `model.telemetry` reads it** (`src/loadlog.rs`, `src/engine.rs`,
   `src/hub.rs`, `src/serving.rs`; [serving](docs/serving.md#the-server-log-and-model-telemetry)). llama.cpp b12726 prints its
