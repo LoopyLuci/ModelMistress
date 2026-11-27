@@ -29,9 +29,15 @@
   she learns) and the Models page (import, speed test). Its tests run offscreen with fake sound and a fake hub.
 - Parity with the Android app: `docs/android-parity.md`. Open: echo cancellation on a real microphone and speaker (checked offline only; a headset is
   advised), steering a reply gives no rating for the cut reply, and the web Live cannot interrupt a reply early.
-- Tests: `cargo test` passes on every target (649 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
+- Tests: `cargo test` passes on every target (650 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
   and the native window's pytest suite (169 tests and 1 skipped; with `MM_HUB_EXE` set, the real-hub test runs too). Not run on a real microphone,
   camera, speaker or large model file.
+
+### Fixes from the review of this branch
+
+- A request that the fabric served for this hub is counted in the peer key's usage when it succeeds, as a failed one already
+  was (`src/hub.rs`, `passthrough`). The count has no tokens: the other node's usage is not read here.
+- The build script trusts only this checkout for git (`src/build.rs`), not every directory on the machine.
 
 ### Android app (`android/`, version 0.1.0)
 
