@@ -6,8 +6,7 @@
 
 - Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are
   kept in Misty's database (`misty.rate`, `misty.feedback.list`, `misty.feedback.forget`). "No tool needed" and "Should have
-  used a tool" route similar questions, and a correction is given to her as a note for similar questions
-  A Good or Bad rating routes nothing, so it does not switch tools on or off (`src/misty/feedback.rs`, `src/misty/agent.rs`).
+  used a tool" route similar questions, and a correction is given to her as a note for similar questions. A Good or Bad rating routes nothing, so it does not switch tools on or off (`src/misty/feedback.rs`, `src/misty/agent.rs`).
 - Learning tab on Setup and status: the rating counts, an export as chat-format JSON lines (`misty.training.export`), and
   forgetting one rating or all of them.
 - Chat: a message written during a reply waits and is sent after it; "Jump to latest" when scrolled up; Dictate (the
@@ -135,6 +134,16 @@
   is offered as a link, not loaded. LTX-2.x has sampling presets (distilled: 8 steps, guidance 1; dev: 20 steps, guidance 3).
   Measured LTX-2.5 distilled Q4_K_M, 25 frames at 512x320 with sound: 387 s of sampling; the Gemma 12B BF16 encoder (26 GB) took 19.7 minutes
   to encode the prompt on its first run, because it streams through the card in 50 segments.
+
+### The tests
+
+- **The tests no longer depend on the machine they run on** (`src/engine.rs`).
+  - *Why nine tests failed.* `Engine::roots` added the folders found from the environment: `OLLAMA_MODELS`, the home
+  folder's `.ollama` and the Hugging Face caches. On a machine with its own models (here `OLLAMA_MODELS` points at a
+  store of models) those models were listed first, so tests that expect their own `tiny` model or no model got the
+  host's instead.
+  - *The fix.* A test build gets no machine folders; a test names the folders it needs in its settings. A test checks
+  that a fresh engine's folders are all under its own home.
 
 ## 0.4.2 — 2026-11-23
 

@@ -9,6 +9,9 @@ dist/
 !.env.example
 ci/logs/
 ci/.pipeline.lock
+# The local hub home (config, keys, control.json with the owner's token, databases,
+# logs, and a copy of the hub binary). Machine state, never tracked.
+/home/
 __pycache__/
 .pytest_cache/
 .venv/

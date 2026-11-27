@@ -701,9 +701,22 @@ impl Engine {
         Ok(())
     }
 
+    /// The folders found on this machine: `OLLAMA_MODELS`, the home folder's `.ollama`, the Hugging Face caches.
+    /// Tests get none, so a test never depends on the models installed where it runs; it names the folders it
+    /// needs in its settings.
+    #[cfg(not(test))]
+    fn machine_roots() -> Roots {
+        Roots::detected()
+    }
+
+    #[cfg(test)]
+    fn machine_roots() -> Roots {
+        Roots::default()
+    }
+
     pub fn roots(&self) -> Roots {
         let s = self.settings.read();
-        let mut r = Roots::detected();
+        let mut r = Self::machine_roots();
         if s.ollama_discovery {
             r.ollama.splice(0..0, s.ollama_dirs.iter().cloned());
         } else {
@@ -3637,6 +3650,17 @@ mod job {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_test_engine_looks_in_no_folder_of_the_machine() {
+        // The host's OLLAMA_MODELS, ~/.ollama and Hugging Face caches must not reach a test's roots: every folder
+        // here is under the test's own home (the default settings' `downloads` is the home itself).
+        let d = crate::testing::TestDir::new("mm-no-host-roots");
+        let r = super::Engine::new(d.to_path_buf(), super::Settings::default()).roots();
+        for dirs in [&r.ollama, &r.huggingface, &r.folders, &r.native] {
+            assert!(dirs.iter().all(|p| p.starts_with(&*d)), "{dirs:?}");
+        }
+    }
+
     #[test]
     fn raise_priority_is_off_by_default_and_read_from_config_toml() {
         assert!(!Settings::default().raise_priority);
