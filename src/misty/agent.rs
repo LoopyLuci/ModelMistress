@@ -682,6 +682,9 @@ async fn act(ctx: &Ctx, run: &Run, req: &Req, guard: &mut Guard, name: &str, arg
 /// What a result becomes when the conversation outgrows the model's context.
 const DROPPED: &str = "[this result was dropped to fit the model's context; call the tool again if you still need it]";
 
+/// What the end of a result that was cut to fit says.
+const CUT_NOTE: &str = "\n... (cut to fit the model's context)";
+
 /// A rough count of tokens: three bytes to a token. English runs nearer four, and Chinese or code differ both ways;
 /// counting high is the safe side, since a prompt over the context is refused outright.
 fn tokens_of(text: &str) -> usize {
@@ -744,6 +747,11 @@ pub fn fit_context(messages: &mut Vec<Value>, budget: usize) -> Fit {
         first += 1;
     }
     if first > 1 {
+        // what stays of the conversation begins with a question: a chat template that wants the roles to alternate
+        // refuses a prompt whose first turn is an answer
+        while first < last_user && messages[first]["role"] != "user" {
+            first += 1;
+        }
         fit.changed += first - 1;
         messages.drain(1..first);
     }
@@ -763,14 +771,15 @@ pub fn fit_context(messages: &mut Vec<Value>, budget: usize) -> Fit {
             break;
         };
         let text = messages[i]["content"].as_str().unwrap_or("").to_string();
-        if text.len() <= 400 {
+        // the biggest result is already as small as a cut makes it (the note adds to what is kept): nothing more to gain
+        if text.len() <= 400 + CUT_NOTE.len() {
             break;
         }
         let mut cut = (text.len() / 2).max(400);
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        messages[i]["content"] = json!(format!("{}\n... (cut to fit the model's context)", &text[..cut]));
+        messages[i]["content"] = json!(format!("{}{CUT_NOTE}", &text[..cut]));
         fit.changed += 1;
     }
     fit.after = total(messages);
@@ -1193,6 +1202,7 @@ async fn inner(ctx: &Ctx, req: &Req, run: &Run, out: &mut Outcome) -> Result<(),
                         Ok(args) => act(ctx, run, req, &mut guard, &c.name, args, &collection).await,
                         Err(e) => {
                             guard.used += 1;
+                            guard.done.push((c.name.clone(), "bad arguments"));
                             run.emit(json!({"type": "tool", "name": c.name, "status": "error", "note": format!("arguments are not JSON: {e}")}));
                             format!(
                                 "error: the arguments were not valid JSON ({e}); call the tool again with a JSON object"
@@ -2697,6 +2707,44 @@ pub mod tests {
                 assert_eq!(m3[i + 1]["role"], "tool");
             }
         }
+    }
+
+    #[test]
+    fn what_stays_of_the_history_begins_with_a_question_and_a_hopeless_budget_ends_quickly() {
+        // two old exchanges and a question; the budget forces out the first exchange only partly
+        let big = "x".repeat(900); // 300 tokens
+        let mut m = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "user", "content": big}),
+            json!({"role": "assistant", "content": big}),
+            json!({"role": "user", "content": "a second question"}),
+            json!({"role": "assistant", "content": "a second answer"}),
+            json!({"role": "user", "content": "the question now"}),
+        ];
+        // dropping the old question alone brings the prompt under the budget, but would leave its answer first
+        let fit = fit_context(&mut m, 420);
+        assert_eq!(m[1]["role"], "user", "{m:?}");
+        assert_eq!(m[1]["content"], "a second question");
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(fit.changed, 2, "{fit:?}");
+        assert_eq!(m.last().unwrap()["content"], "the question now");
+
+        // a budget no cut can meet: the biggest result is cut until a cut gains nothing, and the work stops there
+        let mut m = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [{"id": "t", "type": "function", "function": {"name": "fs_read", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "t", "content": "y".repeat(6000)}),
+        ];
+        let fit = fit_context(&mut m, 10);
+        assert!(fit.changed <= 8, "a cut that gains nothing is not repeated: {fit:?}");
+        let kept = m[3]["content"].as_str().unwrap();
+        assert!(
+            kept.len() <= 400 + CUT_NOTE.len() && kept.ends_with(CUT_NOTE),
+            "{}",
+            kept.len()
+        );
     }
 
     /// A run whose tool results are many and large still sends the model prompts that fit its context.
