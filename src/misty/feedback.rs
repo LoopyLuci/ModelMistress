@@ -64,9 +64,9 @@ impl Label {
             .find(|l| l.wire() == wire)
     }
 
-    /// The verdicts that say something about the route a question should take.
+    /// The verdicts that say what tools a question needs. A good or a bad reply says nothing about tools, so it routes nothing.
     fn routes(self) -> bool {
-        matches!(self, Label::Good | Label::NoTools | Label::NeedsTools)
+        matches!(self, Label::NoTools | Label::NeedsTools)
     }
 }
 
@@ -289,6 +289,15 @@ mod tests {
             v("list my files", Label::NoTools, &[], None, 9),
         ];
         assert_eq!(taught("list my files", &all).unwrap().label, Label::NoTools);
+    }
+
+    #[test]
+    fn a_good_or_bad_verdict_says_nothing_about_tools_and_routes_nothing() {
+        let all = vec![
+            v("what time is it", Label::Good, &[], None, 1),
+            v("what time is it", Label::Bad, &[], None, 2),
+        ];
+        assert!(taught("what time is it", &all).is_none());
     }
 
     #[test]

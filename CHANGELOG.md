@@ -7,7 +7,7 @@
 - Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are
   kept in Misty's database (`misty.rate`, `misty.feedback.list`, `misty.feedback.forget`). "No tool needed" and "Should have
   used a tool" route similar questions, and a correction is given to her as a note for similar questions
-  (`src/misty/feedback.rs`, `src/misty/agent.rs`).
+  A Good or Bad rating routes nothing, so it does not switch tools on or off (`src/misty/feedback.rs`, `src/misty/agent.rs`).
 - Learning tab on Setup and status: the rating counts, an export as chat-format JSON lines (`misty.training.export`), and
   forgetting one rating or all of them.
 - Chat: a message written during a reply waits and is sent after it; "Jump to latest" when scrolled up; Dictate (the

@@ -1835,6 +1835,10 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
             if let (Some(spare), true) = (&spare, crate::fabric::capacity_failure(&f)) {
                 if let Some(r) = crate::fabric::offload(&hub, path, spare).await {
                     hub.engine.record(&asked, true, t0.elapsed().as_millis() as u64, None);
+                    // the other node's usage is not read here, so this success is counted without tokens
+                    if let Some(p) = &who.0 {
+                        p.finish(&asked, true, 0, 0);
+                    }
                     return Ok(r);
                 }
             }

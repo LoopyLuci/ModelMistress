@@ -261,11 +261,13 @@ fn build_rigel() {
     );
     let exe = find_exe(&build, "rigel-server").unwrap_or_else(|| panic!("rigel-engine: rigel-server was not built"));
     println!("cargo:rustc-env=MM_BUNDLED_RIGEL={}", exe.display());
-    // (safe.directory: the checkout may belong to another user, and then git would say nothing and the version "unknown")
+    // (safe.directory: the checkout may belong to another user, and then git would say nothing and the version "unknown").
+    // Trusted for this checkout only, not for every directory.
+    let safe = format!("safe.directory={}", src.display().to_string().replace('\\', "/"));
     let commit = Command::new("git")
         .args([
             "-c",
-            "safe.directory=*",
+            &safe,
             "-C",
             &src.display().to_string(),
             "rev-parse",
