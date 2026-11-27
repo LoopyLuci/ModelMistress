@@ -157,7 +157,17 @@ async fn nothing_is_installed_without_a_yes_a_source_and_a_hash() {
     for want in ["ffmpeg-lgpl.zip", "example.org", "164 MB", &sha, "confirm: true"] {
         assert!(m.contains(want), "{want} not in {m}");
     }
-    // a url with no hash, a plain http url, a bad hash, and (no build is pinned here yet) nothing at all
+    // with nothing named, the pinned build (where there is one) is described, not fetched
+    let (st, v) = owner(&h, "POST", "/v1/call/media.install", Some(json!({"confirm": false}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    if crate::media::ffmpeg::pin().is_some() {
+        let pin = crate::media::ffmpeg::pin().unwrap();
+        assert!(
+            message(&v).contains(&pin.sha256) && message(&v).contains(&pin.file),
+            "{v}"
+        );
+    }
+    // a url with no hash, a plain http url, a bad hash, a hash alone, and both url and file
     for (args, word) in [
         (json!({"confirm": true, "url": "https://example.org/a.zip"}), "sha256"),
         (
@@ -168,7 +178,7 @@ async fn nothing_is_installed_without_a_yes_a_source_and_a_hash() {
             json!({"confirm": true, "url": "https://example.org/a.zip", "sha256": "xyz"}),
             "64 hex",
         ),
-        (json!({"confirm": true}), "pinned"),
+        (json!({"confirm": true, "sha256": sha}), "goes with url or file"),
         (
             json!({"confirm": true, "url": "https://example.org/a.zip", "file": "x", "sha256": sha}),
             "not both",

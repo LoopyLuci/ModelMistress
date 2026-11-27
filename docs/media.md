@@ -32,15 +32,19 @@ on the owner's machine is the owner's call), the pinned build, the speech compon
 ### `media.install`
 
 ```bash
-model-mistress call media.install '{"confirm": false, "url": "https://.../ffmpeg-n9.0-win64-lgpl.zip", "sha256": "<64 hex>", "size": 164000000}'
+model-mistress call media.install '{"confirm": false}'      # says what the pinned build is and what it would fetch
+model-mistress call media.install '{"confirm": true, "file": "C:/dl/ffmpeg-....zip", "sha256": "<64 hex>", "wait": true}'
 ```
 
 - Without `confirm: true` the answer (a `400`) says what would happen: the file, its size, where it comes from and the
   SHA-256 it must have. Nothing is fetched.
-- **No build is pinned in this release.** A pin needs a file name, an address that never changes, a size and a SHA-256 that
-  someone has downloaded and hashed, and the owner chooses the build (an LGPL one: no x264 or x265). Until then give
-  `url` and `sha256` (an `https` address, or one on this machine), or `file` and `sha256` for an archive you downloaded
-  yourself, or set `ffmpeg_dir`. `pin()` in `src/media/ffmpeg.rs` is the one place to fill in when the owner has chosen.
+- **The pinned build** (Windows x64 only; nothing is pinned elsewhere) is BtbN's FFmpeg-Builds release n8.1, LGPL, shared:
+  `ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip`, 81,544,084 bytes, SHA-256
+  `bb63313643f91add6ab97f546c216b07378476f4953f983c9e1c8875f4ff9558` (the programs and their DLLs). Its address is a
+  daily-build page whose files stay up for 14 days, so it will stop working: keep the zip and install it with `file` and
+  `sha256`, or pick another build and change `pin()` in `src/media/ffmpeg.rs`. `url` and `sha256` (an `https` address, or one
+  on this machine) install any other build. n9.0.2-982-g836df4e858 (`...win64-lgpl-shared-9.0.zip`, 77,786,993 bytes, SHA-256
+  `ab4b0718084667b20f8f83b6c32e3f5d5c1b14274fffdb3b24da0eb62a7b1460`) was installed and measured beside it (below).
 - The archive's hash is checked before anything is unpacked; a mismatch (`422 hash_mismatch` as a job error) installs
   nothing. The unpacked programs are run once (`-version`) before they replace anything.
 - The result goes to `<home>/engines/ffmpeg/` (the player, `ffplay`, is left out). An earlier install is kept beside it as
@@ -79,7 +83,7 @@ A chat message takes OpenAI's `image_url` and `video_url` parts and llama-server
 
 Measured before this was built (the plan's spike, a 74 s screen recording of a meeting, native video with ffmpeg):
 Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B each answered the five questions about it correctly, at about one second of
-compute per second of video. That measurement was not repeated with the code in this branch (see "Not run").
+compute per second of video. The same kind of check was repeated with this code on one model (see "Run with real builds").
 
 ## `media.probe`
 
@@ -118,9 +122,38 @@ New in the answer:
   times real time against 0.9 on the CPU for the same model. The Vulkan build of whisper-rs-sys fails when the build path is
   long (the shader compile): use a short `CARGO_TARGET_DIR`. `media.components` says which build runs (`build`).
 
+## Run with real builds (2026-11-27)
+
+Both builds were installed with `media.install` from their zips (nine seconds each) into scratch homes, and a scratch hub
+with the pinned-engine `llama-server` (llama.cpp 7fee178) ran the checks on the RX 7900 XTX. The owner's hub was not touched.
+
+| | n8.1.3 (pinned) | n9.0.2 |
+|---|---|---|
+| Licence read from the build | LGPL (`--enable-version3`, no `--enable-gpl`, no `--enable-nonfree`) | the same |
+| `media.probe` of the 32 s MP4 | same fields | same, except ffprobe reports the AAC `initial_padding` as 1024 (n8.1: 0), which the hub does not show |
+| Decode 322 frames of 720p, 5 runs (median) | 0.12 s, about 265 times real time | 0.12 s, about 280 times |
+| Audio to 16 kHz mono, ffprobe | 0.04 s, 0.03 s | the same |
+| PCM that ffmpeg wrote | identical to n9.0.2's, byte for byte | identical |
+| `speech.transcribe` of the MP4 (whisper `large-v3-turbo-q5_0`, CPU, debug build, model load included) | 42 s for 32 s of audio; text identical to the spoken script | 41 s; the same text |
+| Chat, Gemma 4 26B, `video_url` of the local MP4, 13,116 prompt tokens | 5 of 5 answers correct | 5 of 5 |
+| Follow-up answers (prompt cached) | 3.5 to 5.2 s | 2.9 to 5.3 s |
+| Generation over 900 tokens | 82.2 tokens/s | 84.8 tokens/s |
+
+The two builds behaved the same. What the run found:
+
+- **Gemma 4 26B's projector crashes this llama-server on the GPU**: the process died while encoding, for a single picture as
+  well as for the video (the same with 20k and 32k of context, with 6.7 GB of VRAM free), so it is the model, projector and
+  server, not ffmpeg or the hub (the hub staged the file and the server read it). With `--no-mmproj-offload` it runs, but the
+  projector then works on the CPU: the first answer about the video took **16 minutes** (965 s and 957 s), the later ones seconds.
+  The models of the plan's spike (Qwen3-VL, Gemma 4 E4B) are no longer on this machine and nothing was downloaded, so the
+  exit check ran on this model. Use `extra_args` (`--no-mmproj-offload`) per model until a model whose projector runs on the GPU is used.
+- **llama-server's default frame rate is too high for long context**: the 32 s clip came to 52,595 tokens at the default and
+  was refused as over a 32,768 context; with `--video-fps 1` (the setting `extra_args`, as in the spike) it is 13,116 tokens.
+  The hub does not choose a frame rate yet (open).
+- The speed figure is 900 generated tokens; the first-answer time is the CPU projector and is not a speed of the hub.
+
 ## Not run, and open
 
-See the changelog entry for the list of what was run and what was not. In short: no real ffmpeg was installed by this
-code (no build is pinned), so the chat path with a real video, the install from a real archive and `media.probe` on a real
-file have been tested against stand-in programs only; `--features whisper` and `whisper-vulkan` were not run on the owner's
-card with the new code paths.
+See the changelog entry for the list of what was run and what was not. In short: `whisper-vulkan` was not built, and the
+GPU speed of whisper and a vision model whose projector runs on the GPU were not measured with this code. The tests use
+stand-in programs; the run above used real builds, a real model and a real clip.

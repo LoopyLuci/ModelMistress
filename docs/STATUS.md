@@ -63,13 +63,13 @@ format and word times; the Cargo feature `whisper-vulkan` builds whisper.cpp's V
 
 Run: the library tests with stand-in ffmpeg, ffprobe and llama-server programs (807 tests, 800 pass, 6 ignored; the one
 failure, `documents::tests::a_pdf_gives_its_text`, is this worktree's checkout of the PDF fixture with Windows line endings,
-and the file is unchanged by this work). Measured earlier by the media plan's spikes, not repeated with this code: a 74 s
-screen recording answered correctly (5 of 5) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's video input
-at about one second of compute per second of video; whisper.cpp with Vulkan at 59.8 times real time against 0.9 on the CPU.
-Not run: a real ffmpeg (**no build is pinned**, `pin()` in `src/media/ffmpeg.rs` is empty and nothing was downloaded), a real
-video through a real model with this code, the new `whisper` paths (they compile with `--features whisper`; the test binary does not link on this machine,
-unresolved C++ runtime symbols), `whisper-vulkan` at all, the new
-routes from a browser or a real client.
+and the file is unchanged by this work), and the 35 speech tests with `--features whisper`. Run with real builds and a real
+clip on a scratch hub (see [media.md](media.md)): ffmpeg n8.1.3 (pinned, LGPL) and n9.0.2 installed from their zips and
+behaving the same (decode, `media.probe`, a 32 s MP4 transcribed exactly in 41 to 42 s on the CPU), and a Gemma 4 26B chat
+answering 5 of 5 questions about the MP4 on both, 900 tokens at 82 to 85 tokens/s. Found: that model's projector crashes the
+GPU llama-server (it ran with `--no-mmproj-offload`, first answer 16 minutes), and the default video frame rate overflows a
+32k context (`--video-fps 1`). Not run: a vision model whose projector runs on the GPU, `whisper-vulkan` (not built), the
+new routes from a browser or a real client.
 
 ## Ollama-compatible API
 

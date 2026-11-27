@@ -49,7 +49,20 @@ pub struct Pin {
 /// needs the build named by `url` and `sha256` (or a `file` and its `sha256`), or ffmpeg from PATH or the
 /// `ffmpeg_dir` setting is used.
 pub fn pin() -> Option<Pin> {
-    None
+    if !cfg!(all(windows, target_arch = "x86_64")) {
+        return None;
+    }
+    // BtbN's FFmpeg-Builds, release n8.1 branch, LGPL, shared (the programs and their DLLs). Daily builds stay on the
+    // release page for 14 days only, so the address will stop working: the owner keeps the zip and installs it with
+    // `media.install` and `file`, or picks another build and pins that (n9.0.2-982-g836df4e858, 77,786,993 bytes,
+    // sha256 ab4b0718084667b20f8f83b6c32e3f5d5c1b14274fffdb3b24da0eb62a7b1460, was measured beside this one).
+    Some(Pin {
+        file: "ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip".into(),
+        url: "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-27-12-42/ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip".into(),
+        size: 81_544_084,
+        sha256: "bb63313643f91add6ab97f546c216b07378476f4953f983c9e1c8875f4ff9558".into(),
+        licence: "LGPL",
+    })
 }
 
 // ---- where they are -------------------------------------------------------------------------------------------------

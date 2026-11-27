@@ -13,10 +13,10 @@
   `install.json` and are checked before the file is used (a swapped file or a folder with no record is an error that names
   the fix, never a silent use), and an earlier install is kept as `ffmpeg.old-<time>`. Runs as a job; `wait: true` waits.
   New setting `ffmpeg_dir`. See `docs/media.md`.
-- **No ffmpeg build is pinned yet.** `pin()` in `src/media/ffmpeg.rs` is empty until the owner picks a build (an LGPL one)
-  and someone downloads and hashes it: the media spike used BtbN's `ffmpeg-n9.0-latest-win64-lgpl-9.0.zip` (164 MB), whose
-  address is a rolling `latest` tag and cannot be pinned. Until then `media.install` takes `url` + `sha256` (https, or this
-  machine) or `file` + `sha256`, or `ffmpeg_dir` names a folder. Nothing in this change downloaded anything.
+- **The pinned build** (Windows x64) is BtbN's FFmpeg-Builds n8.1, LGPL, shared: `ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip`,
+  81,544,084 bytes, SHA-256 `bb633136…f9558`. Its download address is a daily-build page that keeps files 14 days, so
+  keep the zip and install with `file` + `sha256`, or pin another build in `pin()`. `url` + `sha256` and `file` + `sha256`
+  install any build. Installed from the zip in this change, and n9.0.2 beside it; the hub never downloads by itself.
 - Video and audio in chat. A chat message's `video_url`, `input_video`, `input_audio` and `image_url` parts reach the
   model's llama-server. A model that has a projector is started with `--media-path <home>/media` and, when ffmpeg is there,
   `--video-ffmpeg-dir <folder>`, each only if that llama-server lists the flag and unless the owner's own arguments set it.
@@ -49,16 +49,23 @@
   was answered correctly (5 of 5 questions) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's native video
   input, at about one second of compute per second of video; whisper.cpp through whisper-rs 0.16 with Vulkan ran 59.8 times
   real time against 0.9 on the CPU on the RX 7900 XTX.
-- Run for this change: `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
+- Run on this machine with real builds, a real model and a real clip (a scratch hub, the owner's hub untouched): ffmpeg
+  n8.1.3 and n9.0.2 installed from their zips, both read as LGPL; `media.probe`, decoding (322 frames of 720p in 0.12 s) and the
+  16 kHz audio the same on both; `speech.transcribe` of a 32 s MP4 (whisper large-v3-turbo-q5_0 on the CPU) gave the spoken
+  script exactly in 41 to 42 s; a Gemma 4 26B chat with `video_url` of the local MP4 answered 5 of 5 questions on both builds
+  (900 generated tokens at 82 and 85 tokens/s). Two findings: that model's projector crashes the pinned llama-server on the
+  GPU (for a single picture too), so it ran with `--no-mmproj-offload` and the first video answer took 16 minutes; and
+  llama-server's default frame rate gave 52,595 tokens for the 32 s clip, over a 32k context, so `--video-fps 1` was given
+  in `extra_args` (the hub chooses no frame rate yet).
+- Tests for this change: with `--features whisper` the 35 speech, audio and media tests pass too (the test binary links
+  only against the MSVC 14.51 libraries here: whisper.cpp was compiled with its headers). `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
   fails in this worktree because its PDF fixture was checked out with Windows line endings, which breaks the file's byte
   offsets; the file is not touched here and `*.pdf` is not marked binary in `.gitattributes`), `rustfmt`, and clippy with
   `-D warnings` on this change's files (three other lints, in `misty/ops.rs`, `batch.rs` and `misty/agent.rs`, come from the
   newer toolchain and are not touched). The tests use stand-in ffmpeg, ffprobe and llama-server programs (the install from a stored
   zip with a right and a wrong hash, a swapped file, the listings, the chat path through a stand-in server that records what
-  it was sent, a peer's request left alone, the ass and words formats). Not run: a real ffmpeg (none is pinned, nothing was
-  downloaded), a real video through a real model with this code, `--features whisper` on the new paths against a real
-  model (it compiles; the test binary does not link on this machine, with unresolved `__std_rotate` and two more
-  symbols from the C++ runtime, so those tests did not run), `--features whisper-vulkan` at all (not built here), the new routes with a browser or a real client.
+  it was sent, a peer's request left alone, the ass and words formats). Not run: a vision model whose projector runs on the GPU
+  (Qwen3-VL and Gemma 4 E4B are not on the machine), the GPU speed of whisper, `--features whisper-vulkan` at all (not built here), the new routes with a browser or a real client.
 
 ### System awareness: the hub watches the PC and yields to it, live
 
