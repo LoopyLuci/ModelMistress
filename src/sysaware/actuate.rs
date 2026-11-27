@@ -459,8 +459,14 @@ mod tests {
             let t0 = started_now();
             let _ = child.kill();
             let _ = child.wait();
-            drop(child); // the test's own handle keeps an exited process readable
-            std::thread::sleep(Duration::from_millis(200));
+            // the test's own handle keeps an exited process readable
+            drop(child);
+            // Another program (a scanner, a monitor) may hold a handle to it for a moment, and an exited process stays
+            // readable while any handle is open: give them time to let go.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while win::Windows.state(pid, t0).is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             assert!(win::Windows.state(pid, t0).is_none());
             assert!(win::Windows.set_class(pid, t0, IDLE).is_err());
             assert!(win::Windows.resume(pid, t0).is_err());

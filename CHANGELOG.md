@@ -13,7 +13,10 @@
   and are paused after `pause_after_s` of critical (at most `max_pause_s`); a model server drops to below normal when strained
   and is never paused; any other process the hub started is lowered a step later. It only lowers, only touches descendants of
   the hub (named by pid *and* start time), puts back exactly what it changed (level falls, mode off, hub stops) and does not
-  fight a priority someone else changed. Console hosts and other helpers the OS starts for a child are left alone.
+  fight a priority someone else changed. Console hosts and other helpers the OS starts for a child are left alone. A process
+  counts as the hub's child only when its start time is known and not older than its parent's: Windows reuses a parent pid
+  after the parent exits, and on the live hub an `adb.exe` that predates the hub was lowered through such a pid (found there,
+  fixed, four tests).
 - Heavy jobs (`forge`, `factory`, `quantize`, `image`) do not start while the machine is strained or worse: the job exists
   at once, says why it waits, can be cancelled, and `system.run_now` starts it anyway. `max_wait_s` (default 0: as long as it
   takes) gives up waiting. Downloads, installs and Misty's own jobs never wait.

@@ -76,6 +76,12 @@ impl Native {
             .iter()
             .filter_map(|(pid, p)| p.parent().map(|pp| (pid.as_u32(), pp.as_u32())))
             .collect();
+        let starts: HashMap<u32, u64> = self
+            .sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.start_time()))
+            .collect();
         let mut mine: HashSet<u32> = HashSet::from([self.own]);
         let mut tree = vec![];
         for (pid, p) in self.sys.processes() {
@@ -83,21 +89,7 @@ impl Native {
             if pid == self.own {
                 continue;
             }
-            // bounded walk: a parent loop (pid reuse) must not hang the sampler
-            let (mut at, mut hops) = (pid, 0);
-            let mut descends = false;
-            while let Some(&up) = parents.get(&at) {
-                if up == self.own {
-                    descends = true;
-                    break;
-                }
-                if up == at || hops > 32 {
-                    break;
-                }
-                at = up;
-                hops += 1;
-            }
-            if descends {
+            if descends_from(self.own, pid, &parents, &starts) {
                 mine.insert(pid);
                 tree.push(Proc {
                     pid,
@@ -142,6 +134,32 @@ impl Native {
             user: user_state(),
         }
     }
+}
+
+/// Does `pid` descend from `own`, by the parent links?
+///
+/// Windows keeps the parent pid of a process after that parent has exited and later gives the same pid to some other
+/// program, so a link is only believed when it can be true: a process cannot be older than its parent, and both start
+/// times must be known. A broken link ends the walk, so a stale parent never makes an unrelated program (a daemon the
+/// user started an hour ago) look like the hub's own. The walk is bounded, so a parent loop cannot hang the sampler.
+fn descends_from(own: u32, pid: u32, parents: &HashMap<u32, u32>, starts: &HashMap<u32, u64>) -> bool {
+    let (mut at, mut hops) = (pid, 0);
+    while let Some(&up) = parents.get(&at) {
+        let child_started = starts.get(&at).copied().unwrap_or(0);
+        let parent_started = starts.get(&up).copied().unwrap_or(0);
+        if child_started == 0 || parent_started == 0 || child_started < parent_started {
+            return false;
+        }
+        if up == own {
+            return true;
+        }
+        if up == at || hops > 32 {
+            return false;
+        }
+        at = up;
+        hops += 1;
+    }
+    false
 }
 
 /// What the user is doing at the screen (Windows: the shell's notification state). None where it cannot be told.
@@ -238,6 +256,76 @@ mod tests {
         assert_eq!(p.parent, std::process::id());
         assert!(p.started_s > 0);
         assert!(mm > 0.0, "its CPU is counted as ours: {mm}");
+    }
+
+    fn map<const N: usize>(pairs: [(u32, u64); N]) -> HashMap<u32, u64> {
+        pairs.into_iter().collect()
+    }
+
+    #[test]
+    fn a_child_and_a_grandchild_descend_from_the_hub() {
+        // hub 10 (started 1000) -> 20 (1005) -> 30 (1010)
+        let parents = HashMap::from([(20, 10), (30, 20)]);
+        let starts = map([(10, 1000), (20, 1005), (30, 1010)]);
+        assert!(descends_from(10, 20, &parents, &starts));
+        assert!(descends_from(10, 30, &parents, &starts));
+        assert!(
+            !descends_from(10, 10, &parents, &starts),
+            "the hub is not its own descendant"
+        );
+        // started in the same second as its parent: Windows start times are whole seconds
+        assert!(descends_from(10, 20, &parents, &map([(10, 1000), (20, 1000)])));
+    }
+
+    /// The case found on the live hub: `adb.exe` was started at 10:38 by a program that has since exited; its recorded parent pid
+    /// was later reused by a console host the hub's child started at 12:06, so the walk reached the hub and lowered adb.
+    #[test]
+    fn a_process_older_than_its_recorded_parent_is_not_its_child() {
+        // adb 30 (started 100) says its parent is 20, which is now a console host (started 5000), a child of hub 10 (4000)
+        let parents = HashMap::from([(20, 10), (30, 20)]);
+        let starts = map([(10, 4000), (20, 5000), (30, 100)]);
+        assert!(
+            descends_from(10, 20, &parents, &starts),
+            "the console host really is the hub's child"
+        );
+        assert!(
+            !descends_from(10, 30, &parents, &starts),
+            "adb is older than the pid it names as its parent"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_start_time_is_unknown_is_not_believed() {
+        let parents = HashMap::from([(20, 10), (30, 20)]);
+        assert!(!descends_from(10, 20, &parents, &map([(10, 1000), (20, 0)])));
+        assert!(!descends_from(10, 20, &parents, &map([(10, 0), (20, 1005)])));
+        assert!(
+            !descends_from(10, 20, &parents, &map([(20, 1005)])),
+            "a parent that is gone from the table"
+        );
+        // a break anywhere on the way up ends the walk
+        assert!(!descends_from(
+            10,
+            30,
+            &parents,
+            &map([(10, 1000), (20, 0), (30, 1010)])
+        ));
+    }
+
+    #[test]
+    fn a_parent_loop_and_an_unrelated_chain_end_the_walk() {
+        let looped = HashMap::from([(20, 30), (30, 20)]);
+        let starts = map([(10, 1000), (20, 1005), (30, 1005)]);
+        assert!(!descends_from(10, 20, &looped, &starts));
+        let self_parent = HashMap::from([(20, 20)]);
+        assert!(!descends_from(10, 20, &self_parent, &starts));
+        let elsewhere = HashMap::from([(20, 40), (40, 1)]);
+        assert!(!descends_from(
+            10,
+            20,
+            &elsewhere,
+            &map([(10, 1000), (20, 1005), (40, 900), (1, 1)])
+        ));
     }
 
     #[test]

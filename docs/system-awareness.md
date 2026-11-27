@@ -46,7 +46,10 @@ What the governor promises, each with a test:
 - It only **lowers**. A process already at or below the cap is not touched, and a priority is never raised above what the
   process had.
 - It only touches **processes the hub started** (descendants of the hub), and names a process by pid *and* start time, so a
-  pid that Windows reused for another program is never changed.
+  pid that Windows reused for another program is never changed. A parent link is believed only when it can be true: Windows
+  keeps a process's parent pid after the parent exits and later gives that pid to another program, so a process that is older
+  than the parent it names (or whose start time is unknown) is not the hub's child. This was found on the live hub, where an
+  `adb.exe` started hours before the hub was lowered because its old parent pid had been reused by a console host.
 - It leaves the operating system's **helpers** alone: the console host (`conhost.exe`, `OpenConsole.exe`) that Windows starts
   for a child, and the crash reporter. Lowering them would only slow the output of the program they serve. Their CPU
   still counts as the hub's own.
@@ -144,6 +147,9 @@ debug build:
   connected 0.6 s after `watchdog_url` was changed. Watchdog refused a wrong Host header (403) and a POST (405).
 - Two faults the run found, fixed and covered by tests: a console host was lowered like a program, and a changed
   `watchdog_url` waited out the backoff earned at the old address.
+- A third fault, found on the live hub after it was restarted on this build: an `adb.exe` that predates the hub was lowered
+  to idle during a critical spell, through a reused parent pid (see "What the governor promises"). Fixed by the start-time
+  check on every link of the walk, with four tests; the priority was put back when the level fell.
 
 Tested without a model: idle-model shedding (the engine's `shed_one` and the loop's decision, including that CPU pressure and
 `shed = false` shed nothing), on stand-in instances.
