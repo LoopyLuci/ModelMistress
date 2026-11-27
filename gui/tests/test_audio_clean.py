@@ -4,8 +4,12 @@ no device; the speaker is only started, and the test ends before any sound would
 
 from __future__ import annotations
 
+import os
+import time
+
 import numpy as np
 import pytest
+from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import QApplication
 
 from mm_gui import dsp
@@ -87,3 +91,19 @@ def test_the_speaker_hands_the_clip_it_plays_to_the_alignment(app):
     assert speaker.alignment.playing
     speaker.stop()
     assert not speaker.alignment.playing
+
+
+def test_the_speaker_plays_its_clip_from_a_file_and_deletes_the_file_when_the_clip_ends(app):
+    if not QMediaDevices.audioOutputs():
+        pytest.skip("this computer has no sound output")
+    speaker = Speaker()
+    done: list = []
+    speaker.play(wav_bytes(pcm_of(np.zeros(RATE // 4))), done.append)  # a quarter second of silence
+    path = speaker._path
+    assert path is not None and os.path.exists(path)
+    end = time.monotonic() + 10
+    while not done and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    assert done == [None], f"the clip did not play: {done}"
+    assert not os.path.exists(path)

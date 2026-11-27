@@ -9,12 +9,14 @@ from __future__ import annotations
 import array
 import io
 import math
+import os
 import sys
+import tempfile
 import wave
 from typing import Callable
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtMultimedia import (
     QAudioFormat,
@@ -240,14 +242,17 @@ class Dictation(QObject):
 
 class Speaker(QObject):
     """Plays a WAV clip through the default output. `play` calls `on_done(error)` once the clip has ended (error is None)
-    or could not be played; `stop` ends it without calling back."""
+    or could not be played; `stop` ends it without calling back. The clip is written to a temporary file and played from
+    there: Qt's player cannot read a clip from memory on Windows ("Could not open file"), and the file is deleted once the
+    player has let go of it."""
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._player = QMediaPlayer(self)
         self._output = QAudioOutput(self)
         self._player.setAudioOutput(self._output)
-        self._buffer: QBuffer | None = None
+        self._path: str | None = None  # the clip being played, in a temporary file
+        self._stale: list[str] = []  # clip files the player still held when they were due to go; deleted on a later call
         self._on_done: Callable[[str | None], None] | None = None
         # What is playing, lined up with the microphone: the echo canceller's reference. The delay to the microphone is
         # measured from the sound, so the player's own latency does not need to be known.
@@ -258,16 +263,36 @@ class Speaker(QObject):
     def play(self, wav: bytes, on_done: Callable[[str | None], None]) -> None:
         self.stop()
         self.alignment.start(wav_floats(wav))
-        self._buffer = QBuffer(QByteArray(wav), self)
-        self._buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        fd, path = tempfile.mkstemp(prefix="mm-speech-", suffix=".wav")
+        with os.fdopen(fd, "wb") as f:
+            f.write(wav)
+        self._path = path
         self._on_done = on_done
-        self._player.setSourceDevice(self._buffer)
+        self._player.setSource(QUrl.fromLocalFile(path))
         self._player.play()
 
     def stop(self) -> None:
         self.alignment.stop()
         self._on_done = None
         self._player.stop()
+        self._discard()
+
+    def _discard(self) -> None:
+        """Deletes the clip's file once the player has let go of it. The player is pointed at nothing first, since Windows
+        will not delete a file that is open; a file still refused is deleted on a later call."""
+        self._player.setSource(QUrl())
+        if self._path is not None:
+            self._stale.append(self._path)
+            self._path = None
+        remaining = []
+        for path in self._stale:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                remaining.append(path)
+        self._stale = remaining
 
     def _status(self, status) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
@@ -278,6 +303,7 @@ class Speaker(QObject):
 
     def _finish(self, error: str | None) -> None:
         self.alignment.stop()
+        self._discard()  # before the callback, which may start the next clip
         callback, self._on_done = self._on_done, None
         if callback is not None:
             callback(error)
