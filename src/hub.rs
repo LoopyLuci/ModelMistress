@@ -64,6 +64,8 @@ pub struct Hub {
     pub keys: Arc<Keys>,
     /// The loads that peer keys asked for, waiting for the owner (see `requests`).
     pub requests: Arc<crate::requests::Queue>,
+    /// Batch jobs: prompts run in order, answers written as they finish (see `batch`).
+    pub batches: Arc<crate::batch::Batches>,
     /// Misty, the agent (src/misty), opened on first use.
     pub misty: Arc<parking_lot::Mutex<Option<Arc<crate::misty::Misty>>>>,
 }
@@ -72,6 +74,7 @@ impl Hub {
     pub fn new(engine: Arc<Engine>, token: String) -> Self {
         let keys = Keys::open(&engine.home);
         let requests = Arc::new(crate::requests::Queue::open(&engine.home));
+        let batches = Arc::new(crate::batch::Batches::open(&engine.home));
         Self {
             engine,
             jobs: Arc::new(Default::default()),
@@ -80,6 +83,7 @@ impl Hub {
             stop: Arc::new(tokio::sync::Notify::new()),
             keys,
             requests,
+            batches,
             misty: Default::default(),
         }
     }
@@ -377,6 +381,50 @@ fn core_operations() -> Vec<Value> {
             false,
             load_props,
             &["model"],
+        ),
+        op(
+            "batch.submit",
+            "Run a list of prompts with one model, a few at a time. Each answer is written to disk as it finishes; the job's id comes back at once",
+            true,
+            false,
+            json!({"model": {"type": "string"}, "prompts": {"type": "array", "items": {"type": "string"}, "maxItems": 10000},
+                   "system": {"type": "string"}, "name": {"type": "string"},
+                   "max_tokens": {"type": "integer", "minimum": 1, "maximum": 8192},
+                   "concurrency": {"type": "integer", "minimum": 1, "maximum": 8}}),
+            &["model", "prompts"],
+        ),
+        op(
+            "batch.get",
+            "A batch's state and progress: how many items are done and how many failed",
+            false,
+            false,
+            json!({"id": {"type": "string"}}),
+            &["id"],
+        ),
+        op(
+            "batch.list",
+            "The batches, newest first: all of them, or only those running, done or cancelled",
+            false,
+            false,
+            json!({"state": {"type": "string", "enum": ["running", "done", "cancelled", "all"]}}),
+            &[],
+        ),
+        op(
+            "batch.results",
+            "The finished items of a batch, in the order they finished, a page at a time (from is the position to start at)",
+            false,
+            false,
+            json!({"id": {"type": "string"}, "from": {"type": "integer", "minimum": 0},
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}),
+            &["id"],
+        ),
+        op(
+            "batch.cancel",
+            "Stop a running batch: the items in progress finish, and no further item starts",
+            true,
+            false,
+            json!({"id": {"type": "string"}}),
+            &["id"],
         ),
         op(
             "request.list",
@@ -916,6 +964,16 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         "model.show" => crate::ollama_api::show(hub, s(a, "model")?)?,
         "model.create" => crate::ollama_api::create(hub, a)?,
         "model.copy" => crate::ollama_api::copy(hub, s(a, "source")?, s(a, "destination")?)?,
+        "batch.submit" => crate::batch::submit(hub, a)?,
+        "batch.get" => crate::batch::get(hub, s(a, "id")?)?,
+        "batch.list" => crate::batch::list(hub, a["state"].as_str().unwrap_or("all"))?,
+        "batch.results" => crate::batch::results(
+            hub,
+            s(a, "id")?,
+            a["from"].as_u64().unwrap_or(0) as usize,
+            a["limit"].as_u64().unwrap_or(100) as usize,
+        )?,
+        "batch.cancel" => crate::batch::cancel(hub, s(a, "id")?)?,
         "request.list" => {
             let state = crate::requests::RequestState::filter(a["state"].as_str().unwrap_or("pending"))?;
             let pending = hub.requests.list(Some(crate::requests::RequestState::Pending)).len();
@@ -2444,6 +2502,8 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     };
     // A key written while this hub was starting (after it read keys.json, before it announced itself) is taken in here.
     hub.keys.refresh();
+    // A batch that was running when the hub last stopped runs again for the items it has no answer for.
+    crate::batch::resume(&hub);
     if let Some(problem) = hub.keys.unreadable() {
         eprintln!("model-mistress: {problem}; key changes are refused until it can be read");
     }
@@ -2562,6 +2622,7 @@ unrelated line
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
             requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }
@@ -2771,6 +2832,7 @@ unrelated line
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
             requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }
@@ -3405,6 +3467,7 @@ unrelated line
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
             requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         };
         let id = std::path::Path::new(&model)
@@ -3462,6 +3525,7 @@ unrelated line
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
             requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }

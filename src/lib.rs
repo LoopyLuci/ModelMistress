@@ -26,6 +26,7 @@ pub mod misty;
 pub mod ollama_api;
 pub mod pull;
 pub mod requests;
+pub mod batch;
 pub mod serving;
 pub mod speech;
 pub mod testing;

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Batch jobs: prompts in order, answers written as they finish
+
+- `batch.submit` with `model`, `prompts` (up to 10,000), and optionally `system`, `name`, `max_tokens` (1 to 8192, default
+  512) and `concurrency` (1 to 8, default 2). It returns the job's id at once and runs in the background. Each answer goes to
+  `<home>/batches/<id>/results.jsonl` as it finishes, synced to disk. A failed item is recorded with its error, and the job goes on.
+- `batch.get` (state and progress), `batch.list` (running, done, cancelled or all), `batch.results` (a page of finished items,
+  `from` and `limit`, with `next`), and `batch.cancel` (a running job only: the items in progress finish, no further one starts).
+- A restart runs again every batch that was running, for the items with no answer. A line cut off by the crash is dropped.
+- Owner only, and in `mcp --all-tools` rather than the core set. Not done: peer keys cannot submit a batch; there is no
+  per-key quota; `concurrency` is per job, not across jobs; there is no page in `/ui`. Not run: a batch of real answers from
+  a loaded model (the tests run items through a hub with no model server, and check the restart and the file handling).
+- `src/batch.rs`, seven tests.
+
 ### Approval queue: a peer key asks, the owner approves
 
 - A peer key cannot load a model, but it can ask. `POST /v1/requests` with `{"model", "reason"}` queues a request and answers
