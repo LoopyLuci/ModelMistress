@@ -28,7 +28,7 @@
   she learns) and the Models page (import, speed test). Its tests run offscreen with fake sound and a fake hub.
 - Parity with the Android app: `docs/android-parity.md`. Open: echo cancellation on a real microphone and speaker (checked offline only; a headset is
   advised), steering a reply gives no rating for the cut reply, and the web Live cannot interrupt a reply early.
-- Tests: `cargo test` passes on every target (650 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
+- Tests: `cargo test` passes on every target (651 library, 2 binary and 16 desktop-app tests; 6 ignored), the frontend tests (vitest, 222 tests; `vue-tsc` and `vite build` clean),
   and the native window's pytest suite (169 tests and 1 skipped; with `MM_HUB_EXE` set, the real-hub test runs too). Not run on a real microphone,
   camera, speaker or large model file.
 
