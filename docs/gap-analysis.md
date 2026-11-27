@@ -24,7 +24,7 @@ a live hub, except where the window was launched on the owner's hub.
 | **No approval queue for loads.** Peer keys cannot load, but nothing lets the owner approve a request. | `peer_route` in `src/hub.rs` | Open |
 | **Named key scopes.** A key reaches every model route or none. | `peer_route` | Open |
 | **Error codes do not cover every path.** Chat, completions, embeddings and rerank map llama-server's errors, and so do the Ollama shim and the `embeddings.create` and `rerank.run` operations now. About 57 sites still return a generic `500 io` (storage, model files and the like). | `src/ollama_api.rs`, `forward_json` in `src/hub.rs` | **Done for llama-server's errors.** The `500 io` sites are open. |
-| **MCP exposes every operation as a tool** (about 94), which costs context on every turn. | `hub.rs` operations; `docs/claude.md` | Open (tool profile) |
+| **MCP exposes every operation as a tool** (about 94), which costs context on every turn. | `hub.rs` operations; `docs/claude.md` | **Done.** The owner's session offers twelve core tools (`CORE_OPS`); `mcp --all-tools` offers the rest. |
 
 ## Dashboard (`frontend/`)
 

@@ -12,7 +12,9 @@
 //!
 //! Nothing here runs unless `<home>/fabric.json` exists. The hub does not need CF.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -31,6 +33,55 @@ const FILE: &str = "fabric.json";
 const HOP_HEADER: &str = "x-cf-hop";
 
 type Res<T> = Result<T, Fail>;
+
+/// Requests this process passed to the fabric, by hub home and the node that served them. A hub does not read the
+/// answer's token counts into its own model usage; the caller's key gets them (see `Offloaded::into_response`).
+static OFFLOADED: Mutex<BTreeMap<(PathBuf, String), u64>> = Mutex::new(BTreeMap::new());
+
+fn count_offloaded(home: &Path, node: &str) {
+    if let Ok(mut m) = OFFLOADED.lock() {
+        *m.entry((home.to_path_buf(), node.to_string())).or_insert(0) += 1;
+    }
+}
+
+fn offloaded_by_node(home: &Path) -> Value {
+    let m = OFFLOADED.lock().map(|m| m.clone()).unwrap_or_default();
+    json!(m
+        .into_iter()
+        .filter(|((h, _), _)| h == home)
+        .map(|((_, node), n)| (node, n))
+        .collect::<BTreeMap<_, _>>())
+}
+
+/// A request the fabric served for this hub: its answer, not yet sent on.
+pub struct Offloaded {
+    resp: reqwest::Response,
+    /// The node that served it (`x-cf-node` from the fabric endpoint).
+    pub node: Option<String>,
+}
+
+impl Offloaded {
+    /// The answer to send to the caller. `observe` sees every piece of it as it passes, so the caller's key can be
+    /// charged for the tokens, as for a request served here.
+    pub fn into_response(self, mut observe: impl FnMut(&[u8]) + Send + 'static) -> Response {
+        let content_type = self.resp.headers().get("content-type").cloned();
+        let mut out = Response::new(Body::from_stream(self.resp.bytes_stream().map(move |c| {
+            if let Ok(b) = &c {
+                observe(b);
+            }
+            c.map_err(std::io::Error::other)
+        })));
+        *out.status_mut() = StatusCode::OK;
+        if let Some(c) = content_type {
+            out.headers_mut().insert("content-type", c);
+        }
+        if let Some(n) = self.node.as_deref().and_then(|n| HeaderValue::from_str(n).ok()) {
+            out.headers_mut().insert("x-mm-node", n);
+        }
+        out.headers_mut().insert("x-mm-offloaded", HeaderValue::from_static("1"));
+        out
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,7 +168,7 @@ pub fn offers(hub: &Hub) -> bool {
 
 /// Pass a request to the fabric's endpoint. None when it cannot be (no fabric, offload off, the request came through the
 /// fabric already, no node can serve it either): the caller then reports its own failure.
-pub async fn offload(hub: &Hub, path: &str, body: &Value) -> Option<Response> {
+pub async fn offload(hub: &Hub, path: &str, body: &Value) -> Option<Offloaded> {
     if hop() > 0 {
         return None;
     }
@@ -140,21 +191,13 @@ pub async fn offload(hub: &Hub, path: &str, body: &Value) -> Option<Response> {
         // The fabric could not serve it either: the hub's own error is the better answer.
         return None;
     }
-    let content_type = resp.headers().get("content-type").cloned();
-    let node = resp.headers().get("x-cf-node").cloned();
-    let mut out = Response::new(Body::from_stream(
-        resp.bytes_stream().map(|c| c.map_err(std::io::Error::other)),
-    ));
-    *out.status_mut() = StatusCode::OK;
-    if let Some(c) = content_type {
-        out.headers_mut().insert("content-type", c);
-    }
-    if let Some(n) = node {
-        out.headers_mut().insert("x-mm-node", n);
-    }
-    out.headers_mut()
-        .insert("x-mm-offloaded", HeaderValue::from_static("1"));
-    Some(out)
+    let node = resp
+        .headers()
+        .get("x-cf-node")
+        .and_then(|n| n.to_str().ok())
+        .map(String::from);
+    count_offloaded(&hub.engine.home, node.as_deref().unwrap_or("?"));
+    Some(Offloaded { resp, node })
 }
 
 // ---- operations ----------------------------------------------------------------------------------------------
@@ -282,7 +325,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                     .unwrap_or(Value::Null)
             };
             json!({"joined": true, "api": c.api, "endpoint": c.endpoint, "offload": c.offload,
-                   "token": c.token_file.is_some(), "endpoint_reachable": reachable, "node": node})
+                   "token": c.token_file.is_some(), "endpoint_reachable": reachable, "node": node,
+                   "offloaded_by_node": offloaded_by_node(&e.home)})
         }
         "fabric.nodes" | "fabric.models" | "fabric.route" => {
             let c = load(&e.home).ok_or_else(|| Fail::invalid("this hub is not joined to a fabric (fabric.set)"))?;

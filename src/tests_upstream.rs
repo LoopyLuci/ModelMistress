@@ -313,6 +313,37 @@ async fn a_busy_hub_passes_the_request_to_the_fabric() {
     assert_eq!(v["choices"][0]["message"]["content"], "fabric", "the answer is the fabric's: {v}");
     assert_eq!(busy.seen.load(Ordering::SeqCst), 0, "this hub's own server never saw it");
     assert_eq!(fabric.seen.load(Ordering::SeqCst), 1);
+    // the hub counts what it passed on, by the node that served it (the stand-in does not name one)
+    let (_, _, v) = call(&h, "POST", "/v1/call/fabric.status", json!({})).await;
+    assert_eq!(v["result"]["offloaded_by_node"]["?"], 1, "{v}");
+}
+
+#[tokio::test]
+async fn an_offloaded_request_is_charged_to_the_callers_key_with_the_tokens_the_fabric_answered() {
+    let home = testing::temp_home();
+    let (h, _busy, _fabric) = joined(&home, "when_full").await;
+    let (st, _, v) = call(&h, "POST", "/v1/call/key.create", json!({"peer": "alice"})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let key = v["result"]["key"].as_str().unwrap().to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(chat().to_string()))
+        .unwrap();
+    let resp = hub::router(h.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-mm-offloaded"].to_str().unwrap(), "1");
+    // the key is charged when the answer has been read to its end
+    let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let (_, _, u) = call(&h, "POST", "/v1/call/usage.get", json!({"key": "alice"})).await;
+    let row = &u["result"][0];
+    assert_eq!(
+        (row["requests"].as_u64(), row["prompt_tokens"].as_u64(), row["completion_tokens"].as_u64()),
+        (Some(1), Some(3), Some(5)),
+        "{u}"
+    );
 }
 
 #[tokio::test]

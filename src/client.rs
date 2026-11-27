@@ -290,6 +290,29 @@ impl Client {
         answer(r).await
     }
 
+    /// Ask the owner to load a model this key may use (`POST /v1/requests`). Nothing loads until the owner approves.
+    pub async fn peer_request(&self, model: &str, reason: &str) -> Result<Value> {
+        let r = self
+            .http
+            .post(format!("{}/v1/requests", self.url))
+            .bearer_auth(&self.token)
+            .json(&json!({"model": model, "reason": reason}))
+            .send()
+            .await?;
+        answer(r).await
+    }
+
+    /// The answer to a request this key made (`GET /v1/requests/{id}`).
+    pub async fn peer_request_status(&self, id: u64) -> Result<Value> {
+        let r = self
+            .http
+            .get(format!("{}/v1/requests/{id}", self.url))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        answer(r).await
+    }
+
     pub async fn stop(&self) -> Result<()> {
         self.http
             .post(format!("{}/v1/service/stop", self.url))
@@ -385,21 +408,56 @@ machine and which are loaded. `model_load` loads one into memory and `model_unlo
 a lot of RAM or GPU memory, so unload what you no longer need. `chat_complete` answers one prompt with a model. \
 `service_status` shows the hub's version, memory and loaded models. Tools marked destructive delete or change files.";
 
-/// What an MCP session on this server may do: every operation with the owner's token, or only the model routes with a
-/// peer key (for an agent that should list models and chat, and nothing that changes the hub).
+/// What an MCP session on this server may do: the owner's operations with the owner's token, or only the model routes with
+/// a peer key (for an agent that should list models and chat, and nothing that changes the hub).
 #[derive(Clone, Copy)]
 pub enum McpAccess<'a> {
-    Owner(&'a Client),
+    Owner(&'a Client, ToolSet),
     Peer(&'a Client),
 }
 
-/// What a peer key's session is told: the two tools it has, and that the owner does the rest.
-const PEER_MCP_INSTRUCTIONS: &str =
-    "This ModelMistress server uses a scoped key. `models_list` shows the models the key \
-may use, and `chat_complete` answers one prompt with one of them. Loading, unloading, downloads and settings are not \
-available with this key; the owner does those.";
+/// Which of the hub's operations the owner's session offers as tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSet {
+    /// The operations an agent needs to see, load, unload and ask the local models, the log of a failed load, and the
+    /// owner's approval queue for the loads peer keys ask for.
+    Core,
+    /// Every operation the hub lists: downloads, deletes, settings, Misty, the fabric and the rest.
+    All,
+}
 
-/// The two tools of a peer key: the models it may use, and one answer from one of them.
+/// The core tools. Each tool costs an agent context on every turn, so the rest are behind `mcp --all-tools`.
+pub const CORE_OPS: &[&str] = &[
+    "service.status",
+    "model.list",
+    "model.loaded",
+    "model.info",
+    "model.plan",
+    "model.load",
+    "model.unload",
+    "chat.complete",
+    "logs.tail",
+    "request.list",
+    "request.approve",
+    "request.deny",
+];
+
+impl ToolSet {
+    fn includes(self, op_id: &str) -> bool {
+        match self {
+            ToolSet::Core => CORE_OPS.contains(&op_id),
+            ToolSet::All => true,
+        }
+    }
+}
+
+/// What a peer key's session is told: its four tools, and that the owner does the rest.
+const PEER_MCP_INSTRUCTIONS: &str = "This ModelMistress server uses a scoped key. `models_list` shows the models the key \
+may use, and `chat_complete` answers one prompt with one of them. A key cannot load a model: `model_request` asks the \
+owner to load one it may use, and nothing loads until the owner approves; `request_status` shows the answer. Unloading, \
+downloads and settings are the owner's.";
+
+/// The tools of a peer key: the models it may use, one answer from one of them, and a request for a model to be loaded.
 fn peer_tools() -> Vec<Value> {
     vec![
         json!({"name": "models_list", "description": "List the models this key may use (the OpenAI model list).",
@@ -412,20 +470,49 @@ fn peer_tools() -> Vec<Value> {
                                               "max_tokens": {"type": "integer", "minimum": 1}},
                                "required": ["model", "prompt"]},
                "annotations": {"readOnlyHint": true, "destructiveHint": false}}),
+        json!({"name": "model_request",
+               "description": "Ask the owner to load a model this key may use. Nothing loads until the owner approves. \
+                               Returns the request, with its id for request_status.",
+               "inputSchema": {"type": "object",
+                               "properties": {"model": {"type": "string"}, "reason": {"type": "string"}},
+                               "required": ["model"]},
+               "annotations": {"readOnlyHint": false, "destructiveHint": false}}),
+        json!({"name": "request_status",
+               "description": "The answer to a request this key made: pending, approved or denied, and the owner's note.",
+               "inputSchema": {"type": "object",
+                               "properties": {"id": {"type": "integer", "minimum": 1}},
+                               "required": ["id"]},
+               "annotations": {"readOnlyHint": true, "destructiveHint": false}}),
     ]
 }
 
-/// Serve the hub's operations as MCP tools over stdio (JSON-RPC 2.0, one message per line), with the owner's token.
-pub async fn serve_mcp(hub: Client) -> Result<()> {
-    serve_mcp_io(McpAccess::Owner(&hub), std::io::stdin().lock(), std::io::stdout()).await
+/// Serve the hub's operations in `set` as MCP tools over stdio (JSON-RPC 2.0, one message per line), with the owner's token.
+pub async fn serve_mcp(hub: Client, set: ToolSet) -> Result<()> {
+    serve_mcp_io(McpAccess::Owner(&hub, set), std::io::stdin().lock(), std::io::stdout()).await
+}
+
+/// What the owner's session is told: the core tools, and where the other operations are.
+fn owner_instructions(set: ToolSet) -> String {
+    match set {
+        ToolSet::Core => format!(
+            "{MCP_INSTRUCTIONS} Only the core tools are listed. Downloads, deletes, settings, Misty and the other operations \
+             need the server started with `model-mistress mcp --all-tools`."
+        ),
+        ToolSet::All => MCP_INSTRUCTIONS.to_string(),
+    }
 }
 
 /// The MCP loop over any line reader and writer: stdio for the CLI, buffers in the tests.
 pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: impl Write) -> Result<()> {
-    // The owner's tools are the hub's operations; a peer key's tools are the two model routes.
-    let (instructions, tools, names) = match access {
-        McpAccess::Owner(hub) => {
-            let ops = hub.operations().await?;
+    // The owner's tools are the hub's operations in the tool set; a peer key's tools are its four (see `peer_tools`).
+    let (instructions, tools, names): (String, Vec<Value>, Vec<(String, String)>) = match access {
+        McpAccess::Owner(hub, set) => {
+            let ops: Vec<Value> = hub
+                .operations()
+                .await?
+                .into_iter()
+                .filter(|o| o["id"].as_str().is_some_and(|id| set.includes(id)))
+                .collect();
             let tools: Vec<Value> = ops
                 .iter()
                 .map(|o| {
@@ -442,9 +529,9 @@ pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: i
                 .iter()
                 .filter_map(|o| o["id"].as_str().map(|id| (tool_name(id), id.to_string())))
                 .collect();
-            (MCP_INSTRUCTIONS, tools, names)
+            (owner_instructions(set), tools, names)
         }
-        McpAccess::Peer(_) => (PEER_MCP_INSTRUCTIONS, peer_tools(), Vec::new()),
+        McpAccess::Peer(_) => (PEER_MCP_INSTRUCTIONS.to_string(), peer_tools(), Vec::new()),
     };
     for line in input.lines() {
         let line = line?;
@@ -484,12 +571,20 @@ pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: i
                     msg["params"]["arguments"].clone()
                 };
                 let outcome = match access {
-                    McpAccess::Owner(hub) => match names.iter().find(|(n, _)| *n == name) {
+                    McpAccess::Owner(hub, _) => match names.iter().find(|(n, _)| *n == name) {
                         Some((_, op)) => Some(hub.call(op, args).await),
                         None => None,
                     },
                     McpAccess::Peer(peer) => match name.as_str() {
                         "models_list" => Some(peer.peer_models().await),
+                        "model_request" => Some(
+                            peer.peer_request(
+                                args["model"].as_str().unwrap_or(""),
+                                args["reason"].as_str().unwrap_or(""),
+                            )
+                            .await,
+                        ),
+                        "request_status" => Some(peer.peer_request_status(args["id"].as_u64().unwrap_or(0)).await),
                         "chat_complete" => Some(
                             peer.peer_chat(
                                 args["model"].as_str().unwrap_or(""),
@@ -589,7 +684,7 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         );
         let mut out = Vec::new();
-        serve_mcp_io(McpAccess::Owner(&client), input.as_bytes(), &mut out)
+        serve_mcp_io(McpAccess::Owner(&client, ToolSet::All), input.as_bytes(), &mut out)
             .await
             .unwrap();
         let replies: Vec<Value> = String::from_utf8(out)
@@ -669,7 +764,10 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, ["models_list", "chat_complete"]);
+        assert_eq!(
+            names,
+            ["models_list", "chat_complete", "model_request", "request_status"]
+        );
         assert!(replies[1]["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -678,6 +776,142 @@ mod tests {
             replies[2]["error"]["code"], -32602,
             "owner tools are not on a peer key's server"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_key_asks_for_a_load_and_the_owner_decides() {
+        let home = crate::testing::temp_home();
+        let hub = crate::testing::hub(&home, &["alpha", "beta"]);
+        let (_info, secret) = hub
+            .keys
+            .create("agent", Default::default(), vec!["alpha".into()], "hub")
+            .unwrap();
+        let (_info, other_secret) = hub
+            .keys
+            .create("other", Default::default(), vec!["alpha".into()], "hub")
+            .unwrap();
+        let (addr, _task) = crate::testing::serve(hub).await;
+        let url = format!("http://{addr}");
+        let peer = Client::new(&url, &secret);
+        let other = Client::new(&url, &other_secret);
+        let owner = Client::new(&url, crate::testing::TOKEN);
+
+        let asked = peer.peer_request("alpha", "a summary pass").await.unwrap();
+        let id = asked["request"]["id"].as_u64().unwrap();
+        assert_eq!(
+            (&asked["request"]["state"], &asked["request"]["peer"]),
+            (&json!("pending"), &json!("agent")),
+            "{asked}"
+        );
+
+        let refused = peer.peer_request("beta", "").await.unwrap_err().to_string();
+        assert!(refused.starts_with("model_not_allowed:"), "{refused}");
+
+        let status = peer.peer_request_status(id).await.unwrap();
+        assert_eq!(status["request"]["state"], "pending", "{status}");
+        let hidden = other.peer_request_status(id).await.unwrap_err().to_string();
+        assert!(
+            hidden.starts_with("not_found:"),
+            "another key does not see this request: {hidden}"
+        );
+
+        let waiting = owner.call("request.list", json!({})).await.unwrap();
+        assert_eq!(waiting["pending"], 1, "{waiting}");
+        assert_eq!(waiting["requests"][0]["model"], "alpha", "{waiting}");
+
+        let denied = owner
+            .call("request.deny", json!({"id": id, "reason": "not today"}))
+            .await
+            .unwrap();
+        assert_eq!(denied["request"]["state"], "denied", "{denied}");
+        let answer = peer.peer_request_status(id).await.unwrap();
+        assert_eq!(
+            (&answer["request"]["state"], &answer["request"]["note"]),
+            (&json!("denied"), &json!("not today")),
+            "{answer}"
+        );
+
+        let again = owner
+            .call("request.approve", json!({"id": id}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            again.starts_with("not_pending:"),
+            "a denied request must not load its model: {again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_core_profile_offers_the_core_tools_and_all_offers_every_operation() {
+        let home = crate::testing::temp_home();
+        let hub = crate::testing::hub(&home, &["alpha"]);
+        let (addr, _task) = crate::testing::serve(hub).await;
+        let client = Client::new(&format!("http://{addr}"), crate::testing::TOKEN);
+        let every: Vec<String> = client
+            .operations()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["id"].as_str().map(str::to_string))
+            .collect();
+        let missing: Vec<&str> = CORE_OPS
+            .iter()
+            .copied()
+            .filter(|id| !every.iter().any(|e| e.as_str() == *id))
+            .collect();
+        assert!(missing.is_empty(), "core operations the hub does not list: {missing:?}");
+
+        // A call to a tool outside the core set must be refused before it reaches the hub, so the call here is harmless.
+        let core_input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"model_delete\",\"arguments\":{}}}\n",
+        );
+        let mut out = Vec::new();
+        serve_mcp_io(
+            McpAccess::Owner(&client, ToolSet::Core),
+            core_input.as_bytes(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut core: Vec<&str> = replies[0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        core.sort();
+        let mut expected: Vec<String> = CORE_OPS.iter().map(|id| tool_name(id)).collect();
+        expected.sort();
+        assert_eq!(core, expected, "the core profile lists exactly the core operations");
+        assert_eq!(
+            replies[1]["error"]["code"], -32602,
+            "a tool outside the core set is not on this server"
+        );
+
+        let all_input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        let mut out = Vec::new();
+        serve_mcp_io(McpAccess::Owner(&client, ToolSet::All), all_input.as_bytes(), &mut out)
+            .await
+            .unwrap();
+        let all: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let listed = all[0]["result"]["tools"].as_array().unwrap().len();
+        assert_eq!(
+            listed,
+            every.len(),
+            "the full profile offers every operation the hub lists"
+        );
+        assert!(listed > core.len());
     }
 
     #[test]

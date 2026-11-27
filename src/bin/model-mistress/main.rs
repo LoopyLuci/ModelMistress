@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use model_mistress::client::{default_home, serve_mcp, serve_mcp_io, Client, McpAccess};
+use model_mistress::client::{default_home, serve_mcp, serve_mcp_io, Client, McpAccess, ToolSet};
 use model_mistress::engine::{Engine, Settings};
 use model_mistress::hosting::Keys;
 use model_mistress::hub::{self, new_token, Hub, ServeOpts};
@@ -244,15 +244,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ForgeCmd,
     },
-    /// Serve the operations as MCP tools over stdio. The hub must be running, or pass `--start` to start one in the
-    /// background; it keeps running after this exits (`stop` ends it).
+    /// Serve the core operations as MCP tools over stdio (`--all-tools` for every one). The hub must be running, or pass
+    /// `--start` to start one in the background; it keeps running after this exits (`stop` ends it).
     Mcp {
         /// Start a hub for this home when none answers.
         #[arg(long)]
         start: bool,
-        /// Serve only the model routes, with a peer key from MODELMISTRESS_KEY: `models_list` and `chat_complete`.
+        /// Serve only the model routes, with a peer key from MODELMISTRESS_KEY: `models_list`, `chat_complete`, `model_request`
+        /// and `request_status`.
         #[arg(long)]
         peer: bool,
+        /// Offer every operation the hub lists (downloads, deletes, settings, Misty, the fabric), not the core tools.
+        #[arg(long, conflicts_with = "peer")]
+        all_tools: bool,
     },
 }
 
@@ -1050,7 +1054,7 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 ForgeCmd::Unload { model } => show(&c.call("forge.unload", json!({"model": model})).await?),
             }
         }
-        Cmd::Mcp { start, peer } => {
+        Cmd::Mcp { start, peer, all_tools } => {
             let hub = match client().await {
                 Ok(hub) => hub,
                 Err(_) if start => {
@@ -1068,7 +1072,8 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
                 let scoped = Client::new(&hub.url, key.trim());
                 serve_mcp_io(McpAccess::Peer(&scoped), std::io::stdin().lock(), std::io::stdout()).await?
             } else {
-                serve_mcp(hub).await?
+                let set = if all_tools { ToolSet::All } else { ToolSet::Core };
+                serve_mcp(hub, set).await?
             }
         }
     }

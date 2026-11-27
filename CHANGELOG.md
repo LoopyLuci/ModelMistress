@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Batch jobs: prompts in order, answers written as they finish
+
+- `batch.submit` with `model`, `prompts` (up to 10,000), and optionally `system`, `name`, `max_tokens` (1 to 8192, default
+  512) and `concurrency` (1 to 8, default 2). It returns the job's id at once and runs in the background. Each answer goes to
+  `<home>/batches/<id>/results.jsonl` as it finishes, synced to disk. A failed item is recorded with its error, and the job goes on.
+- `batch.get` (state and progress), `batch.list` (running, done, cancelled or all), `batch.results` (a page of finished items,
+  `from` and `limit`, with `next`), and `batch.cancel` (a running job only: the items in progress finish, no further one starts).
+- A restart runs again every batch that was running, for the items with no answer. A line cut off by the crash is dropped.
+- Owner only, and in `mcp --all-tools` rather than the core set. Not done: peer keys cannot submit a batch; there is no
+  per-key quota; `concurrency` is per job, not across jobs; there is no page in `/ui`. Not run: a batch of real answers from
+  a loaded model (the tests run items through a hub with no model server, and check the restart and the file handling).
+- `src/batch.rs`, seven tests.
+
+### Approval queue: a peer key asks, the owner approves
+
+- A peer key cannot load a model, but it can ask. `POST /v1/requests` with `{"model", "reason"}` queues a request and answers
+  `202`; nothing loads. A key that asks again for a model it already waits for gets the same request, and at most 20 requests
+  wait per key. The peer MCP session has `model_request` and `request_status` (`GET /v1/requests/:id`, the key's own requests only).
+- The owner lists the queue with `request.list` (pending by default). `request.approve` loads the model, as `model.load` does; if
+  the load fails, the request stays pending and the error says why. `request.deny` refuses, with a reason the key can read. A
+  decided request cannot be decided again, so a denied request never loads its model.
+- The queue is kept in `<home>/requests.json`: every pending request and the newest 200 decided ones (`src/requests.rs`).
+- Not done: an approval page in `/ui` and a badge for pending requests. Not run: a real approve that loads a model (the tests
+  cover the queue, the refusals and the denied-then-approve path, which never loads).
+
+### MCP: a core tool profile
+
+- The owner's MCP session (`model-mistress mcp`) offers twelve core tools: `service_status`, `model_list`, `model_loaded`,
+  `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete`, `logs_tail` and the approval queue (`request.list`, `request.approve`, `request.deny`). Before, it offered every hub
+  operation (about 94), which cost an agent context on every turn. A tool outside the set is refused as a tool that does not
+  exist.
+- `model-mistress mcp --all-tools` offers every operation again: downloads (`model_search`, `model_pull`), deletes, settings,
+  Misty and the fabric. It cannot be combined with `--peer`.
+- The core set is `CORE_OPS` in `src/client.rs`; a test checks that each name is an operation the hub lists
+  (`the_core_profile_offers_the_core_tools_and_all_offers_every_operation`).
+- An MCP client that was set up before this change, such as the Claude Code plugin's `.mcp.json`, now gets the core set. To keep
+  the full list, start the server with `--all-tools`. See `docs/claude.md`.
+
 ### Desktop app: Misty, chat and speech
 
 - Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are
@@ -35,8 +73,16 @@
 ### Fixes from the review of this branch
 
 - A request that the fabric served for this hub is counted in the peer key's usage when it succeeds, as a failed one already
-  was (`src/hub.rs`, `passthrough`). The count has no tokens: the other node's usage is not read here.
+  was (`src/hub.rs`, `passthrough`). The tokens are counted too, from the answer (see Fabric below).
 - The build script trusts only this checkout for git (`src/build.rs`), not every directory on the machine.
+- An approval holds a claim on its request while the model loads: a deny that comes in meanwhile is refused (409
+  `approval_in_progress`), and a second approve waits. Before, a deny could land in the middle and the model still loaded.
+- A request belongs to the peer key's id, not its name, so two keys with one name do not share requests (`src/requests.rs`).
+- `batch.submit` refuses a model this hub does not serve before it writes the job, and refuses an option of the wrong type
+  (`concurrency: "8"`, `max_tokens: -1`) rather than taking the default.
+- `batch.cancel` and a job's final write share a lock, so a job that finishes as it is cancelled is never overwritten.
+- `batch.get` and `batch.list` count only the lines appended since the last call, not the whole results file. `batch.results`
+  reads up to the end of the page it returns.
 
 ### Android app (`android/`, version 0.1.0)
 
@@ -61,6 +107,9 @@
   (`x-cf-hop`) is never passed on again; the answer carries `x-mm-offloaded` and `x-mm-node`. Off until `fabric.set` is
   used. See `docs/fabric.md`. Tests: `fabric::tests`, and six in `tests_upstream.rs` (busy hub offloads, hop guard, offload
   off, unreachable fabric, `fabric.set` checks, `machine.status`).
+- An offloaded request is charged to the caller's key with the tokens in the fabric's answer (as one served here is, and
+  counting against its quotas), and `fabric.status` gains `offloaded_by_node`. Tests: the offload test checks the count, and
+  `an_offloaded_request_is_charged_to_the_callers_key_with_the_tokens_the_fabric_answered`.
 
 - **The server log says how a model's layers were placed, and `model.telemetry` reads it** (`src/loadlog.rs`, `src/engine.rs`,
   `src/hub.rs`, `src/serving.rs`; [serving](docs/serving.md#the-server-log-and-model-telemetry)). llama.cpp b12726 prints its

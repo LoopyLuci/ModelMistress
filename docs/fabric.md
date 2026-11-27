@@ -46,7 +46,9 @@ returned.
 - `offload: "off"` keeps every request on this machine.
 - Streams are passed through as they arrive.
 
-Not yet: the hub's `usage.get` does not count an offloaded request under the node that served it (CF's `models.usage` does).
+Usage: the caller's key is charged for an offloaded request as for one served here (requests, tokens, its quotas), from the
+`usage` in the fabric's answer. `fabric.status` shows `offloaded_by_node`, a count per serving node since the hub started.
+CF's `models.usage` has the full figures by caller, model and node.
 
 ## Operations
 

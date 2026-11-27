@@ -57,7 +57,8 @@ change in the same commit.
   (`hub` or `offline`). `model-mistress keys log` prints the list. Do not edit `keys.json` by hand while a hub runs.
 - Errors: on `/v1` the body is `{"error": {"code", "message", "type"}}`; on `/api` it is `{"error": message, "code"}`.
   The stable codes, and the ones still generic, are listed in `docs/agents.md`.
-- A peer key reaches the model routes only. The owner's token is accepted from this machine only.
+- A peer key reaches the model routes, and it may ask the owner for a model to be loaded (`POST /v1/requests`, the approval
+  queue in `src/requests.rs`); the key cannot load one itself. The owner's token is accepted from this machine only.
 
 ## Conventions
 

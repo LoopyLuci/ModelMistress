@@ -11,7 +11,7 @@ ModelMistress has no MCP server of its own process. The `model-mistress mcp` com
 - `serve_mcp(hub)` serves the owner's session: every operation the hub lists, with the owner's token.
 - `serve_mcp_io(access, input, output)` is the loop itself, over any reader and writer. The CLI uses stdio; the tests use
   buffers.
-- `McpAccess::Owner(&Client)` gives the owner's tools. `McpAccess::Peer(&Client)` gives a scoped peer key two tools only.
+- `McpAccess::Owner(&Client, ToolSet)` gives the owner's tools. `McpAccess::Peer(&Client)` gives a scoped peer key four tools only.
 - `model-mistress mcp --peer` starts the peer session, with the key in `MODELMISTRESS_KEY`.
 
 ## Tools come from the hub
@@ -30,9 +30,16 @@ becomes a tool:
 in the list answers `no tool <name>`. So adding an operation to the hub makes it an MCP tool with no change to the MCP code,
 and the operation's own flags set how the client sees it.
 
-## Peer keys get two tools
+Which operations are offered is a `ToolSet`: `Core` (the default, `mcp`) offers the twelve operations in `CORE_OPS`, and `All`
+(`mcp --all-tools`) offers every operation the hub lists. `tools/list` and `tools/call` both use the same set, so a tool
+outside it answers `-32602` as if it did not exist. Add an operation to `CORE_OPS` only on purpose: each tool costs an
+agent context on every turn.
 
-A scoped peer key sees only `models_list` (the models the key may use) and `chat_complete` (one answer, not streamed).
+## Peer keys get four tools
+
+A scoped peer key sees only `models_list` (the models the key may use), `chat_complete` (one answer, not streamed),
+`model_request` (asks the owner to load a model: `POST /v1/requests`, which loads nothing) and `request_status` (the answer to
+its own request: `GET /v1/requests/:id`). The owner decides the requests with `request.list`, `request.approve` and `request.deny`.
 Their definitions are `peer_tools()` in `src/client.rs`, and the instructions the client sees say the owner does loading,
 unloading, downloads and settings. The hub enforces the same limit on the server side: a peer key's requests to any other
 route answer `403 forbidden` (see `peer_route` in `src/hub.rs`).
@@ -51,7 +58,8 @@ path, not by starting a process.
 
 ## Rules
 
-1. An operation is a tool. Mark it `mutating` and `destructive` honestly: the client reads those flags for its own hints.
+1. An operation is a tool when the session's `ToolSet` includes it. Mark it `mutating` and `destructive` honestly: the client
+   reads those flags for its own hints.
 2. A peer key must not gain a route by accident. Add a route to `peer_route` only on purpose, and then also to `peer_tools()`.
 3. Error text comes back as the hub's message. Keep it actionable; it is what the agent reads.
 

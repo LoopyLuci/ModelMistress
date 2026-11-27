@@ -62,6 +62,10 @@ pub struct Hub {
     pub stop: Arc<tokio::sync::Notify>,
     /// The peer keys (see `hosting`).
     pub keys: Arc<Keys>,
+    /// The loads that peer keys asked for, waiting for the owner (see `requests`).
+    pub requests: Arc<crate::requests::Queue>,
+    /// Batch jobs: prompts run in order, answers written as they finish (see `batch`).
+    pub batches: Arc<crate::batch::Batches>,
     /// Misty, the agent (src/misty), opened on first use.
     pub misty: Arc<parking_lot::Mutex<Option<Arc<crate::misty::Misty>>>>,
 }
@@ -69,6 +73,8 @@ pub struct Hub {
 impl Hub {
     pub fn new(engine: Arc<Engine>, token: String) -> Self {
         let keys = Keys::open(&engine.home);
+        let requests = Arc::new(crate::requests::Queue::open(&engine.home));
+        let batches = Arc::new(crate::batch::Batches::open(&engine.home));
         Self {
             engine,
             jobs: Arc::new(Default::default()),
@@ -76,6 +82,8 @@ impl Hub {
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys,
+            requests,
+            batches,
             misty: Default::default(),
         }
     }
@@ -141,7 +149,9 @@ fn peer_route(path: &str) -> bool {
             | "/v1/vision/classify"
             | "/v1/vision/detect"
             | "/v1/vision/embed"
+            | "/v1/requests"
     ) || path.starts_with("/v1/images/files/")
+        || path.starts_with("/v1/requests/")
 }
 
 /// The owner's token is accepted from this machine only. (No address known, as in tests that call the router
@@ -371,6 +381,74 @@ fn core_operations() -> Vec<Value> {
             false,
             load_props,
             &["model"],
+        ),
+        op(
+            "batch.submit",
+            "Run a list of prompts with one model, a few at a time. Each answer is written to disk as it finishes; the job's id comes back at once",
+            true,
+            false,
+            json!({"model": {"type": "string"}, "prompts": {"type": "array", "items": {"type": "string"}, "maxItems": 10000},
+                   "system": {"type": "string"}, "name": {"type": "string"},
+                   "max_tokens": {"type": "integer", "minimum": 1, "maximum": 8192},
+                   "concurrency": {"type": "integer", "minimum": 1, "maximum": 8}}),
+            &["model", "prompts"],
+        ),
+        op(
+            "batch.get",
+            "A batch's state and progress: how many items are done and how many failed",
+            false,
+            false,
+            json!({"id": {"type": "string"}}),
+            &["id"],
+        ),
+        op(
+            "batch.list",
+            "The batches, newest first: all of them, or only those running, done or cancelled",
+            false,
+            false,
+            json!({"state": {"type": "string", "enum": ["running", "done", "cancelled", "all"]}}),
+            &[],
+        ),
+        op(
+            "batch.results",
+            "The finished items of a batch, in the order they finished, a page at a time (from is the position to start at)",
+            false,
+            false,
+            json!({"id": {"type": "string"}, "from": {"type": "integer", "minimum": 0},
+                   "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}),
+            &["id"],
+        ),
+        op(
+            "batch.cancel",
+            "Stop a running batch: the items in progress finish, and no further item starts",
+            true,
+            false,
+            json!({"id": {"type": "string"}}),
+            &["id"],
+        ),
+        op(
+            "request.list",
+            "The loads that peer keys asked for: the pending ones unless state says otherwise (pending, approved, denied or all)",
+            false,
+            false,
+            json!({"state": {"type": "string", "enum": ["pending", "approved", "denied", "all"]}}),
+            &[],
+        ),
+        op(
+            "request.approve",
+            "Approve a request a peer key made: loads the model now. If the load fails, the request stays pending and the error says why",
+            true,
+            false,
+            json!({"id": {"type": "integer", "minimum": 1}}),
+            &["id"],
+        ),
+        op(
+            "request.deny",
+            "Deny a request a peer key made. The reason is shown to the key",
+            true,
+            false,
+            json!({"id": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}}),
+            &["id"],
         ),
         op(
             "model.unload",
@@ -793,6 +871,19 @@ fn llama_entry(hub: &Hub, name: &str) -> ApiResult<crate::catalog::ModelEntry> {
     }
 }
 
+/// `Ok` when `name` is a llama model this hub serves: what `batch.submit` checks before it writes a job.
+pub(crate) fn served_llama_model(hub: &Hub, name: &str) -> Result<(), Fail> {
+    llama_entry(hub, name).map(|_| ()).map_err(|e| e.0)
+}
+
+/// The owner's approval loads the model a peer key asked for, as `model.load` does.
+async fn load_for_approval(hub: &Hub, model: &str) -> ApiResult<Value> {
+    let m = llama_entry(hub, model)?;
+    let opts: LoadOpts = serde_json::from_value(json!({})).map_err(|x| Fail::invalid(x.to_string()))?;
+    let inst = hub.engine.ensure_loaded(&m, &opts, true).await?;
+    Ok(json!(inst.describe()))
+}
+
 /// [`call`] as a boxed future. Misty's tools call back into the hub (`hub_status`, `model_load`), and the hub calls
 /// Misty's operations: a boxed `Send` future cuts that cycle, which the compiler cannot prove `Send` through.
 pub fn call_boxed<'a>(hub: &'a Hub, id: &'a str, a: &'a Value) -> futures::future::BoxFuture<'a, ApiResult<Value>> {
@@ -886,6 +977,59 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         "model.show" => crate::ollama_api::show(hub, s(a, "model")?)?,
         "model.create" => crate::ollama_api::create(hub, a)?,
         "model.copy" => crate::ollama_api::copy(hub, s(a, "source")?, s(a, "destination")?)?,
+        "batch.submit" => crate::batch::submit(hub, a)?,
+        "batch.get" => crate::batch::get(hub, s(a, "id")?)?,
+        "batch.list" => crate::batch::list(hub, crate::batch::opt_str(a, "state")?.unwrap_or("all"))?,
+        "batch.results" => crate::batch::results(
+            hub,
+            s(a, "id")?,
+            crate::batch::opt_u64(a, "from", 0)? as usize,
+            crate::batch::opt_u64(a, "limit", 100)? as usize,
+        )?,
+        "batch.cancel" => crate::batch::cancel(hub, s(a, "id")?)?,
+        "request.list" => {
+            let state = crate::requests::RequestState::filter(a["state"].as_str().unwrap_or("pending"))?;
+            let pending = hub.requests.list(Some(crate::requests::RequestState::Pending)).len();
+            json!({"requests": hub.requests.list(state), "pending": pending})
+        }
+        "request.approve" => {
+            let id = a["id"]
+                .as_u64()
+                .ok_or_else(|| Fail::invalid("request.approve needs \"id\": the request's number"))?;
+            // Claimed for the whole load: a deny cannot land in between, and a second approve waits for this one.
+            // A request that is already decided is refused by the claim, before anything loads.
+            let asked = hub.requests.claim(id)?;
+            let t0 = Instant::now();
+            let result = match load_for_approval(hub, &asked.model).await {
+                Ok(loaded) => hub
+                    .requests
+                    .decide(
+                        id,
+                        crate::requests::RequestState::Approved,
+                        "loaded",
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .map(|decided| {
+                        json!({"request": decided, "loaded": loaded, "load_ms": t0.elapsed().as_millis() as u64})
+                    })
+                    .map_err(ApiError::from),
+                Err(err) => Err(err),
+            };
+            hub.requests.release(id);
+            result?
+        }
+        "request.deny" => {
+            let id = a["id"]
+                .as_u64()
+                .ok_or_else(|| Fail::invalid("request.deny needs \"id\": the request's number"))?;
+            let decided = hub.requests.decide(
+                id,
+                crate::requests::RequestState::Denied,
+                a["reason"].as_str().unwrap_or(""),
+                chrono::Utc::now().timestamp(),
+            )?;
+            json!({"request": decided})
+        }
         "model.load" => {
             let m = llama_entry(hub, s(a, "model")?)?;
             let mut args = a.clone();
@@ -1651,6 +1795,46 @@ async fn call_op(State(hub): State<Hub>, Path(id): Path<String>, body: Option<Js
     Ok(Json(json!({"result": call(&hub, &id, &args).await?})))
 }
 
+/// `POST /v1/requests` (peer keys): ask the owner to load a model the key may use. Nothing loads until the owner approves.
+async fn peer_request(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    body: Option<Json<Value>>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Some(key) = who.0 else {
+        return Err(Fail::invalid("the owner loads a model with model.load; a request is for a peer key").into());
+    };
+    let args = body.map(|Json(v)| v).unwrap_or(json!({}));
+    let model = args["model"].as_str().unwrap_or("").trim().to_string();
+    if model.is_empty() {
+        return Err(Fail::invalid("the body needs \"model\": the name of a model").into());
+    }
+    if !key.allows(&model, &model) {
+        return Err(Fail::new(403, "model_not_allowed", format!("this key may not use {model}")).into());
+    }
+    llama_entry(&hub, &model)?;
+    let now = chrono::Utc::now().timestamp();
+    let request = hub
+        .requests
+        .ask(&key.id, &key.peer, &model, args["reason"].as_str().unwrap_or(""), now)?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"request": request}))))
+}
+
+/// `GET /v1/requests/:id` (peer keys): the answer to a request this key made.
+async fn peer_request_status(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Path(id): Path<u64>,
+) -> ApiResult<Json<Value>> {
+    let Some(key) = who.0 else {
+        return Err(Fail::invalid("a request is for a peer key").into());
+    };
+    match hub.requests.get(id) {
+        Some(request) if request.key == key.id => Ok(Json(json!({"request": request}))),
+        _ => Err(Fail::not_found(format!("no request {id} from this key")).into()),
+    }
+}
+
 async fn stop(State(hub): State<Hub>) -> Json<Value> {
     hub.stop.notify_one();
     Json(json!({"result": {"stopping": true}}))
@@ -1833,13 +2017,18 @@ async fn passthrough(hub: Hub, who: Caller, path: &'static str, body: Value) -> 
         Err(f) => {
             // no room here (or busy): another node of the fabric may have it
             if let (Some(spare), true) = (&spare, crate::fabric::capacity_failure(&f)) {
-                if let Some(r) = crate::fabric::offload(&hub, path, spare).await {
+                if let Some(off) = crate::fabric::offload(&hub, path, spare).await {
                     hub.engine.record(&asked, true, t0.elapsed().as_millis() as u64, None);
-                    // the other node's usage is not read here, so this success is counted without tokens
-                    if let Some(p) = &who.0 {
-                        p.finish(&asked, true, 0, 0);
-                    }
-                    return Ok(r);
+                    // the caller's key is charged for what the other node answered, as for a request served here
+                    let mut tracker = Tracker {
+                        _lease: None,
+                        who: who.0.clone(),
+                        model: asked.clone(),
+                        ok: true,
+                        tail: String::new(),
+                        events: 0,
+                    };
+                    return Ok(off.into_response(move |b| tracker.observe(b)));
                 }
             }
             if let Some(p) = &who.0 {
@@ -2260,6 +2449,8 @@ pub fn router(hub: Hub) -> Router {
     let private = Router::new()
         .route("/v1/operations", get(list_ops))
         .route("/v1/call/:op", post(call_op))
+        .route("/v1/requests", post(peer_request))
+        .route("/v1/requests/:id", get(peer_request_status))
         .route("/v1/service/stop", post(stop))
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(chat))
@@ -2331,6 +2522,8 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     };
     // A key written while this hub was starting (after it read keys.json, before it announced itself) is taken in here.
     hub.keys.refresh();
+    // A batch that was running when the hub last stopped runs again for the items it has no answer for.
+    crate::batch::resume(&hub);
     if let Some(problem) = hub.keys.unreadable() {
         eprintln!("model-mistress: {problem}; key changes are refused until it can be read");
     }
@@ -2448,6 +2641,8 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }
@@ -2656,6 +2851,8 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }
@@ -3289,6 +3486,8 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         };
         let id = std::path::Path::new(&model)
@@ -3345,6 +3544,8 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
+            batches: Default::default(),
             misty: Default::default(),
         }
     }
