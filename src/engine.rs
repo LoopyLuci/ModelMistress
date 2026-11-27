@@ -871,7 +871,8 @@ impl Engine {
         } else {
             None
         };
-        crate::media::serve::args(with_media.then_some(media.as_path()), ffmpeg_dir.as_deref(), owner)
+        let has_fps = self.server_has_flag(exe, "--video-fps").await;
+        crate::media::serve::args(with_media.then_some(media.as_path()), ffmpeg_dir.as_deref(), has_fps, owner)
     }
 
     /// `rigel-server`: the `rigel_server` setting, MM_RIGEL_SERVER, the built-in one, `<home>/engines/rigel/`, PATH.
@@ -4348,6 +4349,7 @@ parallel = 1
         let d = crate::testing::TestDir::new("mm-media-args");
         let ff = ffmpeg_stubs(&d.join("ff"));
         let both = server_stub(&d.join("both"), &["--media-path", "--video-ffmpeg-dir"]);
+        let with_fps = server_stub(&d.join("fps"), &["--media-path", "--video-ffmpeg-dir", "--video-fps"]);
         let e = engine_with_ffmpeg(&d.join("home"), Some(ff.clone()));
         let media = d.join("home").join("media");
         let want = [
@@ -4361,6 +4363,11 @@ parallel = 1
             media.is_dir(),
             "the folder the server reads under exists before it starts"
         );
+        // a server that lists --video-fps is given one frame a second, unless the owner says another
+        let mut with = want.to_vec();
+        with.extend(["--video-fps".to_string(), "1".to_string()]);
+        assert_eq!(e.media_args(&with_fps, &[]).await, with);
+        assert_eq!(e.media_args(&with_fps, &["--video-fps=4".to_string()]).await, want);
         // the owner's own arguments win, joined with `=` or not
         let own = ["--video-ffmpeg-dir=/x".to_string()];
         assert_eq!(e.media_args(&both, &own).await, want[..2]);

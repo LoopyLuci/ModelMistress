@@ -56,7 +56,8 @@
   (900 generated tokens at 82 and 85 tokens/s). Two findings: that model's projector crashes the pinned llama-server on the
   GPU (for a single picture too), so it ran with `--no-mmproj-offload` and the first video answer took 16 minutes; and
   llama-server's default frame rate gave 52,595 tokens for the 32 s clip, over a 32k context, so `--video-fps 1` was given
-  in `extra_args` (the hub chooses no frame rate yet).
+  in `extra_args`. The hub now passes `--video-fps 1` itself (with ffmpeg present, to a server that lists the flag; the
+  owner's own `--video-fps` wins).
 - Tests for this change: with `--features whisper` the 35 speech, audio and media tests pass too (the test binary links
   only against the MSVC 14.51 libraries here: whisper.cpp was compiled with its headers). `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
   fails in this worktree because its PDF fixture was checked out with Windows line endings, which breaks the file's byte

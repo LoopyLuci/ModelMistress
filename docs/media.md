@@ -149,7 +149,8 @@ The two builds behaved the same. What the run found:
   exit check ran on this model. Use `extra_args` (`--no-mmproj-offload`) per model until a model whose projector runs on the GPU is used.
 - **llama-server's default frame rate is too high for long context**: the 32 s clip came to 52,595 tokens at the default and
   was refused as over a 32,768 context; with `--video-fps 1` (the setting `extra_args`, as in the spike) it is 13,116 tokens.
-  The hub does not choose a frame rate yet (open).
+  The hub now passes `--video-fps 1` itself when ffmpeg is there and the server lists the flag; the owner's own
+  `--video-fps` (in `extra_args`) wins.
 - The speed figure is 900 generated tokens; the first-answer time is the CPU projector and is not a speed of the hub.
 
 ## Not run, and open

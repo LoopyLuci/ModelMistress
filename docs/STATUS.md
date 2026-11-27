@@ -68,7 +68,7 @@ clip on a scratch hub (see [media.md](media.md)): ffmpeg n8.1.3 (pinned, LGPL) a
 behaving the same (decode, `media.probe`, a 32 s MP4 transcribed exactly in 41 to 42 s on the CPU), and a Gemma 4 26B chat
 answering 5 of 5 questions about the MP4 on both, 900 tokens at 82 to 85 tokens/s. Found: that model's projector crashes the
 GPU llama-server (it ran with `--no-mmproj-offload`, first answer 16 minutes), and the default video frame rate overflows a
-32k context (`--video-fps 1`). Not run: a vision model whose projector runs on the GPU, `whisper-vulkan` (not built), the
+32k context (the hub now passes `--video-fps 1`). Not run: a vision model whose projector runs on the GPU, `whisper-vulkan` (not built), the
 new routes from a browser or a real client.
 
 ## Ollama-compatible API

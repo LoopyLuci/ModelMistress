@@ -25,9 +25,15 @@ const STAGED: &str = "staged";
 /// Staged copies older than this are removed the next time a file is staged.
 const KEEP: Duration = Duration::from_secs(24 * 3600);
 
+/// Frames per second llama-server samples from a video unless the owner says otherwise.
+pub const VIDEO_FPS: &str = "1";
+
 /// The arguments for a model with a projector. `media_dir` and `ffmpeg_dir` are given only where the server lists the
 /// flag (and the folder is there); a flag the owner's own arguments already set is left to them.
-pub fn args(media_dir: Option<&Path>, ffmpeg_dir: Option<&Path>, owner: &[String]) -> Vec<String> {
+///
+/// With ffmpeg, a server that lists `--video-fps` is also given [`VIDEO_FPS`]: its own default sampled a 32 s clip into
+/// 52,595 tokens, over a 32k context, where one frame a second took 13,116. The owner's `--video-fps` wins.
+pub fn args(media_dir: Option<&Path>, ffmpeg_dir: Option<&Path>, has_fps: bool, owner: &[String]) -> Vec<String> {
     let set = |flag: &str| owner.iter().any(|a| a == flag || a.starts_with(&format!("{flag}=")));
     let mut out = vec![];
     if let (Some(d), false) = (media_dir, set("--media-path")) {
@@ -35,6 +41,9 @@ pub fn args(media_dir: Option<&Path>, ffmpeg_dir: Option<&Path>, owner: &[String
     }
     if let (Some(d), false) = (ffmpeg_dir, set("--video-ffmpeg-dir")) {
         out.extend(["--video-ffmpeg-dir".to_string(), d.display().to_string()]);
+    }
+    if ffmpeg_dir.is_some() && has_fps && !set("--video-fps") {
+        out.extend(["--video-fps".to_string(), VIDEO_FPS.to_string()]);
     }
     out
 }
@@ -239,21 +248,25 @@ mod tests {
     fn the_arguments_name_the_folders_and_leave_the_owners_flags_alone() {
         let (m, f) = (Path::new("/h/media"), Path::new("/h/engines/ffmpeg"));
         assert_eq!(
-            args(Some(m), Some(f), &[]),
+            args(Some(m), Some(f), false, &[]),
             ["--media-path", "/h/media", "--video-ffmpeg-dir", "/h/engines/ffmpeg"]
         );
         // a server that lacks a flag is given none; no ffmpeg, no ffmpeg flag
-        assert_eq!(args(Some(m), None, &[]), ["--media-path", "/h/media"]);
-        assert!(args(None, None, &[]).is_empty());
+        assert_eq!(args(Some(m), None, true, &[]), ["--media-path", "/h/media"]);
+        assert!(args(None, None, true, &[]).is_empty());
         // the owner's own arguments win, with the flag and value apart or joined
         let own = [
             "--media-path".to_string(),
             "/mine".to_string(),
             "--video-ffmpeg-dir=/ff".to_string(),
         ];
-        assert!(args(Some(m), Some(f), &own).is_empty());
+        assert_eq!(args(Some(m), Some(f), true, &own), ["--video-fps", "1"]);
+        assert!(args(Some(m), Some(f), false, &own).is_empty());
+        let fps = ["--video-fps".to_string(), "4".to_string()];
+        assert_eq!(args(None, Some(f), true, &fps), ["--video-ffmpeg-dir", "/h/engines/ffmpeg"]);
+        assert!(args(None, None, true, &[]).is_empty(), "no ffmpeg, no frame rate");
         assert_eq!(
-            args(Some(m), Some(f), &["--media-path=/x".to_string()]),
+            args(Some(m), Some(f), false, &["--media-path=/x".to_string()]),
             ["--video-ffmpeg-dir", "/h/engines/ffmpeg"]
         );
     }
