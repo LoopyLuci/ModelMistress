@@ -44,7 +44,10 @@
   estimates, good to a fraction of a second.
 - Cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend; implies `whisper`); `media.components` and
   `speech::BUILD` say which build runs (`vulkan`, `cpu`, `none`). The Vulkan build of whisper-rs-sys fails when the build
-  path is long: use a short `CARGO_TARGET_DIR`.
+  path is long: use a short `CARGO_TARGET_DIR`. Built and run on the RX 7900 XTX: the 32 s MP4 transcribes in 1.2 to 1.4 s
+  once the model is loaded (same text as the CPU). The card's cooperative-matrix kernels end the process at the first encode
+  (exit code 0xC0000409, no message), so the hub sets `GGML_VK_DISABLE_COOPMAT=1` while the model loads (unless the owner
+  set it); `MM_WHISPER_LOG=1` makes whisper.cpp and ggml print to stderr.
 - Measured before this was built (the media plan's spikes, not repeated with this code): a 74 s screen recording of a meeting
   was answered correctly (5 of 5 questions) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's native video
   input, at about one second of compute per second of video; whisper.cpp through whisper-rs 0.16 with Vulkan ran 59.8 times
@@ -66,7 +69,7 @@
   newer toolchain and are not touched). The tests use stand-in ffmpeg, ffprobe and llama-server programs (the install from a stored
   zip with a right and a wrong hash, a swapped file, the listings, the chat path through a stand-in server that records what
   it was sent, a peer's request left alone, the ass and words formats). Not run: a vision model whose projector runs on the GPU
-  (Qwen3-VL and Gemma 4 E4B are not on the machine), the GPU speed of whisper, `--features whisper-vulkan` at all (not built here), the new routes with a browser or a real client.
+  (Qwen3-VL and Gemma 4 E4B are not on the machine), the new routes with a browser or a real client.
 
 ### System awareness: the hub watches the PC and yields to it, live
 

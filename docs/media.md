@@ -121,6 +121,7 @@ New in the answer:
   model-mistress --features whisper-vulkan`; implies `whisper`). Measured on the RX 7900 XTX with whisper-rs 0.16: 59.8
   times real time against 0.9 on the CPU for the same model. The Vulkan build of whisper-rs-sys fails when the build path is
   long (the shader compile): use a short `CARGO_TARGET_DIR`. `media.components` says which build runs (`build`).
+  Built here (2026-11-27, `--features whisper-vulkan`, MSVC, Vulkan SDK 1.4): the 32 s MP4 through ffmpeg and large-v3-turbo-q5_0 on the RX 7900 XTX took 1.2 to 1.4 s a request once the model was loaded (about 25 times real time end to end, decoding and HTTP included; the first request, with the model load, 2.4 s), with the same text as the CPU build. The card's KHR cooperative-matrix kernels end the whole process at the first encode (exit code 0xC0000409, no message), so the hub sets `GGML_VK_DISABLE_COOPMAT=1` while the model loads, unless the owner has set the variable. `MM_WHISPER_LOG=1` lets whisper.cpp and ggml print to stderr (which GPU, why a load fails).
 
 ## Run with real builds (2026-11-27)
 
@@ -155,6 +156,5 @@ The two builds behaved the same. What the run found:
 
 ## Not run, and open
 
-See the changelog entry for the list of what was run and what was not. In short: `whisper-vulkan` was not built, and the
-GPU speed of whisper and a vision model whose projector runs on the GPU were not measured with this code. The tests use
+See the changelog entry for the list of what was run and what was not. In short: a vision model whose projector runs on the GPU was not measured with this code (none is on the machine). The tests use
 stand-in programs; the run above used real builds, a real model and a real clip.

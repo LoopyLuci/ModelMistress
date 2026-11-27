@@ -60,6 +60,8 @@ A GPU build is the cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend)
 CPU for the same model, measured on the RX 7900 XTX. It needs the Vulkan SDK to build, and a short `CARGO_TARGET_DIR` (the
 Vulkan build of whisper-rs-sys fails when the build path is long). `media.components` says which build runs.
 
+Built here (2026-11-27, `--features whisper-vulkan`, MSVC, Vulkan SDK 1.4): the 32 s MP4 through ffmpeg and large-v3-turbo-q5_0 on the RX 7900 XTX took 1.2 to 1.4 s a request once the model was loaded (about 25 times real time end to end, decoding and HTTP included; the first request, with the model load, 2.4 s), with the same text as the CPU build. The card's KHR cooperative-matrix kernels end the whole process at the first encode (exit code 0xC0000409, no message), so the hub sets `GGML_VK_DISABLE_COOPMAT=1` while the model loads, unless the owner has set the variable. `MM_WHISPER_LOG=1` lets whisper.cpp and ggml print to stderr (which GPU, why a load fails).
+
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -F file=@talk.wav -F model=base.en \
      -F response_format=srt http://127.0.0.1:PORT/v1/audio/transcriptions

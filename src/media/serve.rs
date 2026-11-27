@@ -263,7 +263,10 @@ mod tests {
         assert_eq!(args(Some(m), Some(f), true, &own), ["--video-fps", "1"]);
         assert!(args(Some(m), Some(f), false, &own).is_empty());
         let fps = ["--video-fps".to_string(), "4".to_string()];
-        assert_eq!(args(None, Some(f), true, &fps), ["--video-ffmpeg-dir", "/h/engines/ffmpeg"]);
+        assert_eq!(
+            args(None, Some(f), true, &fps),
+            ["--video-ffmpeg-dir", "/h/engines/ffmpeg"]
+        );
         assert!(args(None, None, true, &[]).is_empty(), "no ffmpeg, no frame rate");
         assert_eq!(
             args(Some(m), Some(f), false, &["--media-path=/x".to_string()]),
