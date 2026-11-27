@@ -4,3 +4,4 @@
 *.icns binary
 *.gguf binary
 engines/patches/*.patch -text
+*.pdf binary
