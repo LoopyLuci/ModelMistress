@@ -204,6 +204,10 @@ pub struct Settings {
     pub forge_src: Option<PathBuf>,
     /// The Python that creates the Forge environment. Unset: MM_FORGE_PYTHON, else `python` on PATH.
     pub forge_python: Option<PathBuf>,
+    /// The folder that holds `ffmpeg` and `ffprobe` (video and audio input to chat models, speech to text on any
+    /// container, `media.probe`). Unset: MM_FFMPEG_DIR, then `<home>/engines/ffmpeg/` (where `media.install` puts them),
+    /// then PATH.
+    pub ffmpeg_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -254,6 +258,7 @@ impl Default for Settings {
             forge_data_dir: None,
             forge_src: None,
             forge_python: None,
+            ffmpeg_dir: None,
         }
     }
 }
@@ -832,6 +837,42 @@ impl Engine {
         std::env::split_paths(&path)
             .map(|d| d.join(exe("llama-server")))
             .find(|p| p.is_file())
+    }
+
+    /// Where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, MM_FFMPEG_DIR, `<home>/engines/ffmpeg/`, PATH), or what to
+    /// do about it. An installed build is hashed against its record on the first use and again when a file changes.
+    pub async fn ffmpeg(&self) -> std::result::Result<crate::media::ffmpeg::Located, String> {
+        let (home, setting) = (self.home.clone(), self.settings.read().ffmpeg_dir.clone());
+        tokio::task::spawn_blocking(move || crate::media::ffmpeg::locate(&home, setting.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    /// Whether a chat model can be given video now: ffmpeg is there, and the llama-server takes `--video-ffmpeg-dir`.
+    pub async fn video_state(&self) -> crate::media::caps::Video {
+        use crate::media::caps::Video;
+        if self.ffmpeg().await.is_err() {
+            return Video::NoFfmpeg;
+        }
+        match self.llama_server() {
+            None => Video::NoServer,
+            Some(exe) if self.server_has_flag(&exe, "--video-ffmpeg-dir").await => Video::Ready,
+            Some(_) => Video::ServerTooOld,
+        }
+    }
+
+    /// The arguments that let a server read media: `--media-path <home>/media` and `--video-ffmpeg-dir <dir>`, each only
+    /// where `exe` lists the flag (and, for the second, ffmpeg is there). A flag the owner's own arguments set is theirs.
+    async fn media_args(&self, exe: &Path, owner: &[String]) -> Vec<String> {
+        let media = crate::media::serve::media_dir(&self.home);
+        let with_media = self.server_has_flag(exe, "--media-path").await && std::fs::create_dir_all(&media).is_ok();
+        let ffmpeg_dir = if self.server_has_flag(exe, "--video-ffmpeg-dir").await {
+            self.ffmpeg().await.ok().map(|l| l.dir)
+        } else {
+            None
+        };
+        let has_fps = self.server_has_flag(exe, "--video-fps").await;
+        crate::media::serve::args(with_media.then_some(media.as_path()), ffmpeg_dir.as_deref(), has_fps, owner)
     }
 
     /// `rigel-server`: the `rigel_server` setting, MM_RIGEL_SERVER, the built-in one, `<home>/engines/rigel/`, PATH.
@@ -2762,6 +2803,9 @@ impl Engine {
         } else {
             if let Some(p) = &entry.mmproj {
                 args.extend(["--mmproj".into(), p.display().to_string()]);
+                // a local file reaches the server as `file://name` under --media-path, and video needs ffmpeg
+                let owner: Vec<String> = s.extra_args.iter().chain(opts.extra_args.iter()).cloned().collect();
+                args.extend(self.media_args(&exe, &owner).await);
             }
             args.extend(lora_args(&extras.lora));
             if let Some(d) = &extras.draft {
@@ -4274,6 +4318,107 @@ parallel = 1
                 "0"
             ]
         );
+    }
+
+    /// An engine whose `ffmpeg_dir` setting names `ffmpeg` (a folder with the stand-in tools, or none).
+    fn engine_with_ffmpeg(home: &Path, ffmpeg: Option<PathBuf>) -> Arc<Engine> {
+        Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ffmpeg_dir: ffmpeg,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn ffmpeg_stubs(dir: &Path) -> PathBuf {
+        use crate::media::stub::{pair, Stub};
+        pair(
+            dir,
+            &Stub {
+                configuration: "--disable-gpl",
+                probe_json: "{}",
+                pcm: &[],
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_server_gets_the_media_arguments_it_lists_and_ffmpeg_makes_the_second() {
+        use crate::media::stub::server_stub;
+        let d = crate::testing::TestDir::new("mm-media-args");
+        let ff = ffmpeg_stubs(&d.join("ff"));
+        let both = server_stub(&d.join("both"), &["--media-path", "--video-ffmpeg-dir"]);
+        let with_fps = server_stub(&d.join("fps"), &["--media-path", "--video-ffmpeg-dir", "--video-fps"]);
+        let e = engine_with_ffmpeg(&d.join("home"), Some(ff.clone()));
+        let media = d.join("home").join("media");
+        let want = [
+            "--media-path".to_string(),
+            media.display().to_string(),
+            "--video-ffmpeg-dir".into(),
+            ff.display().to_string(),
+        ];
+        assert_eq!(e.media_args(&both, &[]).await, want);
+        assert!(
+            media.is_dir(),
+            "the folder the server reads under exists before it starts"
+        );
+        // a server that lists --video-fps is given one frame a second, unless the owner says another
+        let mut with = want.to_vec();
+        with.extend(["--video-fps".to_string(), "1".to_string()]);
+        assert_eq!(e.media_args(&with_fps, &[]).await, with);
+        assert_eq!(e.media_args(&with_fps, &["--video-fps=4".to_string()]).await, want);
+        // the owner's own arguments win, joined with `=` or not
+        let own = ["--video-ffmpeg-dir=/x".to_string()];
+        assert_eq!(e.media_args(&both, &own).await, want[..2]);
+        // a server that lists only one of them is given only that one
+        let older = server_stub(&d.join("older"), &["--media-path"]);
+        assert_eq!(e.media_args(&older, &[]).await, want[..2]);
+        let none = server_stub(&d.join("none"), &["--ctx-size"]);
+        assert!(e.media_args(&none, &[]).await.is_empty());
+        // no ffmpeg: no ffmpeg argument (an empty folder is named, so PATH is not searched)
+        let empty = d.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let bare = engine_with_ffmpeg(&d.join("home2"), Some(empty));
+        assert_eq!(
+            bare.media_args(&both, &[]).await,
+            [
+                "--media-path".to_string(),
+                d.join("home2").join("media").display().to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn video_is_ready_when_ffmpeg_and_a_new_enough_server_are_there() {
+        use crate::media::caps::Video;
+        use crate::media::stub::server_stub;
+        let d = crate::testing::TestDir::new("mm-media-video");
+        let ff = ffmpeg_stubs(&d.join("ff"));
+        let new = server_stub(&d.join("new"), &["--media-path", "--video-ffmpeg-dir"]);
+        let old = server_stub(&d.join("old"), &["--media-path"]);
+        let with = |ffmpeg: Option<PathBuf>, server: Option<PathBuf>| {
+            Engine::new(
+                d.join("home"),
+                Settings {
+                    ffmpeg_dir: ffmpeg,
+                    llama_server: Some(server.unwrap_or_else(|| d.join("no-such-server"))),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            with(Some(ff.clone()), Some(new.clone())).video_state().await,
+            Video::Ready
+        );
+        assert_eq!(
+            with(Some(ff.clone()), Some(old)).video_state().await,
+            Video::ServerTooOld
+        );
+        assert_eq!(with(Some(ff), None).video_state().await, Video::NoServer);
+        let empty = d.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(with(Some(empty), Some(new)).video_state().await, Video::NoFfmpeg);
     }
 
     #[test]

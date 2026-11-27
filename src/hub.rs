@@ -14,7 +14,7 @@
 //!   POST /v1/completions            OpenAI
 //!   POST /v1/embeddings             OpenAI (a model loaded for it: autoloaded, or load with embeddings: true)
 //!   POST /v1/rerank, /rerank        Jina/llama-server style reranking (a reranker model; reranking: true)
-//!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV or MP3), whisper.cpp (feature `whisper`)
+//!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV, MP3, else through ffmpeg), whisper.cpp (feature `whisper`)
 //!   POST /v1/audio/translations     the same, into English
 //!   POST /v1/audio/speech           OpenAI text to speech (JSON in, WAV or raw PCM out), llama.cpp's llama-tts
 //!   POST /v1/images/generations     OpenAI image generation (PNG as b64_json or a url), stable-diffusion.cpp's sd-cli
@@ -23,6 +23,8 @@
 //!   POST /v1/vision/classify        image recognition through ONNX Runtime (feature `vision`; see docs/vision.md)
 //!   POST /v1/vision/detect          the same: objects with boxes
 //!   POST /v1/vision/embed           the same: an embedding vector of the picture
+//!   GET  /v1/media/components       ffmpeg and speech to text: what is installed (owner only; see docs/media.md)
+//!   POST /v1/media/probe            what a media file holds, from ffprobe (owner only)
 //!
 //!   /api/*                          Ollama's server API (tags, show, chat, generate, embed, ps, pull, create...): see ollama_api.rs
 //!   GET  /v1/native/...             traces, live stream, rerun and diff (owner only; see docs/native/observability.md)
@@ -254,6 +256,7 @@ pub fn operations() -> Vec<Value> {
     all.extend(crate::benchmark::operations());
     all.extend(crate::sysaware::ops::operations());
     all.extend(crate::privacy::ops::operations());
+    all.extend(crate::media::ops::operations());
     all
 }
 
@@ -592,16 +595,17 @@ fn core_operations() -> Vec<Value> {
         ),
         op(
             "speech.transcribe",
-            "Speech to text with the built-in whisper.cpp: transcribe (or translate to English) an audio file (WAV or MP3) on the hub's machine",
+            "Speech to text with the built-in whisper.cpp: transcribe (or translate to English) an audio or video file on the hub's machine. WAV and MP3 are read by the hub; any other container (MP4, MKV, M4A, Ogg, FLAC, WebM ...) is read through ffmpeg once it is installed (media.install)",
             false,
             false,
             json!({
-                "file": {"type": "string", "description": "path of the audio file"},
+                "file": {"type": "string", "description": "path of the audio or video file"},
                 "model": {"type": "string", "description": "whisper model, e.g. base.en (default: whisper_model setting)"},
                 "language": {"type": "string", "description": "ISO-639-1 code; default: detected"},
                 "prompt": {"type": "string", "description": "text that guides the style or spelling"},
                 "translate": {"type": "boolean", "description": "translate to English instead of transcribing"},
-                "format": {"type": "string", "description": "json, text, verbose_json, srt or vtt; the answer's `rendered` is in it"}
+                "words": {"type": "boolean", "description": "time every word: the answer has a `words` list, and the ass format lights each word as it is spoken"},
+                "format": {"type": "string", "description": "json, text, verbose_json, srt, vtt or ass; the answer's `rendered` is in it"}
             }),
             &["file"],
         ),
@@ -935,6 +939,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             // `deletable`: ModelMistress downloaded it, so model.delete may remove it
             let root = crate::pull::download_root(e);
             let devices = e.gpu_devices_recent().await;
+            let video = listing_video(e).await;
             let mut out: Vec<Value> = e
                 .catalog()
                 .iter()
@@ -943,6 +948,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                     let mut v = m.summary(e.is_loaded(&m.id));
                     v["deletable"] = json!(crate::pull::is_downloaded(&root, &m.path));
                     v["hardware"] = e.hardware_json(m, &devices);
+                    crate::media::caps::annotate(&mut v, m, video);
                     v
                 })
                 .collect();
@@ -1088,6 +1094,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let body = json!({"model": a.get("model").cloned().unwrap_or(json!("")), "messages": messages,
                               "max_tokens": a.get("max_tokens").cloned().unwrap_or(json!(512)),
                               "temperature": a.get("temperature").cloned().unwrap_or(json!(0.7)), "stream": false});
+            // this operation is the owner's: a media part may name a file on this machine
+            let body = crate::media::serve::stage_for_owner(body, &e.home).await?;
             let t0 = Instant::now();
             let (model, resp, _lease) = e.forward("/v1/chat/completions", body).await?;
             let status = resp.status();
@@ -1185,7 +1193,25 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         }
         "speech.transcribe" => {
             let path = s(a, "file")?;
-            let file = std::fs::read(path).map_err(|x| Fail::invalid(format!("{path}: {x}")))?;
+            // WAV and MP3 are read here; any other container stays on disk for ffmpeg, which reads it where it is (a
+            // recording of hours is not held in memory)
+            let (file, ffmpeg_reads) = {
+                let p = path.to_string();
+                tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<std::path::PathBuf>), Fail> {
+                    use std::io::Read;
+                    let mut head = [0u8; 16];
+                    let n = std::fs::File::open(&p)
+                        .and_then(|mut f| f.read(&mut head))
+                        .map_err(|x| Fail::invalid(format!("{p}: {x}")))?;
+                    if audio::is_native(&head[..n], &p) {
+                        Ok((std::fs::read(&p).map_err(|x| Fail::invalid(format!("{p}: {x}")))?, None))
+                    } else {
+                        Ok((Vec::new(), Some(std::path::PathBuf::from(&p))))
+                    }
+                })
+                .await
+                .map_err(|x| Fail::new(500, "io", x.to_string()))??
+            };
             let opt = |k: &str| {
                 a.get(k)
                     .and_then(Value::as_str)
@@ -1194,6 +1220,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             };
             let req = audio::Request {
                 file,
+                words: a.get("words").and_then(Value::as_bool).unwrap_or(false),
+                path: ffmpeg_reads,
                 filename: path.to_string(),
                 model: opt("model").unwrap_or_default(),
                 language: opt("language").map(|l| l.to_lowercase()),
@@ -1242,6 +1270,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         id if id.starts_with("forge.") => crate::forge::call(hub, id, a).await?,
         id if id.starts_with("system.") => crate::sysaware::ops::call(hub, id, a).await?,
         id if id.starts_with("privacy.") => crate::privacy::ops::call(hub, id, a).await?,
+        id if id.starts_with("media.") => crate::media::ops::call(hub, id, a).await?,
         "model.convert" => return Err(Fail::new(501, "not_implemented", CONVERT_HELP).into()),
         "key.create" | "key.list" | "key.revoke" | "usage.get" => {
             key_call(&hub.keys, id, a, "hub").map_err(ApiError::from)?
@@ -1829,10 +1858,21 @@ async fn stop(State(hub): State<Hub>) -> Json<Value> {
     Json(json!({"result": {"stopping": true}}))
 }
 
+/// Whether video can be given to a model, worked out only when some model has a projector (a catalog of text models
+/// never asks for ffmpeg or runs the server's `--help`).
+async fn listing_video(e: &Engine) -> crate::media::caps::Video {
+    if e.catalog().iter().any(|m| m.mmproj.is_some()) {
+        e.video_state().await
+    } else {
+        crate::media::caps::Video::NoFfmpeg
+    }
+}
+
 async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>) -> Json<Value> {
     let e = &hub.engine;
     let allowed = |id: &str| who.0.as_ref().is_none_or(|p| p.allows(id, id));
     let devices = e.gpu_devices_recent().await;
+    let video = listing_video(e).await;
     let mut data: Vec<Value> = e
         .catalog()
         .iter()
@@ -1843,9 +1883,12 @@ async fn openai_models(State(hub): State<Hub>, Extension(who): Extension<Caller>
                 Some(i) => i.serving(),
                 None => e.serving_preview(m),
             };
-            json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
+            let mut v = json!({"id": m.id, "object": "model", "created": 0, "owned_by": m.source,
                          "meta": m.summary(e.is_loaded(&m.id)), "serving": serving,
-                         "hardware": e.hardware_json(m, &devices)})
+                         "hardware": e.hardware_json(m, &devices)});
+            // what the model can be given: text, image, audio, video
+            crate::media::caps::annotate(&mut v, m, video);
+            v
         })
         .collect();
     // Misty, the agent, answers to these names (a catalog model of the same name wins)
@@ -2132,6 +2175,11 @@ async fn chat(
 
 /// A chat for one model of the catalog (or Ollama): traced when the owner asks, then forwarded.
 async fn chat_to_model(hub: Hub, who: Caller, headers: HeaderMap, mut body: Value) -> ApiResult<Response> {
+    // The owner may name a file on this machine in a media part; a server reads media only under its --media-path, so
+    // the file is linked or copied there. A peer's request is never rewritten: it can name only what is in <home>/media.
+    if who.0.is_none() {
+        body = crate::media::serve::stage_for_owner(body, &hub.engine.home).await?;
+    }
     // the owner's requests can be traced (src/trace); a peer's never are
     let scope = crate::trace::capture::wants(&hub.engine.home, &headers, &mut body);
     if let (Some(scope), true) = (scope, who.0.is_none()) {
@@ -2374,6 +2422,10 @@ const MAX_VISION_BODY: usize = vision::MAX_IMAGE_BYTES / 3 * 4 + (1 << 16);
 /// The largest audio upload (OpenAI's own limit is 25 MB; local files are often longer).
 const MAX_AUDIO_BYTES: usize = 512 << 20;
 
+/// The largest chat request: a short clip or a few pictures as base64 in the JSON (axum's own limit, 2 MB, refuses a
+/// video). A longer file is named by path instead (`file:///...`, the owner's), which is not part of the body.
+const MAX_CHAT_BODY: usize = 128 << 20;
+
 /// `POST /v1/audio/transcriptions` and `/v1/audio/translations`: multipart in, the transcript out.
 async fn speech_to_text(
     hub: Hub,
@@ -2404,9 +2456,23 @@ async fn run_speech(hub: &Hub, req: audio::Request, translate: bool) -> ApiResul
     let (dirs, preferred) = (hub.engine.whisper_dirs(), hub.engine.settings().whisper_model);
     let model = speech::find_model(&dirs, &req.model, preferred.as_deref())?;
     let name = speech::model_name(&model).unwrap_or_else(|| "whisper".into());
+    // ffmpeg reads what the hub cannot (any container); WAV and MP3 never need it
+    let ffmpeg = hub.engine.ffmpeg().await;
+    if let (Some(path), Err(why)) = (&req.path, &ffmpeg) {
+        return Err(Fail::new(
+            501,
+            "not_implemented",
+            format!(
+                "{} is not a WAV or MP3 file, and reading it needs ffmpeg: {why}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    let tmp = crate::media::serve::media_dir(&hub.engine.home).join("tmp");
     let t0 = Instant::now();
     let out = tokio::task::spawn_blocking(move || -> Result<audio::Transcript, Fail> {
-        let samples = audio::decode(&req.file, &req.filename).map_err(Fail::invalid)?;
+        let samples = crate::media::decode::decode_any(&ffmpeg, &req, &tmp).map_err(Fail::invalid)?;
         speech::transcribe(&model, &samples, &req, translate)
     })
     .await
@@ -2442,7 +2508,10 @@ pub fn router(hub: Hub) -> Router {
         .route("/v1/requests/:id", get(peer_request_status))
         .route("/v1/service/stop", post(stop))
         .route("/v1/models", get(openai_models))
-        .route("/v1/chat/completions", post(chat))
+        .route(
+            "/v1/chat/completions",
+            post(chat).layer(DefaultBodyLimit::max(MAX_CHAT_BODY)),
+        )
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/rerank", post(rerank))
@@ -2453,7 +2522,10 @@ pub fn router(hub: Hub) -> Router {
             post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
         )
         // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
-        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/v1/models/import",
+            post(model_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))
@@ -2483,6 +2555,7 @@ pub fn router(hub: Hub) -> Router {
         .merge(crate::km::ops::routes())
         .merge(crate::factory::ops::routes())
         .merge(crate::misty::ops::routes())
+        .merge(crate::media::ops::routes())
         .route_layer(middleware::from_fn_with_state(hub.clone(), auth))
         // how many routers a request has passed (`x-cf-hop`), so a request the fabric sent here is not sent back
         .layer(middleware::from_fn(crate::fabric::hop_layer));
@@ -2751,7 +2824,16 @@ unrelated line
     #[tokio::test]
     async fn bad_speech_requests_get_clear_errors() {
         let home = temp_home();
-        let h = hub(&home);
+        let mut h = hub(&home);
+        // no ffmpeg (an empty folder is named, so PATH is not searched): what the hub cannot read itself is refused
+        std::fs::create_dir_all(home.join("no-ffmpeg")).unwrap();
+        h.engine = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ffmpeg_dir: Some(home.join("no-ffmpeg")),
+                ..Default::default()
+            },
+        );
         let t = "/v1/audio/transcriptions";
         let (st, _, text) = post(&h, t, "application/json", b"{}".to_vec()).await;
         assert_eq!((st.as_u16(), text.contains("multipart")), (400, true), "{text}");
@@ -2774,7 +2856,54 @@ unrelated line
         let ogg = form(&[("file", Some("a.ogg"), b"OggS....."), ("model", None, b"fake")]);
         let (st, _, text) = post(&h, t, MP, ogg).await;
         assert_eq!((st.as_u16(), text.contains("Ogg")), (400, true), "{text}");
+        assert!(text.contains("ffmpeg"), "the answer says ffmpeg would read it: {text}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An MP4 is read through ffmpeg: the stand-in decodes it, and the (fake) model is what fails, not the audio.
+    #[cfg(feature = "whisper")]
+    #[tokio::test]
+    async fn an_mp4_is_decoded_by_ffmpeg_before_the_model_is_loaded() {
+        use crate::media::stub::{last_args, pair, Stub};
+        let home = temp_home();
+        let mut h = hub(&home);
+        let tools = pair(
+            &home.join("ff"),
+            &Stub {
+                configuration: "--disable-gpl",
+                probe_json: crate::media::probe::SAMPLE,
+                pcm: &[0.1; 16_000],
+            },
+        );
+        h.engine = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ffmpeg_dir: Some(tools.clone()),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(home.join("whisper")).unwrap();
+        std::fs::write(home.join("whisper").join("ggml-fake.bin"), b"not a model").unwrap();
+        let mp4 = form(&[
+            ("file", Some("meeting.mp4"), b"\0\0\0\x20ftypisom"),
+            ("model", None, b"fake"),
+            ("response_format", None, b"ass"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
+        let (st, _, text) = post(&h, "/v1/audio/transcriptions", MP, mp4).await;
+        assert_eq!(
+            st.as_u16(),
+            500,
+            "the audio was read; the fake model is what fails: {text}"
+        );
+        assert!(text.contains("model_error"), "{text}");
+        assert!(last_args(&tools, "args.log").contains("-map 0:a:0"));
+        // the operation names the file by path: ffmpeg reads it where it is
+        let clip = home.join("clip.mkv");
+        std::fs::write(&clip, b"x").unwrap();
+        let (code, v) = json_post(&h, "/v1/call/speech.transcribe", json!({"file": clip, "model": "fake"})).await;
+        assert_eq!(code, 500, "{v}");
+        assert!(last_args(&tools, "args.log").contains("clip.mkv"));
     }
 
     /// Needs a real whisper model and a short recording; see docs/speech.md. Run:

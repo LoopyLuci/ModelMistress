@@ -449,7 +449,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn sha_of(path: &Path) -> Option<String> {
+pub(crate) fn sha_of(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut h = Sha256::new();

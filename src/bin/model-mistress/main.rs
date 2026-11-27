@@ -80,7 +80,8 @@ enum Cmd {
     },
     /// One question, one answer.
     Chat { model: String, prompt: String },
-    /// Speech to text with the built-in whisper.cpp (WAV or MP3): `transcribe talk.wav --model base.en`.
+    /// Speech to text with the built-in whisper.cpp: `transcribe talk.wav --model base.en`. WAV and MP3 are read by the
+    /// hub; any other audio or video file (MP4, MKV, M4A ...) needs ffmpeg (`model-mistress call media.install`).
     Transcribe {
         file: PathBuf,
         /// A whisper model (`base.en` for ggml-base.en.bin); default: the whisper_model setting or what is found.
@@ -95,9 +96,12 @@ enum Cmd {
         /// Translate the speech into English.
         #[arg(long)]
         translate: bool,
-        /// text, json, verbose_json, srt or vtt.
+        /// text, json, verbose_json, srt, vtt or ass.
         #[arg(long, default_value = "text")]
         format: String,
+        /// Time every word (the ass format then lights each word as it is spoken; verbose_json lists them).
+        #[arg(long)]
+        words: bool,
     },
     /// Recognise a picture with an ONNX model in <home>/vision: `vision resnet50 cat.jpg [--top-k 5]`. A classifier
     /// lists its best guesses, a detector the boxes it found, an embedding model prints its vector as JSON.
@@ -657,10 +661,11 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             prompt,
             translate,
             format,
+            words,
         } => {
             // The hub reads the file, and its working folder is not ours.
             let file = std::path::absolute(&file)?;
-            let mut a = json!({"file": file, "translate": translate, "format": format});
+            let mut a = json!({"file": file, "translate": translate, "format": format, "words": words});
             for (k, v) in [("model", model), ("language", language), ("prompt", prompt)] {
                 if let Some(v) = v {
                     a[k] = json!(v);

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -108,6 +108,48 @@ async fn fake_slots(State(f): State<Fake>) -> Response {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
     Json(json!([{"id": 0, "is_processing": false}])).into_response()
+}
+
+/// The chat bodies a [`recording_stand_in`] was sent, in order.
+pub type Recorded = Arc<std::sync::Mutex<Vec<Value>>>;
+
+#[derive(Clone)]
+struct Recorder {
+    fake: Fake,
+    bodies: Recorded,
+}
+
+async fn record_chat(State(r): State<Recorder>, Json(body): Json<Value>) -> Response {
+    r.bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body.clone());
+    fake_chat(State(r.fake), Json(body)).await
+}
+
+async fn record_slots(State(r): State<Recorder>) -> Response {
+    fake_slots(State(r.fake)).await
+}
+
+/// A stand-in `llama-server` like [`stand_in`] that also keeps the body of every chat request, as the server got it.
+pub async fn recording_stand_in(tag: &str) -> (StandIn, Recorded) {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let bodies: Recorded = Default::default();
+    let recorder = Recorder {
+        fake: Fake {
+            tag: tag.to_string(),
+            delay: Duration::ZERO,
+            seen: seen.clone(),
+            slots_full: false,
+        },
+        bodies: bodies.clone(),
+    };
+    let app = Router::new()
+        // llama-server takes a clip of any size; axum's own 2 MB limit would answer 413 for this stand-in
+        .route(
+            "/v1/chat/completions",
+            post(record_chat).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/slots", get(record_slots))
+        .with_state(recorder);
+    (serve_app(app, seen).await, bodies)
 }
 
 /// A stand-in `llama-server` that answers every chat, completion, embedding and rerank request with `status` and `body`.

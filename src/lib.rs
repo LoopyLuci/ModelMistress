@@ -22,6 +22,7 @@ pub mod image;
 pub mod km;
 pub mod loadlog;
 pub mod machine;
+pub mod media;
 pub mod misty;
 pub mod ollama_api;
 pub mod privacy;
@@ -42,6 +43,8 @@ pub mod watchdog;
 mod ollama_tests;
 #[cfg(test)]
 mod tests_hosting;
+#[cfg(test)]
+mod tests_media;
 #[cfg(test)]
 mod tests_upstream;
 

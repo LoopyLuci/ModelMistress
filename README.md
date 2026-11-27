@@ -16,9 +16,13 @@ runs on its own.
 - **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server`, `llama-quantize` and `llama-tts` (Vulkan by
   default) and needs nothing else installed but the GPU driver.
 - **Speech to text, built in.** With `--features whisper` it runs whisper.cpp itself: OpenAI's
-  `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in; json, text, verbose_json, srt or vtt out)
+  `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in, any other audio or video container once ffmpeg
+  is installed; json, text, verbose_json, srt, vtt or ass out, with word times on request)
   and `model-mistress transcribe talk.wav`. A whisper model is a `ggml-*.bin` file in a model folder
   ([docs/speech.md](docs/speech.md)).
+- **Video and audio in chat.** `video_url`, `input_video` and `input_audio` parts reach the model's llama-server, which
+  decodes the video with ffmpeg; ffmpeg is a setup component the owner installs on purpose (`media.install`), and
+  `media.probe` says what a media file holds ([docs/media.md](docs/media.md)).
 - **Text to speech, built in.** `POST /v1/audio/speech` (OpenAI's route; WAV or raw PCM out) and
   `model-mistress speak "Hello" --out hello.wav` run llama.cpp's own `llama-tts`, built from the vendored llama.cpp
   ([docs/text-to-speech.md](docs/text-to-speech.md)).

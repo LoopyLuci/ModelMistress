@@ -595,11 +595,16 @@ pub mod tests_support {
     use std::path::Path;
 
     pub fn gguf(path: &Path, arch: &str, name: &str) {
+        gguf_with(path, arch, name, &[]);
+    }
+
+    /// Like [`gguf`], with more true/false entries (`clip.has_audio_encoder` and the like) after the architecture.
+    pub fn gguf_with(path: &Path, arch: &str, name: &str, flags: &[(&str, bool)]) {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&5u64.to_le_bytes());
+        b.extend_from_slice(&(5 + flags.len() as u64).to_le_bytes());
         let s = |b: &mut Vec<u8>, v: &str| {
             b.extend_from_slice(&(v.len() as u64).to_le_bytes());
             b.extend_from_slice(v.as_bytes());
@@ -619,6 +624,11 @@ pub mod tests_support {
         s(&mut b, &format!("{arch}.context_length"));
         b.extend_from_slice(&4u32.to_le_bytes());
         b.extend_from_slice(&4096u32.to_le_bytes());
+        for (key, on) in flags {
+            s(&mut b, key);
+            b.extend_from_slice(&7u32.to_le_bytes());
+            b.push(*on as u8);
+        }
         s(&mut b, "tokenizer.ggml.model"); // reading stops here
         b.extend_from_slice(&8u32.to_le_bytes());
         s(&mut b, "gpt2");

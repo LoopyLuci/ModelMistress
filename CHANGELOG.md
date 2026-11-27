@@ -41,6 +41,75 @@ yet with the real Bonsai models.
 - Docs: `DESIGN.md` section 3.3 and 3.4 follow the code; it said network tools default to `ask`, and the code (and now the
   document) says `deny`.
 
+### Media: video and audio in chat, an ffmpeg component, speech to text on any container
+
+- ffmpeg is a setup component, not a download that happens by itself. `media.components` (and `GET /v1/media/components`)
+  says where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, `MM_FFMPEG_DIR`, `<home>/engines/ffmpeg/`, then PATH), their
+  version and licence (a GPL or nonfree build is reported, not refused), and what each projector model can be given.
+  `media.install` (owner only) puts a build into `<home>/engines/ffmpeg/`: without `confirm: true` it answers what it would
+  fetch, from where, how big, and the SHA-256 it must have; the archive's hash is checked before it is unpacked, the
+  programs are run once (`-version`) before they replace anything, every installed file's size and hash go into
+  `install.json` and are checked before the file is used (a swapped file or a folder with no record is an error that names
+  the fix, never a silent use), and an earlier install is kept as `ffmpeg.old-<time>`. Runs as a job; `wait: true` waits.
+  New setting `ffmpeg_dir`. See `docs/media.md`.
+- **The pinned build** (Windows x64) is BtbN's FFmpeg-Builds n8.1, LGPL, shared: `ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip`,
+  81,544,084 bytes, SHA-256 `bb633136…f9558`. Its download address is a daily-build page that keeps files 14 days, so
+  keep the zip and install with `file` + `sha256`, or pin another build in `pin()`. `url` + `sha256` and `file` + `sha256`
+  install any build. Installed from the zip in this change, and n9.0.2 beside it; the hub never downloads by itself.
+- Video and audio in chat. A chat message's `video_url`, `input_video`, `input_audio` and `image_url` parts reach the
+  model's llama-server. A model that has a projector is started with `--media-path <home>/media` and, when ffmpeg is there,
+  `--video-ffmpeg-dir <folder>`, each only if that llama-server lists the flag and unless the owner's own arguments set it.
+  A llama-server reads a local file only as `file://<name>` under `--media-path` (a bare path fails with HTTP 500, measured),
+  so the owner's own requests (`/v1/chat/completions`, `chat.complete`) may name a file anywhere on the machine
+  (`file:///C:/clips/a.mp4`, a plain path, `%20` decoded): the hub links or copies it to `<home>/media/staged/` and passes
+  `file://staged/<name>`. Copies nobody asked for in a day are removed. A peer key's request is never rewritten, so a peer
+  cannot read a file of the owner's machine through chat. `/v1/chat/completions` takes up to 128 MB of body (axum's 2 MB
+  refused a short clip as base64).
+- `model.list` and `/v1/models` carry `input_modalities` (`text`, `image`, `audio`, `video`): image and audio from the
+  projector's own flags (`clip.has_vision_encoder`, `clip.has_audio_encoder`), video when the model sees images, ffmpeg is
+  there and the server takes `--video-ffmpeg-dir`; `video_note` says what is missing when video is possible but not ready.
+- `media.probe` (and `POST /v1/media/probe`, JSON `{"file"}` or a multipart upload up to 512 MB): what ffprobe says about a
+  file, as the container (format, duration, size, bit rate) and every video, audio and subtitle stream (codec, size, frame
+  rate, rotation, sample rate, channels, language, cover art). Owner only; ffprobe gets `-protocol_whitelist file`.
+- Speech to text reads any container. `/v1/audio/transcriptions`, `/v1/audio/translations` and `speech.transcribe` keep
+  reading WAV and MP3 themselves; any other audio or video file goes through ffmpeg when it is installed (the first audio
+  stream, 16 kHz mono), and `speech.transcribe` leaves a file named by path on disk for ffmpeg (a long recording is not held
+  in memory). Only plain audio and video containers are decoded (not playlists, `concat`, image sequences, devices or raw
+  streams), ffmpeg gets only the `file` protocol, at most 4 hours are decoded, and every process has a time limit. Without
+  ffmpeg the answer says how to get it (`501` for a path; the usual `400` for an upload).
+- New response format `ass` (Advanced SubStation Alpha) and word times: `timestamp_granularities[]=word` on the OpenAI
+  route, `words: true` / `--words` on `speech.transcribe` / `model-mistress transcribe`. `verbose_json` then has OpenAI's
+  top-level `words`; `ass` writes each word as a karaoke tag. The times are whisper.cpp's token times grouped into words:
+  estimates, good to a fraction of a second.
+- Cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend; implies `whisper`); `media.components` and
+  `speech::BUILD` say which build runs (`vulkan`, `cpu`, `none`). The Vulkan build of whisper-rs-sys fails when the build
+  path is long: use a short `CARGO_TARGET_DIR`. Built and run on the RX 7900 XTX: the 32 s MP4 transcribes in 1.2 to 1.4 s
+  once the model is loaded (same text as the CPU). The card's cooperative-matrix kernels end the process at the first encode
+  (exit code 0xC0000409, no message), so the hub sets `GGML_VK_DISABLE_COOPMAT=1` while the model loads (unless the owner
+  set it); `MM_WHISPER_LOG=1` makes whisper.cpp and ggml print to stderr.
+- Measured before this was built (the media plan's spikes, not repeated with this code): a 74 s screen recording of a meeting
+  was answered correctly (5 of 5 questions) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's native video
+  input, at about one second of compute per second of video; whisper.cpp through whisper-rs 0.16 with Vulkan ran 59.8 times
+  real time against 0.9 on the CPU on the RX 7900 XTX.
+- Run on this machine with real builds, a real model and a real clip (a scratch hub, the owner's hub untouched): ffmpeg
+  n8.1.3 and n9.0.2 installed from their zips, both read as LGPL; `media.probe`, decoding (322 frames of 720p in 0.12 s) and the
+  16 kHz audio the same on both; `speech.transcribe` of a 32 s MP4 (whisper large-v3-turbo-q5_0 on the CPU) gave the spoken
+  script exactly in 41 to 42 s; a Gemma 4 26B chat with `video_url` of the local MP4 answered 5 of 5 questions on both builds
+  (900 generated tokens at 82 and 85 tokens/s). Two findings: that model's projector crashes the pinned llama-server on the
+  GPU (for a single picture too), so it ran with `--no-mmproj-offload` and the first video answer took 16 minutes; and
+  llama-server's default frame rate gave 52,595 tokens for the 32 s clip, over a 32k context, so `--video-fps 1` was given
+  in `extra_args`. The hub now passes `--video-fps 1` itself (with ffmpeg present, to a server that lists the flag; the
+  owner's own `--video-fps` wins).
+- Tests for this change: with `--features whisper` the 35 speech, audio and media tests pass too (the test binary links
+  only against the MSVC 14.51 libraries here: whisper.cpp was compiled with its headers). `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
+  fails in this worktree because its PDF fixture was checked out with Windows line endings, which breaks the file's byte
+  offsets; the file is not touched here and `*.pdf` is not marked binary in `.gitattributes`), `rustfmt`, and clippy with
+  `-D warnings` on this change's files (three other lints, in `misty/ops.rs`, `batch.rs` and `misty/agent.rs`, come from the
+  newer toolchain and are not touched). The tests use stand-in ffmpeg, ffprobe and llama-server programs (the install from a stored
+  zip with a right and a wrong hash, a swapped file, the listings, the chat path through a stand-in server that records what
+  it was sent, a peer's request left alone, the ass and words formats). Not run: a vision model whose projector runs on the GPU
+  (Qwen3-VL and Gemma 4 E4B are not on the machine), the new routes with a browser or a real client.
+
 ### System awareness: the hub watches the PC and yields to it, live
 
 - Every two seconds the hub reads how pressed the machine is: CPU used by *other* programs (the machine's total less the hub's
