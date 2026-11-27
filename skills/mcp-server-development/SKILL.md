@@ -30,6 +30,11 @@ becomes a tool:
 in the list answers `no tool <name>`. So adding an operation to the hub makes it an MCP tool with no change to the MCP code,
 and the operation's own flags set how the client sees it.
 
+Which operations are offered is a `ToolSet`: `Core` (the default, `mcp`) offers the nine operations in `CORE_OPS`, and `All`
+(`mcp --all-tools`) offers every operation the hub lists. `tools/list` and `tools/call` both use the same set, so a tool
+outside it answers `-32602` as if it did not exist. Add an operation to `CORE_OPS` only on purpose: each tool costs an
+agent context on every turn.
+
 ## Peer keys get two tools
 
 A scoped peer key sees only `models_list` (the models the key may use) and `chat_complete` (one answer, not streamed).
@@ -51,7 +56,8 @@ path, not by starting a process.
 
 ## Rules
 
-1. An operation is a tool. Mark it `mutating` and `destructive` honestly: the client reads those flags for its own hints.
+1. An operation is a tool when the session's `ToolSet` includes it. Mark it `mutating` and `destructive` honestly: the client
+   reads those flags for its own hints.
 2. A peer key must not gain a route by accident. Add a route to `peer_route` only on purpose, and then also to `peer_tools()`.
 3. Error text comes back as the hub's message. Keep it actionable; it is what the agent reads.
 

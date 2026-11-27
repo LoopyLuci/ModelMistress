@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### MCP: a core tool profile
+
+- The owner's MCP session (`model-mistress mcp`) offers nine core tools: `service_status`, `model_list`, `model_loaded`,
+  `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete` and `logs_tail`. Before, it offered every hub
+  operation (about 94), which cost an agent context on every turn. A tool outside the set is refused as a tool that does not
+  exist.
+- `model-mistress mcp --all-tools` offers every operation again: downloads (`model_search`, `model_pull`), deletes, settings,
+  Misty and the fabric. It cannot be combined with `--peer`.
+- The core set is `CORE_OPS` in `src/client.rs`; a test checks that each name is an operation the hub lists
+  (`the_core_profile_offers_the_core_tools_and_all_offers_every_operation`).
+- An MCP client that was set up before this change, such as the Claude Code plugin's `.mcp.json`, now gets the core set. To keep
+  the full list, start the server with `--all-tools`. See `docs/claude.md`.
+
 ### Desktop app: Misty, chat and speech
 
 - Misty ratings: each reply can be rated Good, Bad, No tool needed or Should have used a tool, or corrected. Ratings are

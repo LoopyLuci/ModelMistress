@@ -385,12 +385,43 @@ machine and which are loaded. `model_load` loads one into memory and `model_unlo
 a lot of RAM or GPU memory, so unload what you no longer need. `chat_complete` answers one prompt with a model. \
 `service_status` shows the hub's version, memory and loaded models. Tools marked destructive delete or change files.";
 
-/// What an MCP session on this server may do: every operation with the owner's token, or only the model routes with a
-/// peer key (for an agent that should list models and chat, and nothing that changes the hub).
+/// What an MCP session on this server may do: the owner's operations with the owner's token, or only the model routes with
+/// a peer key (for an agent that should list models and chat, and nothing that changes the hub).
 #[derive(Clone, Copy)]
 pub enum McpAccess<'a> {
-    Owner(&'a Client),
+    Owner(&'a Client, ToolSet),
     Peer(&'a Client),
+}
+
+/// Which of the hub's operations the owner's session offers as tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSet {
+    /// The operations an agent needs to see, load, unload and ask the local models, and the log of a failed load.
+    Core,
+    /// Every operation the hub lists: downloads, deletes, settings, Misty, the fabric and the rest.
+    All,
+}
+
+/// The core tools. Each tool costs an agent context on every turn, so the rest are behind `mcp --all-tools`.
+pub const CORE_OPS: &[&str] = &[
+    "service.status",
+    "model.list",
+    "model.loaded",
+    "model.info",
+    "model.plan",
+    "model.load",
+    "model.unload",
+    "chat.complete",
+    "logs.tail",
+];
+
+impl ToolSet {
+    fn includes(self, op_id: &str) -> bool {
+        match self {
+            ToolSet::Core => CORE_OPS.contains(&op_id),
+            ToolSet::All => true,
+        }
+    }
 }
 
 /// What a peer key's session is told: the two tools it has, and that the owner does the rest.
@@ -415,17 +446,33 @@ fn peer_tools() -> Vec<Value> {
     ]
 }
 
-/// Serve the hub's operations as MCP tools over stdio (JSON-RPC 2.0, one message per line), with the owner's token.
-pub async fn serve_mcp(hub: Client) -> Result<()> {
-    serve_mcp_io(McpAccess::Owner(&hub), std::io::stdin().lock(), std::io::stdout()).await
+/// Serve the hub's operations in `set` as MCP tools over stdio (JSON-RPC 2.0, one message per line), with the owner's token.
+pub async fn serve_mcp(hub: Client, set: ToolSet) -> Result<()> {
+    serve_mcp_io(McpAccess::Owner(&hub, set), std::io::stdin().lock(), std::io::stdout()).await
+}
+
+/// What the owner's session is told: the core tools, and where the other operations are.
+fn owner_instructions(set: ToolSet) -> String {
+    match set {
+        ToolSet::Core => format!(
+            "{MCP_INSTRUCTIONS} Only the core tools are listed. Downloads, deletes, settings, Misty and the other operations \
+             need the server started with `model-mistress mcp --all-tools`."
+        ),
+        ToolSet::All => MCP_INSTRUCTIONS.to_string(),
+    }
 }
 
 /// The MCP loop over any line reader and writer: stdio for the CLI, buffers in the tests.
 pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: impl Write) -> Result<()> {
     // The owner's tools are the hub's operations; a peer key's tools are the two model routes.
-    let (instructions, tools, names) = match access {
-        McpAccess::Owner(hub) => {
-            let ops = hub.operations().await?;
+    let (instructions, tools, names): (String, Vec<Value>, Vec<(String, String)>) = match access {
+        McpAccess::Owner(hub, set) => {
+            let ops: Vec<Value> = hub
+                .operations()
+                .await?
+                .into_iter()
+                .filter(|o| o["id"].as_str().is_some_and(|id| set.includes(id)))
+                .collect();
             let tools: Vec<Value> = ops
                 .iter()
                 .map(|o| {
@@ -442,9 +489,9 @@ pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: i
                 .iter()
                 .filter_map(|o| o["id"].as_str().map(|id| (tool_name(id), id.to_string())))
                 .collect();
-            (MCP_INSTRUCTIONS, tools, names)
+            (owner_instructions(set), tools, names)
         }
-        McpAccess::Peer(_) => (PEER_MCP_INSTRUCTIONS, peer_tools(), Vec::new()),
+        McpAccess::Peer(_) => (PEER_MCP_INSTRUCTIONS.to_string(), peer_tools(), Vec::new()),
     };
     for line in input.lines() {
         let line = line?;
@@ -484,7 +531,7 @@ pub async fn serve_mcp_io(access: McpAccess<'_>, input: impl BufRead, mut out: i
                     msg["params"]["arguments"].clone()
                 };
                 let outcome = match access {
-                    McpAccess::Owner(hub) => match names.iter().find(|(n, _)| *n == name) {
+                    McpAccess::Owner(hub, _) => match names.iter().find(|(n, _)| *n == name) {
                         Some((_, op)) => Some(hub.call(op, args).await),
                         None => None,
                     },
@@ -589,7 +636,7 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
         );
         let mut out = Vec::new();
-        serve_mcp_io(McpAccess::Owner(&client), input.as_bytes(), &mut out)
+        serve_mcp_io(McpAccess::Owner(&client, ToolSet::All), input.as_bytes(), &mut out)
             .await
             .unwrap();
         let replies: Vec<Value> = String::from_utf8(out)
@@ -678,6 +725,78 @@ mod tests {
             replies[2]["error"]["code"], -32602,
             "owner tools are not on a peer key's server"
         );
+    }
+
+    #[tokio::test]
+    async fn the_core_profile_offers_the_core_tools_and_all_offers_every_operation() {
+        let home = crate::testing::temp_home();
+        let hub = crate::testing::hub(&home, &["alpha"]);
+        let (addr, _task) = crate::testing::serve(hub).await;
+        let client = Client::new(&format!("http://{addr}"), crate::testing::TOKEN);
+        let every: Vec<String> = client
+            .operations()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["id"].as_str().map(str::to_string))
+            .collect();
+        let missing: Vec<&str> = CORE_OPS
+            .iter()
+            .copied()
+            .filter(|id| !every.iter().any(|e| e.as_str() == *id))
+            .collect();
+        assert!(missing.is_empty(), "core operations the hub does not list: {missing:?}");
+
+        // A call to a tool outside the core set must be refused before it reaches the hub, so the call here is harmless.
+        let core_input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"model_delete\",\"arguments\":{}}}\n",
+        );
+        let mut out = Vec::new();
+        serve_mcp_io(
+            McpAccess::Owner(&client, ToolSet::Core),
+            core_input.as_bytes(),
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let replies: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let mut core: Vec<&str> = replies[0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        core.sort();
+        let mut expected: Vec<String> = CORE_OPS.iter().map(|id| tool_name(id)).collect();
+        expected.sort();
+        assert_eq!(core, expected, "the core profile lists exactly the core operations");
+        assert_eq!(
+            replies[1]["error"]["code"], -32602,
+            "a tool outside the core set is not on this server"
+        );
+
+        let all_input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        let mut out = Vec::new();
+        serve_mcp_io(McpAccess::Owner(&client, ToolSet::All), all_input.as_bytes(), &mut out)
+            .await
+            .unwrap();
+        let all: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let listed = all[0]["result"]["tools"].as_array().unwrap().len();
+        assert_eq!(
+            listed,
+            every.len(),
+            "the full profile offers every operation the hub lists"
+        );
+        assert!(listed > core.len());
     }
 
     #[test]

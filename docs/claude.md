@@ -1,8 +1,9 @@
 # ModelMistress with Claude
 
-Claude can use the models ModelMistress serves on this machine through its MCP server. The server exposes every hub
-operation as a tool (`model_list`, `model_load`, `model_unload`, `chat_complete`, `service_status`, ...), and the Claude
-Code plugin adds slash commands on top.
+Claude can use the models ModelMistress serves on this machine through its MCP server. By default the server offers the
+core tools (`model_list`, `model_info`, `model_loaded`, `model_plan`, `model_load`, `model_unload`, `chat_complete`,
+`service_status`, `logs_tail`). `model-mistress mcp --all-tools` offers every hub operation as a tool: downloads, deletes,
+settings, Misty and the fabric. The Claude Code plugin adds slash commands on top.
 
 Both need the `model-mistress` program on the PATH. Build it with `cargo build --release -p model-mistress --features
 bundled-engine` and put `target/release` on the PATH, or use the full path to the program in the commands below.
