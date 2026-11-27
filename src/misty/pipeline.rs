@@ -382,6 +382,10 @@ async fn ask(ctx: &Ctx, d: &Value, prompt: String, role: Option<Role>) -> Result
     if o.status != "done" {
         return Err(o.error.unwrap_or_else(|| o.status.to_string()));
     }
+    // A step that ran out of steps or time has no answer to hand on: the next step would build on a guess.
+    if let Some(why) = o.partial {
+        return Err(format!("the step stopped early ({why} ran out): {}", o.text));
+    }
     Ok(json!({"text": o.text, "role": o.role, "run": o.run, "citations": o.citations}))
 }
 

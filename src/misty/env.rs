@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::config::{Config, Policy, PolicySet};
+use super::toolbox::{self, Class};
 
 const MAX_NAME: usize = 60;
 const MAX_NOTE: usize = 500;
@@ -41,17 +42,41 @@ pub struct PolicyOverride {
     pub net: Option<Policy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<Policy>,
+    /// A policy for single tools, which wins over any class setting for them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, Policy>,
 }
 
 impl PolicyOverride {
-    /// `base` with this environment's choices on top.
+    fn of_class(&self, c: Class) -> Option<Policy> {
+        match c {
+            Class::Read => self.read,
+            Class::Write => self.write,
+            Class::Exec => self.exec,
+            Class::Net => self.net,
+            Class::Hub => self.hub,
+        }
+    }
+
+    /// `base` with this environment's choices on top. A class the environment sets replaces what Misty's own settings
+    /// say about single tools of that class (the environment is the narrower, newer choice, and a per-tool entry in
+    /// Misty's settings must not undo an environment that turns a whole class off); the environment's own per-tool
+    /// entries then apply.
     pub fn apply(&self, base: &PolicySet) -> PolicySet {
+        let mut tools = base.tools.clone();
+        tools.retain(|name, _| {
+            toolbox::find(name)
+                .map(|s| self.of_class(s.class).is_none())
+                .unwrap_or(true)
+        });
+        tools.extend(self.tools.clone());
         PolicySet {
             read: self.read.unwrap_or(base.read),
             write: self.write.unwrap_or(base.write),
             exec: self.exec.unwrap_or(base.exec),
             net: self.net.unwrap_or(base.net),
             hub: self.hub.unwrap_or(base.hub),
+            tools,
         }
     }
 }
@@ -167,6 +192,11 @@ impl Environment {
             }
         }
         self.roots = roots;
+        for name in self.policy.tools.keys() {
+            if toolbox::find(name).is_none() {
+                return Err(format!("policy.tools: there is no tool named {name}"));
+            }
+        }
         if self.vars.len() > MAX_VARS {
             return Err(format!("at most {MAX_VARS} variables"));
         }
@@ -522,6 +552,51 @@ mod tests {
         let v = browse(Some(&d.to_string_lossy().replace('\\', "/")), false).unwrap();
         assert!(!v["path"].as_str().unwrap().contains('/'), "{v}");
         assert!(!v["dirs"][0]["path"].as_str().unwrap().contains('/'), "{v}");
+    }
+
+    #[test]
+    fn a_tool_policy_in_an_environment_wins_and_a_class_it_sets_replaces_mistys_entries_for_that_class() {
+        let mut base = PolicySet::default();
+        base.tools.insert("fs_write".into(), Policy::Auto); // Misty's own: this one write tool runs freely
+        base.tools.insert("fs_read".into(), Policy::Ask);
+        // an environment that turns the whole write class off is not undone by Misty's per-tool entry
+        let off = PolicyOverride {
+            write: Some(Policy::Deny),
+            ..Default::default()
+        };
+        let p = off.apply(&base);
+        assert_eq!(toolbox::find("fs_write").unwrap().policy(&p), Policy::Deny);
+        assert_eq!(
+            toolbox::find("fs_read").unwrap().policy(&p),
+            Policy::Ask,
+            "another class keeps its entry"
+        );
+        // its own per-tool entry wins over its class and over Misty's
+        let mut own = PolicyOverride {
+            write: Some(Policy::Deny),
+            ..Default::default()
+        };
+        own.tools.insert("fs_write".into(), Policy::Ask);
+        assert_eq!(
+            toolbox::find("fs_write").unwrap().policy(&own.apply(&base)),
+            Policy::Ask
+        );
+        // a name that is not a tool is refused when the environment is saved
+        let d = TestDir::new("env-tool-policy");
+        let mut e = Environment {
+            name: "p".into(),
+            cwd: Some(d.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        e.policy.tools.insert("fs_wirte".into(), Policy::Auto);
+        assert!(e.check().unwrap_err().contains("fs_wirte"));
+        e.policy.tools.clear();
+        e.policy.tools.insert("fs_write".into(), Policy::Auto);
+        assert!(e.check().is_ok());
+        // it survives the JSON round trip the operations use, and an unknown field is still refused
+        let back: PolicyOverride = serde_json::from_value(serde_json::to_value(&e.policy).unwrap()).unwrap();
+        assert_eq!(back, e.policy);
+        assert!(serde_json::from_value::<PolicyOverride>(json!({"tool": {"calc": "auto"}})).is_err());
     }
 
     #[test]

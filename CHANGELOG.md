@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Misty: the optimal-agents spec applied (budgets, a stronger gate, a context that fits, notes)
+
+The spec is `docs/misty/optimal-agents-spec.md` (written from the owner's notes on agent design); the mapping of each
+requirement to what Misty does, with the tests, is `docs/misty/optimal-agents-map.md`. Checked with a scripted model, not
+yet with the real Bonsai models.
+
+- **A run that runs out ends with an answer, not an error.** At `max_steps` or the new `max_tool_calls` the run makes one
+  last call with no tools and the model says what it found and what is missing; at `run_timeout_s` (the hard limit) no
+  further model call is made and the host writes that note from what the run did. The run is `done` with `partial` set to
+  `steps`, `tools` or `time` (in `misty.ask`'s result and the `final` event), and its text starts "(Stopped early: ...)".
+  A pipeline step that ends this way fails, so a later step does not build on it. Before, the run was an error with no
+  summary.
+- **The gate counts tool calls.** A reply may carry `max_calls_per_reply` calls (default 4) and a run may make
+  `max_tool_calls` (default 16, refused calls included); the rest are not run and the model is told. Cancel is now also
+  checked between the calls of one reply. A caller that names its tools (`tools` on a request) gets a refusal for any
+  other, even when the policy would allow it.
+- **The prompt fits the context.** Nothing used to trim a run's messages, so a few large tool results could push a
+  8192-token context over its limit. Before each call the prompt is brought under `context_tokens` (default 8192, less
+  the reply and the tool definitions): earlier tool results become a note, then the oldest turns go, then the latest
+  results are cut. A `context` event says so.
+- **Text from outside cannot close its own label, and order-like text is shown to the owner.** A tool result can no
+  longer contain `<tool_result` or `</tool_result`. Wording that reads as orders ("ignore your instructions", a fake
+  `system:` line, "do not tell the user", "run the following command") is named in the tool event (`flags`), in a warning
+  after the result the model reads, and as a "Look twice" line beside every approval the run asks for afterwards
+  (dashboard and CLI; the approval event and `misty.approvals` carry `warning`). It is a heuristic list and never blocks;
+  the approvals still stop a write, a hub change or a network call.
+- **Per-tool policy.** `policy.tools` (in Misty's settings and in an environment) gives one tool its own `auto`, `ask` or
+  `deny`, which wins over its class; a name that is not a tool is refused when saved. An environment that sets a class
+  replaces Misty's per-tool entries for it. `misty.tools.list` shows each tool's own policy. (The `denied` message names the
+  tool when its own entry is what refused it.)
+- **The bigger model is told why.** When an answer is rejected and the run retries one role up, the system prompt says why
+  ("rejected: empty answer").
+- **`remember`**, a tool of class `write` (so the owner approves each one by default), keeps one short fact in the document
+  index; it comes back by retrieval. A note that gives orders is refused.
+- **Ask first when it matters.** The system prompt tells the model to ask one short question when a request is unclear and
+  a wrong guess would change, delete or run something, and otherwise to work and say what it assumed. A prompt rule only.
+- Docs: `DESIGN.md` section 3.3 and 3.4 follow the code; it said network tools default to `ask`, and the code (and now the
+  document) says `deny`.
+
 ### System awareness: the hub watches the PC and yields to it, live
 
 - Every two seconds the hub reads how pressed the machine is: CPU used by *other* programs (the machine's total less the hub's

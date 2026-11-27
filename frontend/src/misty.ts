@@ -69,7 +69,7 @@ export interface Browse {
   dirs: { name: string; path: string }[]
   places: { label: string; path: string }[]
 }
-export interface Approval { approval: string; run: string; tool: string; class: string; args: any }
+export interface Approval { approval: string; run: string; tool: string; class: string; args: any; warning?: string | null }
 
 /** One entry of a run's event log (the `type` says which fields it has; see agent.rs). */
 export interface RunEvent { type: string; t_ms?: number; [k: string]: any }

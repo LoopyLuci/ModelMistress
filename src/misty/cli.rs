@@ -465,7 +465,10 @@ async fn follow(c: &crate::client::Client, run: &str, quiet: bool) -> anyhow::Re
                     streamed = false;
                 }
                 "approval" => {
-                    let what = format!("Misty wants to run {} {}", e["tool"].as_str().unwrap_or(""), e["args"]);
+                    let mut what = format!("Misty wants to run {} {}", e["tool"].as_str().unwrap_or(""), e["args"]);
+                    if let Some(w) = e["warning"].as_str() {
+                        what.push_str(&format!("\n  Look twice: {w}\n "));
+                    }
                     let id = e["approval"].as_str().unwrap_or("").to_string();
                     let allow = tokio::task::spawn_blocking(move || ask_yes(&what))
                         .await

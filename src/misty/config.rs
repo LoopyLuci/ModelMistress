@@ -17,7 +17,8 @@ pub enum Policy {
     Deny,
 }
 
-/// The tool classes (see `toolbox`): the policy for each.
+/// The tool classes (see `toolbox`): the policy for each, and, for the few tools that should differ from their class,
+/// a policy of their own (`tools`: the tool's name to its policy, which wins over its class).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicySet {
@@ -26,6 +27,8 @@ pub struct PolicySet {
     pub exec: Policy,
     pub net: Policy,
     pub hub: Policy,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, Policy>,
 }
 
 impl Default for PolicySet {
@@ -36,6 +39,7 @@ impl Default for PolicySet {
             exec: Policy::Deny,
             net: Policy::Deny,
             hub: Policy::Ask,
+            tools: BTreeMap::new(),
         }
     }
 }
@@ -46,8 +50,16 @@ pub struct Config {
     /// Folders the file tools may touch (default: `<home>/misty/workspace`). Nothing outside them, ever.
     pub roots: Vec<PathBuf>,
     pub policy: PolicySet,
-    /// Model calls plus tool rounds in one run.
+    /// Model calls plus tool rounds in one run. When it is reached the model is asked, once more and without tools,
+    /// to say what it found and what is missing; the run then ends as a partial answer.
     pub max_steps: u32,
+    /// Tool calls one model reply may carry. The rest are not run, and the model is told so.
+    pub max_calls_per_reply: u32,
+    /// Tool calls one whole run may make, counting the ones the policy refused. Held by the gate, not by the model.
+    pub max_tool_calls: u32,
+    /// The context a model is run with (`docs/misty/DESIGN.md`: 8192). A prompt that would not fit has its oldest tool
+    /// results, then its oldest turns, replaced by a note.
+    pub context_tokens: u32,
     /// Output tokens per model call.
     pub max_tokens: u32,
     pub run_timeout_s: u64,
@@ -87,6 +99,9 @@ impl Default for Config {
             roots: vec![],
             policy: PolicySet::default(),
             max_steps: 8,
+            max_calls_per_reply: 4,
+            max_tool_calls: 16,
+            context_tokens: 8192,
             max_tokens: 2048,
             run_timeout_s: 900,
             approval_timeout_s: 300,
@@ -154,6 +169,21 @@ impl Config {
         if self.rag_top_k == 0 || self.rag_top_k > 50 {
             return Err("rag_top_k must be 1 to 50".into());
         }
+        if self.max_calls_per_reply == 0 || self.max_calls_per_reply > 32 {
+            return Err("max_calls_per_reply must be 1 to 32".into());
+        }
+        if self.max_tool_calls == 0 || self.max_tool_calls > 256 {
+            return Err("max_tool_calls must be 1 to 256".into());
+        }
+        if self.context_tokens < 1024 {
+            return Err("context_tokens must be at least 1024".into());
+        }
+        // a typo would leave the tool on its class's policy, which may be looser than the owner meant
+        for name in self.policy.tools.keys() {
+            if super::toolbox::find(name).is_none() {
+                return Err(format!("policy.tools: there is no tool named {name}"));
+            }
+        }
         Ok(())
     }
 }
@@ -199,5 +229,50 @@ mod tests {
         assert!(c.check().is_err());
         c.max_steps = 4;
         assert!(c.check().is_ok());
+        // the new limits, and a policy for a tool that does not exist (a typo that would silently do nothing)
+        for bad in [
+            Config {
+                max_calls_per_reply: 0,
+                ..Default::default()
+            },
+            Config {
+                max_tool_calls: 0,
+                ..Default::default()
+            },
+            Config {
+                context_tokens: 100,
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.check().is_err());
+        }
+        c.policy.tools.insert("fs_wirte".into(), Policy::Auto);
+        assert!(c.check().unwrap_err().contains("fs_wirte"));
+        c.policy.tools.clear();
+        c.policy.tools.insert("fs_write".into(), Policy::Auto);
+        assert!(c.check().is_ok());
+    }
+
+    #[test]
+    fn a_tool_can_have_a_policy_of_its_own_that_wins_over_its_class() {
+        let mut p = PolicySet::default();
+        let (read, write) = (
+            crate::misty::toolbox::find("fs_read").unwrap(),
+            crate::misty::toolbox::find("fs_write").unwrap(),
+        );
+        assert_eq!((read.policy(&p), write.policy(&p)), (Policy::Auto, Policy::Ask));
+        p.tools.insert("fs_read".into(), Policy::Ask);
+        p.tools.insert("fs_write".into(), Policy::Deny);
+        assert_eq!((read.policy(&p), write.policy(&p)), (Policy::Ask, Policy::Deny));
+        // a tool with no entry keeps its class
+        assert_eq!(crate::misty::toolbox::find("fs_list").unwrap().policy(&p), Policy::Auto);
+        // the entries are saved and come back; an empty map is not written
+        let d = crate::testing::TestDir::new("misty-cfg3");
+        let mut c = Config::default();
+        c.save(&d).unwrap();
+        assert!(!std::fs::read_to_string(Config::path(&d)).unwrap().contains("tools"));
+        c.policy = p.clone();
+        c.save(&d).unwrap();
+        assert_eq!(Config::load(&d).unwrap().policy, p);
     }
 }

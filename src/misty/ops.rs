@@ -343,7 +343,7 @@ fn environment_from(a: &Value, mut e: Environment) -> Res<Environment> {
     if let Some(p) = a.get("policy") {
         e.policy = serde_json::from_value(p.clone()).map_err(|x| {
             Fail::invalid(format!(
-                "policy: {x} (the classes are read, write, exec, net, hub; each auto, ask or deny)"
+                "policy: {x} (the classes are read, write, exec, net, hub; each auto, ask or deny; tools: a tool's name to auto, ask or deny)"
             ))
         })?;
     }
@@ -352,7 +352,7 @@ fn environment_from(a: &Value, mut e: Environment) -> Res<Environment> {
 
 fn outcome(o: &agent::Outcome) -> Value {
     json!({"run": o.run, "status": o.status, "text": o.text, "role": o.role, "citations": o.citations, "usage": o.usage,
-           "session": o.session, "ms": o.ms, "error": o.error})
+           "session": o.session, "ms": o.ms, "error": o.error, "partial": o.partial})
 }
 
 fn ctx_of(hub: &Hub, misty: &Arc<Misty>) -> Ctx {
@@ -661,7 +661,7 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
             }
         }
         "misty.tools.list" => {
-            json!({"tools": toolbox::specs().iter().map(|t| json!({"name": t.name, "class": t.class, "policy": t.class.policy(&cfg.policy),
+            json!({"tools": toolbox::specs().iter().map(|t| json!({"name": t.name, "class": t.class, "policy": t.policy(&cfg.policy),
                                       "description": t.description, "parameters": t.parameters})).collect::<Vec<_>>(), "policy": cfg.policy})
         }
         "misty.config.get" => json!({"config": cfg, "path": Config::path(&misty.dir)}),
