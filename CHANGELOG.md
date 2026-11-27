@@ -2,10 +2,22 @@
 
 ## Unreleased
 
+### Approval queue: a peer key asks, the owner approves
+
+- A peer key cannot load a model, but it can ask. `POST /v1/requests` with `{"model", "reason"}` queues a request and answers
+  `202`; nothing loads. A key that asks again for a model it already waits for gets the same request, and at most 20 requests
+  wait per key. The peer MCP session has `model_request` and `request_status` (`GET /v1/requests/:id`, the key's own requests only).
+- The owner lists the queue with `request.list` (pending by default). `request.approve` loads the model, as `model.load` does; if
+  the load fails, the request stays pending and the error says why. `request.deny` refuses, with a reason the key can read. A
+  decided request cannot be decided again, so a denied request never loads its model.
+- The queue is kept in `<home>/requests.json`: every pending request and the newest 200 decided ones (`src/requests.rs`).
+- Not done: an approval page in `/ui` and a badge for pending requests. Not run: a real approve that loads a model (the tests
+  cover the queue, the refusals and the denied-then-approve path, which never loads).
+
 ### MCP: a core tool profile
 
-- The owner's MCP session (`model-mistress mcp`) offers nine core tools: `service_status`, `model_list`, `model_loaded`,
-  `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete` and `logs_tail`. Before, it offered every hub
+- The owner's MCP session (`model-mistress mcp`) offers twelve core tools: `service_status`, `model_list`, `model_loaded`,
+  `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete`, `logs_tail` and the approval queue (`request.list`, `request.approve`, `request.deny`). Before, it offered every hub
   operation (about 94), which cost an agent context on every turn. A tool outside the set is refused as a tool that does not
   exist.
 - `model-mistress mcp --all-tools` offers every operation again: downloads (`model_search`, `model_pull`), deletes, settings,

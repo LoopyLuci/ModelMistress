@@ -2,7 +2,8 @@
 
 Claude can use the models ModelMistress serves on this machine through its MCP server. By default the server offers the
 core tools (`model_list`, `model_info`, `model_loaded`, `model_plan`, `model_load`, `model_unload`, `chat_complete`,
-`service_status`, `logs_tail`). `model-mistress mcp --all-tools` offers every hub operation as a tool: downloads, deletes,
+`service_status`, `logs_tail`, and the approval queue: `request_list`, `request_approve`, `request_deny`).
+`model-mistress mcp --all-tools` offers every hub operation as a tool: downloads, deletes,
 settings, Misty and the fabric. The Claude Code plugin adds slash commands on top.
 
 Both need the `model-mistress` program on the PATH. Build it with `cargo build --release -p model-mistress --features
@@ -37,7 +38,7 @@ To keep it to your own machine instead, leave out `--scope project` (the default
 ## Scoped access: list and chat only
 
 An agent that should not load, unload or change anything can use a peer key instead of the owner's token. Create the key
-once, then start the server with `--peer`; it exposes two tools, `models_list` and `chat_complete`:
+once, then start the server with `--peer`; it exposes four tools, `models_list`, `chat_complete`, `model_request` and `request_status`:
 
 ```bash
 model-mistress keys create claude-code --requests-per-min 60

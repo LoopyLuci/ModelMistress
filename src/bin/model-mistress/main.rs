@@ -250,7 +250,8 @@ enum Cmd {
         /// Start a hub for this home when none answers.
         #[arg(long)]
         start: bool,
-        /// Serve only the model routes, with a peer key from MODELMISTRESS_KEY: `models_list` and `chat_complete`.
+        /// Serve only the model routes, with a peer key from MODELMISTRESS_KEY: `models_list`, `chat_complete`, `model_request`
+        /// and `request_status`.
         #[arg(long)]
         peer: bool,
         /// Offer every operation the hub lists (downloads, deletes, settings, Misty, the fabric), not the core tools.

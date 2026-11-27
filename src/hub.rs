@@ -62,6 +62,8 @@ pub struct Hub {
     pub stop: Arc<tokio::sync::Notify>,
     /// The peer keys (see `hosting`).
     pub keys: Arc<Keys>,
+    /// The loads that peer keys asked for, waiting for the owner (see `requests`).
+    pub requests: Arc<crate::requests::Queue>,
     /// Misty, the agent (src/misty), opened on first use.
     pub misty: Arc<parking_lot::Mutex<Option<Arc<crate::misty::Misty>>>>,
 }
@@ -69,6 +71,7 @@ pub struct Hub {
 impl Hub {
     pub fn new(engine: Arc<Engine>, token: String) -> Self {
         let keys = Keys::open(&engine.home);
+        let requests = Arc::new(crate::requests::Queue::open(&engine.home));
         Self {
             engine,
             jobs: Arc::new(Default::default()),
@@ -76,6 +79,7 @@ impl Hub {
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys,
+            requests,
             misty: Default::default(),
         }
     }
@@ -141,7 +145,9 @@ fn peer_route(path: &str) -> bool {
             | "/v1/vision/classify"
             | "/v1/vision/detect"
             | "/v1/vision/embed"
+            | "/v1/requests"
     ) || path.starts_with("/v1/images/files/")
+        || path.starts_with("/v1/requests/")
 }
 
 /// The owner's token is accepted from this machine only. (No address known, as in tests that call the router
@@ -371,6 +377,30 @@ fn core_operations() -> Vec<Value> {
             false,
             load_props,
             &["model"],
+        ),
+        op(
+            "request.list",
+            "The loads that peer keys asked for: the pending ones unless state says otherwise (pending, approved, denied or all)",
+            false,
+            false,
+            json!({"state": {"type": "string", "enum": ["pending", "approved", "denied", "all"]}}),
+            &[],
+        ),
+        op(
+            "request.approve",
+            "Approve a request a peer key made: loads the model now. If the load fails, the request stays pending and the error says why",
+            true,
+            false,
+            json!({"id": {"type": "integer", "minimum": 1}}),
+            &["id"],
+        ),
+        op(
+            "request.deny",
+            "Deny a request a peer key made. The reason is shown to the key",
+            true,
+            false,
+            json!({"id": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}}),
+            &["id"],
         ),
         op(
             "model.unload",
@@ -886,6 +916,47 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         "model.show" => crate::ollama_api::show(hub, s(a, "model")?)?,
         "model.create" => crate::ollama_api::create(hub, a)?,
         "model.copy" => crate::ollama_api::copy(hub, s(a, "source")?, s(a, "destination")?)?,
+        "request.list" => {
+            let state = crate::requests::RequestState::filter(a["state"].as_str().unwrap_or("pending"))?;
+            let pending = hub.requests.list(Some(crate::requests::RequestState::Pending)).len();
+            json!({"requests": hub.requests.list(state), "pending": pending})
+        }
+        "request.approve" => {
+            let id = a["id"]
+                .as_u64()
+                .ok_or_else(|| Fail::invalid("request.approve needs \"id\": the request's number"))?;
+            let asked = hub
+                .requests
+                .get(id)
+                .ok_or_else(|| Fail::not_found(format!("no request {id} (request.list shows them)")))?;
+            // Checked before the load: a request already denied must not load its model.
+            if asked.state != crate::requests::RequestState::Pending {
+                return Err(Fail::new(409, "not_pending", format!("request {id} is not pending")).into());
+            }
+            let m = llama_entry(hub, &asked.model)?;
+            let opts: LoadOpts = serde_json::from_value(json!({})).map_err(|x| Fail::invalid(x.to_string()))?;
+            let t0 = Instant::now();
+            let inst = e.ensure_loaded(&m, &opts, true).await?;
+            let decided = hub.requests.decide(
+                id,
+                crate::requests::RequestState::Approved,
+                "loaded",
+                chrono::Utc::now().timestamp(),
+            )?;
+            json!({"request": decided, "loaded": inst.describe(), "load_ms": t0.elapsed().as_millis() as u64})
+        }
+        "request.deny" => {
+            let id = a["id"]
+                .as_u64()
+                .ok_or_else(|| Fail::invalid("request.deny needs \"id\": the request's number"))?;
+            let decided = hub.requests.decide(
+                id,
+                crate::requests::RequestState::Denied,
+                a["reason"].as_str().unwrap_or(""),
+                chrono::Utc::now().timestamp(),
+            )?;
+            json!({"request": decided})
+        }
         "model.load" => {
             let m = llama_entry(hub, s(a, "model")?)?;
             let mut args = a.clone();
@@ -1651,6 +1722,46 @@ async fn call_op(State(hub): State<Hub>, Path(id): Path<String>, body: Option<Js
     Ok(Json(json!({"result": call(&hub, &id, &args).await?})))
 }
 
+/// `POST /v1/requests` (peer keys): ask the owner to load a model the key may use. Nothing loads until the owner approves.
+async fn peer_request(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    body: Option<Json<Value>>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Some(key) = who.0 else {
+        return Err(Fail::invalid("the owner loads a model with model.load; a request is for a peer key").into());
+    };
+    let args = body.map(|Json(v)| v).unwrap_or(json!({}));
+    let model = args["model"].as_str().unwrap_or("").trim().to_string();
+    if model.is_empty() {
+        return Err(Fail::invalid("the body needs \"model\": the name of a model").into());
+    }
+    if !key.allows(&model, &model) {
+        return Err(Fail::new(403, "model_not_allowed", format!("this key may not use {model}")).into());
+    }
+    llama_entry(&hub, &model)?;
+    let now = chrono::Utc::now().timestamp();
+    let request = hub
+        .requests
+        .ask(&key.peer, &model, args["reason"].as_str().unwrap_or(""), now)?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"request": request}))))
+}
+
+/// `GET /v1/requests/:id` (peer keys): the answer to a request this key made.
+async fn peer_request_status(
+    State(hub): State<Hub>,
+    Extension(who): Extension<Caller>,
+    Path(id): Path<u64>,
+) -> ApiResult<Json<Value>> {
+    let Some(key) = who.0 else {
+        return Err(Fail::invalid("a request is for a peer key").into());
+    };
+    match hub.requests.get(id) {
+        Some(request) if request.peer == key.peer => Ok(Json(json!({"request": request}))),
+        _ => Err(Fail::not_found(format!("no request {id} from this key")).into()),
+    }
+}
+
 async fn stop(State(hub): State<Hub>) -> Json<Value> {
     hub.stop.notify_one();
     Json(json!({"result": {"stopping": true}}))
@@ -2260,6 +2371,8 @@ pub fn router(hub: Hub) -> Router {
     let private = Router::new()
         .route("/v1/operations", get(list_ops))
         .route("/v1/call/:op", post(call_op))
+        .route("/v1/requests", post(peer_request))
+        .route("/v1/requests/:id", get(peer_request_status))
         .route("/v1/service/stop", post(stop))
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(chat))
@@ -2448,6 +2561,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
             misty: Default::default(),
         }
     }
@@ -2656,6 +2770,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
             misty: Default::default(),
         }
     }
@@ -3289,6 +3404,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
             misty: Default::default(),
         };
         let id = std::path::Path::new(&model)
@@ -3345,6 +3461,7 @@ unrelated line
             started: Instant::now(),
             stop: Arc::new(tokio::sync::Notify::new()),
             keys: Keys::in_memory(),
+            requests: Default::default(),
             misty: Default::default(),
         }
     }
