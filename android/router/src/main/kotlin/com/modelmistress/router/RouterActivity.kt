@@ -14,11 +14,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.modelmistress.runtime.ApprovalsPanel
 import com.modelmistress.runtime.ModelRuntime
 import com.modelmistress.runtime.ModelsPanel
 import com.modelmistress.runtime.ServerPanel
 
-/** The headless build's only screen: start the server, keep the models, and nothing else. */
+/**
+ * The router's screen: the server, the requests other apps wait on for the owner, and the models with Misty, the benchmark and
+ * the desktops. Other apps reach the same features through the server, not through this screen.
+ */
 class RouterActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,10 +35,13 @@ class RouterActivity : ComponentActivity() {
                 ) {
                     Text("ModelMistress Router", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "Serves the models on this device to other apps through an OpenAI-compatible API.",
+                        "Serves the models on this device to other apps: an OpenAI-compatible API, and the router API for " +
+                            "chats, Misty, sandboxes, ratings and the rest.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     ServerPanel(runtime)
+                    HorizontalDivider()
+                    ApprovalsPanel(runtime)
                     HorizontalDivider()
                     Text("Models", style = MaterialTheme.typography.titleMedium)
                     ModelsPanel(runtime)

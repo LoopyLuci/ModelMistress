@@ -25,6 +25,9 @@ class EngineHub(
     private val cacheDirectory: File,
 ) : ModelCatalog {
     private val lock = Any()
+
+    /** Read without the lock, so a status request does not wait for a reply that is running. */
+    @Volatile
     private var loaded: Loaded? = null
 
     private class Loaded(val id: String, val engine: LocalEngine)
@@ -56,6 +59,19 @@ class EngineHub(
         synchronized(lock) {
             loaded?.engine?.close()
             loaded = null
+        }
+    }
+
+    /** The id of the model that is loaded now, or null when none is. */
+    fun loadedModelId(): String? = loaded?.id
+
+    /** Unloads [modelId] when it is the loaded one, so a model removed from the device is not kept in memory. */
+    fun unloadModel(modelId: String) {
+        synchronized(lock) {
+            if (loaded?.id == modelId) {
+                loaded?.engine?.close()
+                loaded = null
+            }
         }
     }
 

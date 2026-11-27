@@ -24,6 +24,7 @@ data class DownloadState(
     val done: Long = 0L,
     val total: Long = 0L,
     val message: String? = null,
+    val repo: String? = null,
 )
 
 /**
@@ -53,11 +54,19 @@ class ModelDownloads(private val library: ModelLibrary, private val settings: Ru
                 phase = DownloadPhase.FAILED,
                 file = file.name,
                 message = "${library.targetFor(stem).nameWithoutExtension} is already in the library.",
+                repo = spec.repo,
             )
             return true
         }
         stopRequested = false
-        state.value = DownloadState(DownloadPhase.DOWNLOADING, file.name, 0L, file.sizeBytes, "Starting the download.")
+        state.value = DownloadState(
+            DownloadPhase.DOWNLOADING,
+            file.name,
+            0L,
+            file.sizeBytes,
+            "Starting the download.",
+            repo = spec.repo,
+        )
         scope.launch {
             try {
                 val partial = library.partialFor(stem)
@@ -85,6 +94,7 @@ class ModelDownloads(private val library: ModelLibrary, private val settings: Ru
                     done = file.sizeBytes,
                     total = file.sizeBytes,
                     message = "Installed ${model.id}.",
+                    repo = spec.repo,
                 )
             } catch (stopped: DownloadStopped) {
                 state.update { it.copy(phase = DownloadPhase.STOPPED, message = stopped.message) }

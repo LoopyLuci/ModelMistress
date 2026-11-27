@@ -14,5 +14,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Other apps on this phone pair with the router here: the owner sees who asks and allows or denies it. -->
+        <activity
+            android:name="com.modelmistress.router.PairActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.modelmistress.router.action.PAIR" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

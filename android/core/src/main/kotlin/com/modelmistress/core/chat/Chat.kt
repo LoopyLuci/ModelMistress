@@ -70,11 +70,24 @@ data class GenerationOptions(
     }
 }
 
+/**
+ * The router's own options, from the request's `mm` object. A client that does not know them leaves them out and gets a plain
+ * chat. [chatId] keeps the conversation and its sandbox; [sandboxId] names a sandbox for it. [toolsAllowed] null means the
+ * default: tools are offered to chats and to Misty, and not to a plain request. False turns every tool off for the request, and
+ * true offers them to a plain request. Neither can turn on a tool the owner has off.
+ */
+data class MmOptions(
+    val chatId: String? = null,
+    val sandboxId: String? = null,
+    val toolsAllowed: Boolean? = null,
+)
+
 data class ChatRequest(
     val model: String?,
     val messages: List<ChatMessage>,
     val stream: Boolean,
     val options: GenerationOptions,
+    val mm: MmOptions = MmOptions(),
 )
 
 /** A model the device can answer with. [contextTokens] is null when the file does not say. */

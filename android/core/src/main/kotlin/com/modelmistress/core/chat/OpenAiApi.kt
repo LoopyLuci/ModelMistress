@@ -23,7 +23,12 @@ object OpenAi {
         }
         val fields = root as? Map<*, *> ?: throw invalid("The request body must be a JSON object.")
         if (fields.containsKey("tools") || fields.containsKey("functions")) {
-            throw ApiException(400, "tools_unsupported", "Tool calls are not available on this device.")
+            throw ApiException(
+                400,
+                "tools_unsupported",
+                "Tool definitions are not accepted. The device offers its own tools: send model 'misty' or a chat, " +
+                    "or set mm.tools to false to turn them off.",
+            )
         }
         if (fields["n"]?.let { it != 1L } == true) {
             throw ApiException(400, "unsupported_parameter", "Only n = 1 is supported.")
@@ -46,12 +51,37 @@ object OpenAi {
             messages = messages(fields["messages"]),
             stream = stream,
             options = GenerationOptions(maxTokens, temperature, topP, topK, seed),
+            mm = mmOptions(fields["mm"]),
         )
     }
 
-    fun completion(id: String, model: String, created: Long, text: String, stats: GenerationStats): String =
+    private fun mmOptions(value: Any?): MmOptions {
+        if (value == null) return MmOptions()
+        val fields = value as? Map<*, *> ?: throw invalid("mm must be an object.")
+        val chat = fields["chat"]?.let { it as? String ?: throw invalid("mm.chat must be a string.") }
+        val sandbox = fields["sandbox"]?.let { it as? String ?: throw invalid("mm.sandbox must be a string.") }
+        val tools = when (val value = fields["tools"]) {
+            null -> null
+            is Boolean -> value
+            else -> throw invalid("mm.tools must be true or false.")
+        }
+        return MmOptions(chatId = chat, sandboxId = sandbox, toolsAllowed = tools)
+    }
+
+    /**
+     * One reply as a single JSON object. [extra] is added at the top level, under the router's own keys; a standard client ignores
+     * keys it does not know.
+     */
+    fun completion(
+        id: String,
+        model: String,
+        created: Long,
+        text: String,
+        stats: GenerationStats,
+        extra: Map<String, Any?> = emptyMap(),
+    ): String =
         Json.write(
-            mapOf(
+            linkedMapOf<String, Any?>(
                 "id" to id,
                 "object" to "chat.completion",
                 "created" to created,
@@ -64,7 +94,7 @@ object OpenAi {
                     ),
                 ),
                 "usage" to usage(stats),
-            ),
+            ).apply { putAll(extra) },
         )
 
     /** One streamed chunk. [delta] is the part of the reply it carries; [finishReason] is set on the last chunk. */

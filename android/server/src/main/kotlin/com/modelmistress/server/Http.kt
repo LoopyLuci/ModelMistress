@@ -15,6 +15,8 @@ class HttpRequest(
     val path: String,
     private val headers: Map<String, String>,
     val body: ByteArray,
+    /** The part of the address after '?', as sent. Empty when there is none. */
+    val query: String = "",
 ) {
     /** A header by name, matched without regard to case. */
     fun header(name: String): String? = headers[name.lowercase(Locale.ROOT)]
@@ -53,7 +55,13 @@ object HttpReader {
             }
             readExactly(input, length)
         }
-        return HttpRequest(requestLine[0], requestLine[1].substringBefore('?'), headers, body)
+        return HttpRequest(
+            method = requestLine[0],
+            path = requestLine[1].substringBefore('?'),
+            headers = headers,
+            body = body,
+            query = requestLine[1].substringAfter('?', ""),
+        )
     }
 
     private fun readHead(input: InputStream): String {
