@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Media: an ffmpeg component, video and audio in chat
+### Media: video and audio in chat, an ffmpeg component, speech to text on any container
 
 - ffmpeg is a setup component, not a download that happens by itself. `media.components` (and `GET /v1/media/components`)
   says where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, `MM_FFMPEG_DIR`, `<home>/engines/ffmpeg/`, then PATH), their
@@ -32,6 +32,33 @@
 - `media.probe` (and `POST /v1/media/probe`, JSON `{"file"}` or a multipart upload up to 512 MB): what ffprobe says about a
   file, as the container (format, duration, size, bit rate) and every video, audio and subtitle stream (codec, size, frame
   rate, rotation, sample rate, channels, language, cover art). Owner only; ffprobe gets `-protocol_whitelist file`.
+- Speech to text reads any container. `/v1/audio/transcriptions`, `/v1/audio/translations` and `speech.transcribe` keep
+  reading WAV and MP3 themselves; any other audio or video file goes through ffmpeg when it is installed (the first audio
+  stream, 16 kHz mono), and `speech.transcribe` leaves a file named by path on disk for ffmpeg (a long recording is not held
+  in memory). Only plain audio and video containers are decoded (not playlists, `concat`, image sequences, devices or raw
+  streams), ffmpeg gets only the `file` protocol, at most 4 hours are decoded, and every process has a time limit. Without
+  ffmpeg the answer says how to get it (`501` for a path; the usual `400` for an upload).
+- New response format `ass` (Advanced SubStation Alpha) and word times: `timestamp_granularities[]=word` on the OpenAI
+  route, `words: true` / `--words` on `speech.transcribe` / `model-mistress transcribe`. `verbose_json` then has OpenAI's
+  top-level `words`; `ass` writes each word as a karaoke tag. The times are whisper.cpp's token times grouped into words:
+  estimates, good to a fraction of a second.
+- Cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend; implies `whisper`); `media.components` and
+  `speech::BUILD` say which build runs (`vulkan`, `cpu`, `none`). The Vulkan build of whisper-rs-sys fails when the build
+  path is long: use a short `CARGO_TARGET_DIR`.
+- Measured before this was built (the media plan's spikes, not repeated with this code): a 74 s screen recording of a meeting
+  was answered correctly (5 of 5 questions) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's native video
+  input, at about one second of compute per second of video; whisper.cpp through whisper-rs 0.16 with Vulkan ran 59.8 times
+  real time against 0.9 on the CPU on the RX 7900 XTX.
+- Run for this change: `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
+  fails in this worktree because its PDF fixture was checked out with Windows line endings, which breaks the file's byte
+  offsets; the file is not touched here and `*.pdf` is not marked binary in `.gitattributes`), `rustfmt`, and clippy with
+  `-D warnings` on this change's files (three other lints, in `misty/ops.rs`, `batch.rs` and `misty/agent.rs`, come from the
+  newer toolchain and are not touched). The tests use stand-in ffmpeg, ffprobe and llama-server programs (the install from a stored
+  zip with a right and a wrong hash, a swapped file, the listings, the chat path through a stand-in server that records what
+  it was sent, a peer's request left alone, the ass and words formats). Not run: a real ffmpeg (none is pinned, nothing was
+  downloaded), a real video through a real model with this code, `--features whisper` on the new paths against a real
+  model (it compiles; the test binary does not link on this machine, with unresolved `__std_rotate` and two more
+  symbols from the C++ runtime, so those tests did not run), `--features whisper-vulkan` at all (not built here), the new routes with a browser or a real client.
 
 ### System awareness: the hub watches the PC and yields to it, live
 

@@ -14,7 +14,7 @@
 //!   POST /v1/completions            OpenAI
 //!   POST /v1/embeddings             OpenAI (a model loaded for it: autoloaded, or load with embeddings: true)
 //!   POST /v1/rerank, /rerank        Jina/llama-server style reranking (a reranker model; reranking: true)
-//!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV or MP3), whisper.cpp (feature `whisper`)
+//!   POST /v1/audio/transcriptions   OpenAI speech to text (multipart; WAV, MP3, else through ffmpeg), whisper.cpp (feature `whisper`)
 //!   POST /v1/audio/translations     the same, into English
 //!   POST /v1/audio/speech           OpenAI text to speech (JSON in, WAV or raw PCM out), llama.cpp's llama-tts
 //!   POST /v1/images/generations     OpenAI image generation (PNG as b64_json or a url), stable-diffusion.cpp's sd-cli
@@ -595,16 +595,17 @@ fn core_operations() -> Vec<Value> {
         ),
         op(
             "speech.transcribe",
-            "Speech to text with the built-in whisper.cpp: transcribe (or translate to English) an audio file (WAV or MP3) on the hub's machine",
+            "Speech to text with the built-in whisper.cpp: transcribe (or translate to English) an audio or video file on the hub's machine. WAV and MP3 are read by the hub; any other container (MP4, MKV, M4A, Ogg, FLAC, WebM ...) is read through ffmpeg once it is installed (media.install)",
             false,
             false,
             json!({
-                "file": {"type": "string", "description": "path of the audio file"},
+                "file": {"type": "string", "description": "path of the audio or video file"},
                 "model": {"type": "string", "description": "whisper model, e.g. base.en (default: whisper_model setting)"},
                 "language": {"type": "string", "description": "ISO-639-1 code; default: detected"},
                 "prompt": {"type": "string", "description": "text that guides the style or spelling"},
                 "translate": {"type": "boolean", "description": "translate to English instead of transcribing"},
-                "format": {"type": "string", "description": "json, text, verbose_json, srt or vtt; the answer's `rendered` is in it"}
+                "words": {"type": "boolean", "description": "time every word: the answer has a `words` list, and the ass format lights each word as it is spoken"},
+                "format": {"type": "string", "description": "json, text, verbose_json, srt, vtt or ass; the answer's `rendered` is in it"}
             }),
             &["file"],
         ),
@@ -1192,7 +1193,25 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
         }
         "speech.transcribe" => {
             let path = s(a, "file")?;
-            let file = std::fs::read(path).map_err(|x| Fail::invalid(format!("{path}: {x}")))?;
+            // WAV and MP3 are read here; any other container stays on disk for ffmpeg, which reads it where it is (a
+            // recording of hours is not held in memory)
+            let (file, ffmpeg_reads) = {
+                let p = path.to_string();
+                tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<std::path::PathBuf>), Fail> {
+                    use std::io::Read;
+                    let mut head = [0u8; 16];
+                    let n = std::fs::File::open(&p)
+                        .and_then(|mut f| f.read(&mut head))
+                        .map_err(|x| Fail::invalid(format!("{p}: {x}")))?;
+                    if audio::is_native(&head[..n], &p) {
+                        Ok((std::fs::read(&p).map_err(|x| Fail::invalid(format!("{p}: {x}")))?, None))
+                    } else {
+                        Ok((Vec::new(), Some(std::path::PathBuf::from(&p))))
+                    }
+                })
+                .await
+                .map_err(|x| Fail::new(500, "io", x.to_string()))??
+            };
             let opt = |k: &str| {
                 a.get(k)
                     .and_then(Value::as_str)
@@ -1201,6 +1220,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             };
             let req = audio::Request {
                 file,
+                words: a.get("words").and_then(Value::as_bool).unwrap_or(false),
+                path: ffmpeg_reads,
                 filename: path.to_string(),
                 model: opt("model").unwrap_or_default(),
                 language: opt("language").map(|l| l.to_lowercase()),
@@ -2435,9 +2456,23 @@ async fn run_speech(hub: &Hub, req: audio::Request, translate: bool) -> ApiResul
     let (dirs, preferred) = (hub.engine.whisper_dirs(), hub.engine.settings().whisper_model);
     let model = speech::find_model(&dirs, &req.model, preferred.as_deref())?;
     let name = speech::model_name(&model).unwrap_or_else(|| "whisper".into());
+    // ffmpeg reads what the hub cannot (any container); WAV and MP3 never need it
+    let ffmpeg = hub.engine.ffmpeg().await;
+    if let (Some(path), Err(why)) = (&req.path, &ffmpeg) {
+        return Err(Fail::new(
+            501,
+            "not_implemented",
+            format!(
+                "{} is not a WAV or MP3 file, and reading it needs ffmpeg: {why}",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    let tmp = crate::media::serve::media_dir(&hub.engine.home).join("tmp");
     let t0 = Instant::now();
     let out = tokio::task::spawn_blocking(move || -> Result<audio::Transcript, Fail> {
-        let samples = audio::decode(&req.file, &req.filename).map_err(Fail::invalid)?;
+        let samples = crate::media::decode::decode_any(&ffmpeg, &req, &tmp).map_err(Fail::invalid)?;
         speech::transcribe(&model, &samples, &req, translate)
     })
     .await
@@ -2789,7 +2824,16 @@ unrelated line
     #[tokio::test]
     async fn bad_speech_requests_get_clear_errors() {
         let home = temp_home();
-        let h = hub(&home);
+        let mut h = hub(&home);
+        // no ffmpeg (an empty folder is named, so PATH is not searched): what the hub cannot read itself is refused
+        std::fs::create_dir_all(home.join("no-ffmpeg")).unwrap();
+        h.engine = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ffmpeg_dir: Some(home.join("no-ffmpeg")),
+                ..Default::default()
+            },
+        );
         let t = "/v1/audio/transcriptions";
         let (st, _, text) = post(&h, t, "application/json", b"{}".to_vec()).await;
         assert_eq!((st.as_u16(), text.contains("multipart")), (400, true), "{text}");
@@ -2812,7 +2856,54 @@ unrelated line
         let ogg = form(&[("file", Some("a.ogg"), b"OggS....."), ("model", None, b"fake")]);
         let (st, _, text) = post(&h, t, MP, ogg).await;
         assert_eq!((st.as_u16(), text.contains("Ogg")), (400, true), "{text}");
+        assert!(text.contains("ffmpeg"), "the answer says ffmpeg would read it: {text}");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An MP4 is read through ffmpeg: the stand-in decodes it, and the (fake) model is what fails, not the audio.
+    #[cfg(feature = "whisper")]
+    #[tokio::test]
+    async fn an_mp4_is_decoded_by_ffmpeg_before_the_model_is_loaded() {
+        use crate::media::stub::{last_args, pair, Stub};
+        let home = temp_home();
+        let mut h = hub(&home);
+        let tools = pair(
+            &home.join("ff"),
+            &Stub {
+                configuration: "--disable-gpl",
+                probe_json: crate::media::probe::SAMPLE,
+                pcm: &[0.1; 16_000],
+            },
+        );
+        h.engine = Engine::new(
+            home.to_path_buf(),
+            Settings {
+                ffmpeg_dir: Some(tools.clone()),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(home.join("whisper")).unwrap();
+        std::fs::write(home.join("whisper").join("ggml-fake.bin"), b"not a model").unwrap();
+        let mp4 = form(&[
+            ("file", Some("meeting.mp4"), b"\0\0\0\x20ftypisom"),
+            ("model", None, b"fake"),
+            ("response_format", None, b"ass"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
+        let (st, _, text) = post(&h, "/v1/audio/transcriptions", MP, mp4).await;
+        assert_eq!(
+            st.as_u16(),
+            500,
+            "the audio was read; the fake model is what fails: {text}"
+        );
+        assert!(text.contains("model_error"), "{text}");
+        assert!(last_args(&tools, "args.log").contains("-map 0:a:0"));
+        // the operation names the file by path: ffmpeg reads it where it is
+        let clip = home.join("clip.mkv");
+        std::fs::write(&clip, b"x").unwrap();
+        let (code, v) = json_post(&h, "/v1/call/speech.transcribe", json!({"file": clip, "model": "fake"})).await;
+        assert_eq!(code, 500, "{v}");
+        assert!(last_args(&tools, "args.log").contains("clip.mkv"));
     }
 
     /// Needs a real whisper model and a short recording; see docs/speech.md. Run:

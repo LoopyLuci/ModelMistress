@@ -119,8 +119,10 @@ async fn components(hub: &Hub) -> Value {
         })
         .collect();
     let speech = json!({"id": "whisper", "what": "speech to text (whisper.cpp)", "built": crate::speech::AVAILABLE,
+                        "build": crate::speech::BUILD,
                         "models": crate::speech::list_models(&e.whisper_dirs()).into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
                         "note": (!crate::speech::AVAILABLE).then_some(crate::speech::NOT_BUILT)});
+    let installed = ff["installed"] == true;
     json!({
         "components": [ff, speech],
         "video_input": {"ready": video == caps::Video::Ready,
@@ -128,6 +130,8 @@ async fn components(hub: &Hub) -> Value {
                             caps::Video::NoFfmpeg => json!(ffmpeg::NOT_INSTALLED),
                             other => json!(other.note()),
                         }},
+        "any_container_transcription": {"ready": installed && crate::speech::AVAILABLE,
+                                        "why_not": if !installed { json!(ffmpeg::NOT_INSTALLED) } else if !crate::speech::AVAILABLE { json!(crate::speech::NOT_BUILT) } else { Value::Null }},
         "models_with_projector": models,
         "media_folder": super::serve::media_dir(&e.home),
     })

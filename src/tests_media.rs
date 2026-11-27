@@ -107,6 +107,7 @@ async fn the_components_say_what_is_missing_and_what_is_there() {
     );
     assert!(ff["problem"].as_str().unwrap().contains("ffmpeg_dir"), "{ff}");
     assert_eq!(r["video_input"]["ready"], false);
+    assert_eq!(r["any_container_transcription"]["ready"], false);
     assert_eq!(r["components"][1]["id"], "whisper");
     let seer = r["models_with_projector"]
         .as_array()

@@ -39,17 +39,26 @@ cannot translate or take another language. The most recently used model stays lo
 | `model` | a whisper model (see above) |
 | `language` | ISO-639-1 code such as `de`; default: detected (transcriptions only) |
 | `prompt` | text that guides spelling and style |
-| `response_format` | `json` (default), `text`, `verbose_json`, `srt`, `vtt` |
+| `response_format` | `json` (default), `text`, `verbose_json`, `srt`, `vtt`, `ass` |
 | `temperature` | 0 to 1, default 0 |
+| `timestamp_granularities[]` | `word` times every word (`segment` is always there) |
 
-`timestamp_granularities[]` is accepted and ignored (verbose_json always has segment timestamps). The answers match
-OpenAI's: `{"text": ...}`; plain text; `verbose_json` with `task`, `language` (English name), `duration`, `text` and
-`segments` (`id`, `seek`, `start`, `end`, `text`, `tokens`, `temperature`, `no_speech_prob`); SubRip; WebVTT.
+The answers match OpenAI's: `{"text": ...}`; plain text; `verbose_json` with `task`, `language` (English name),
+`duration`, `text` and `segments` (`id`, `seek`, `start`, `end`, `text`, `tokens`, `temperature`, `no_speech_prob`), and
+with `word` also OpenAI's top-level `words` (`word`, `start`, `end`); SubRip; WebVTT; and Advanced SubStation Alpha
+(`ass`; with `word` each word is a karaoke tag). Word times are whisper.cpp's token times grouped into words: estimates,
+good to a fraction of a second.
 
-Audio: WAV (PCM 8/16/24/32-bit, float 32/64-bit, any sample rate and channel count; converted to 16 kHz mono) and MP3.
-Other formats (Ogg, FLAC, M4A, WebM) are refused with a 400 that says so; convert them first, for example
-`ffmpeg -i in.m4a -ar 16000 -ac 1 out.wav`. Errors: `400` bad request or audio, `401` no token, `404` unknown model
-or no whisper model on the machine, `500` model could not be loaded, `501` built without `whisper`.
+Audio: WAV (PCM 8/16/24/32-bit, float 32/64-bit, any sample rate and channel count; converted to 16 kHz mono) and MP3 are
+read by the hub itself. Any other audio or video file (Ogg, FLAC, M4A, WebM, MP4, MKV ...) is read through **ffmpeg** when
+it is installed (`media.install`, [media.md](media.md)): the first audio stream is decoded to 16 kHz mono. Without ffmpeg
+such a file is refused with a 400 that says so and how to get ffmpeg (a file named by path in `speech.transcribe`: 501).
+Errors: `400` bad request or audio, `401` no token, `404` unknown model or no whisper model on the machine, `500` model
+could not be loaded, `501` built without `whisper`.
+
+A GPU build is the cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend): 59.8 times real time against 0.9 on the
+CPU for the same model, measured on the RX 7900 XTX. It needs the Vulkan SDK to build, and a short `CARGO_TARGET_DIR` (the
+Vulkan build of whisper-rs-sys fails when the build path is long). `media.components` says which build runs.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -F file=@talk.wav -F model=base.en \
@@ -59,11 +68,12 @@ curl -H "Authorization: Bearer $TOKEN" -F file=@talk.wav -F model=base.en \
 ## CLI and operation
 
 ```bash
-model-mistress transcribe talk.wav --model base.en [--language de] [--translate] [--format text|json|verbose_json|srt|vtt]
+model-mistress transcribe talk.wav --model base.en [--language de] [--translate] [--words] [--format text|json|verbose_json|srt|vtt|ass]
 ```
 
-It runs the operation `speech.transcribe` (file path on the hub's machine, same options), so MCP and `call` can use
-it too. The hub must be running.
+It runs the operation `speech.transcribe` (file path on the hub's machine, same options; `words: true` times every word),
+so MCP and `call` can use it too. The file may be a video: `model-mistress transcribe meeting.mp4 --format ass --words`
+(needs ffmpeg). The hub must be running.
 
 ## Tests
 

@@ -50,6 +50,27 @@ feeding live readings, Linux and macOS.
 chasing); see [privacy.md](privacy.md). Run in a scratch home with placeholder details: the install gates, tamper
 refusal, drafting and the send refusals; nothing downloaded or sent. Not run: the registry import, a real send, real replies.
 
+## Media: video and audio in chat, ffmpeg, speech on any container (2026-11-27)
+
+Phase 1 of the media plan ([media.md](media.md)). ffmpeg is a setup component the owner installs (`media.install`,
+`confirm: true`, the archive's SHA-256 checked before it is unpacked and every file's hash before it is used);
+`media.components` says what is there. A chat's `video_url`, `input_video` and `input_audio` parts reach llama-server,
+which is started with `--media-path` and `--video-ffmpeg-dir` for a model that has a projector; the owner's own requests
+may name a local file anywhere (linked or copied to `<home>/media/staged` and passed as `file://`), a peer's request is
+never rewritten. `model.list` and `/v1/models` list `input_modalities`. `media.probe` (ffprobe) is an operation and
+`POST /v1/media/probe`. `speech.transcribe` and the OpenAI routes read any container through ffmpeg and gain the `ass`
+format and word times; the Cargo feature `whisper-vulkan` builds whisper.cpp's Vulkan backend.
+
+Run: the library tests with stand-in ffmpeg, ffprobe and llama-server programs (807 tests, 800 pass, 6 ignored; the one
+failure, `documents::tests::a_pdf_gives_its_text`, is this worktree's checkout of the PDF fixture with Windows line endings,
+and the file is unchanged by this work). Measured earlier by the media plan's spikes, not repeated with this code: a 74 s
+screen recording answered correctly (5 of 5) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's video input
+at about one second of compute per second of video; whisper.cpp with Vulkan at 59.8 times real time against 0.9 on the CPU.
+Not run: a real ffmpeg (**no build is pinned**, `pin()` in `src/media/ffmpeg.rs` is empty and nothing was downloaded), a real
+video through a real model with this code, the new `whisper` paths (they compile with `--features whisper`; the test binary does not link on this machine,
+unresolved C++ runtime symbols), `whisper-vulkan` at all, the new
+routes from a browser or a real client.
+
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):

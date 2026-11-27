@@ -17,6 +17,8 @@ pub enum ResponseFormat {
     VerboseJson,
     Srt,
     Vtt,
+    /// Advanced SubStation Alpha subtitles (with word timing, karaoke-style, when the request asked for words).
+    Ass,
 }
 
 impl ResponseFormat {
@@ -27,9 +29,10 @@ impl ResponseFormat {
             "verbose_json" => Self::VerboseJson,
             "srt" => Self::Srt,
             "vtt" => Self::Vtt,
+            "ass" => Self::Ass,
             other => {
                 return Err(format!(
-                    "response_format \"{other}\" is not supported (json, text, verbose_json, srt, vtt)"
+                    "response_format \"{other}\" is not supported (json, text, verbose_json, srt, vtt, ass)"
                 ))
             }
         })
@@ -54,6 +57,11 @@ pub struct Request {
     pub prompt: Option<String>,
     pub format: ResponseFormat,
     pub temperature: f32,
+    /// Time every word (`timestamp_granularities[]=word`): `verbose_json` then has a `words` list, and `ass` times them.
+    pub words: bool,
+    /// A file on the hub's machine to be read by ffmpeg instead of `file` (which is then empty): the operation names big
+    /// recordings by path and does not read them into memory.
+    pub path: Option<std::path::PathBuf>,
 }
 
 struct Part {
@@ -181,6 +189,12 @@ pub fn parse_request(content_type: &str, body: &[u8]) -> Result<Request, String>
         }
         None => 0.0,
     };
+    // `timestamp_granularities[]` may be given more than once ("word", "segment")
+    let words = parts.iter().any(|p| {
+        p.filename.is_none()
+            && p.name.starts_with("timestamp_granularities")
+            && String::from_utf8_lossy(&p.data).trim().eq_ignore_ascii_case("word")
+    });
     Ok(Request {
         file: file.data.clone(),
         filename: file.filename.clone().unwrap_or_default(),
@@ -192,20 +206,35 @@ pub fn parse_request(content_type: &str, body: &[u8]) -> Result<Request, String>
             None => ResponseFormat::Json,
         },
         temperature,
+        words,
+        path: None,
     })
 }
 
 // ---- decoding ------------------------------------------------------------------------------------------------
 
-/// Uploaded audio to 16 kHz mono f32 samples. WAV (PCM 8/16/24/32-bit, float 32/64-bit, any rate and channel
-/// count) is read directly; MP3 needs the `whisper` feature (it brings the decoder). Everything else is a clear error.
-pub fn decode(bytes: &[u8], filename: &str) -> Result<Vec<f32>, String> {
-    let (mono, rate) = if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-        decode_wav(bytes)?
-    } else if bytes.starts_with(b"ID3")
+fn is_wav(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+}
+
+fn is_mp3(bytes: &[u8], filename: &str) -> bool {
+    bytes.starts_with(b"ID3")
         || (bytes.len() > 2 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0)
         || filename.to_lowercase().ends_with(".mp3")
-    {
+}
+
+/// Whether [`decode`] reads this file itself (WAV or MP3, judged by the first bytes and the name), with no ffmpeg.
+pub fn is_native(head: &[u8], filename: &str) -> bool {
+    is_wav(head) || is_mp3(head, filename)
+}
+
+/// Uploaded audio to 16 kHz mono f32 samples. WAV (PCM 8/16/24/32-bit, float 32/64-bit, any rate and channel
+/// count) is read directly; MP3 needs the `whisper` feature (it brings the decoder). Everything else is a clear error
+/// (`media::decode` reads any other container through ffmpeg).
+pub fn decode(bytes: &[u8], filename: &str) -> Result<Vec<f32>, String> {
+    let (mono, rate) = if is_wav(bytes) {
+        decode_wav(bytes)?
+    } else if is_mp3(bytes, filename) {
         decode_mp3(bytes)?
     } else {
         let kind = if bytes.starts_with(b"OggS") {
@@ -401,6 +430,41 @@ pub struct Segment {
     pub end: f64,
     pub text: String,
     pub no_speech_prob: f32,
+    /// Every word with its time; empty unless the request asked for words.
+    pub words: Vec<Word>,
+}
+
+/// One word of a segment, in seconds. whisper.cpp's token times are estimates: good to a fraction of a second.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Word {
+    pub start: f64,
+    pub end: f64,
+    pub word: String,
+}
+
+/// Words from a segment's tokens, each `(text, start, end)`. A token that opens with a space starts a word; one that
+/// does not (a word piece, a comma) belongs to the word before it. Special tokens (`[_BEG_]`, `<|endoftext|>`) and
+/// tokens of only spaces are left out.
+pub fn group_words(tokens: &[(String, f64, f64)]) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    for (text, start, end) in tokens {
+        if text.starts_with("[_") || text.starts_with("<|") || text.trim().is_empty() {
+            continue;
+        }
+        let piece = text.trim_start();
+        match words.last_mut() {
+            Some(w) if !text.starts_with(char::is_whitespace) => {
+                w.word.push_str(piece);
+                w.end = w.end.max(*end);
+            }
+            _ => words.push(Word {
+                start: *start,
+                end: (*end).max(*start),
+                word: piece.to_string(),
+            }),
+        }
+    }
+    words
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -456,11 +520,47 @@ impl Transcript {
                 }
                 out
             }
+            ResponseFormat::Ass => self.ass(),
         }
     }
 
+    /// Advanced SubStation Alpha subtitles. A segment with timed words is written as karaoke (`{\k<centiseconds>}`
+    /// before each word), so a player that knows the format lights each word as it is spoken.
+    fn ass(&self) -> String {
+        let mut out = String::from(
+            "[Script Info]\nTitle: ModelMistress transcript\nScriptType: v4.00+\nWrapStyle: 0\nPlayResX: 384\nPlayResY: 288\n\n\
+             [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, \
+             Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, \
+             MarginR, MarginV, Encoding\nStyle: Default,Arial,16,&H00FFFFFF,&H0000FFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,10,1\n\n\
+             [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+        );
+        for s in &self.segments {
+            let body = if s.words.is_empty() {
+                ass_text(s.text.trim())
+            } else {
+                let mut t = String::new();
+                for (i, w) in s.words.iter().enumerate() {
+                    // each word lasts until the next one starts, so the line adds up to the segment
+                    let until = s.words.get(i + 1).map_or(w.end, |n| n.start).max(w.start);
+                    let cs = (((until - w.start) * 100.0).round() as i64).max(1);
+                    if i > 0 {
+                        t.push(' ');
+                    }
+                    t += &format!("{{\\k{cs}}}{}", ass_text(&w.word));
+                }
+                t
+            };
+            out += &format!(
+                "Dialogue: 0,{},{},Default,,0,0,0,,{body}\n",
+                ass_time(s.start),
+                ass_time(s.end)
+            );
+        }
+        out
+    }
+
     pub fn verbose(&self) -> Value {
-        json!({
+        let mut v = json!({
             "task": self.task,
             "language": self.language,
             "duration": round3(self.duration),
@@ -469,8 +569,38 @@ impl Transcript {
                 "id": i, "seek": 0, "start": round3(s.start), "end": round3(s.end), "text": s.text,
                 "tokens": [], "temperature": self.temperature, "no_speech_prob": s.no_speech_prob,
             })).collect::<Vec<_>>(),
-        })
+        });
+        // OpenAI's shape for `timestamp_granularities[]=word`: one list for the whole recording
+        if self.segments.iter().any(|s| !s.words.is_empty()) {
+            v["words"] = json!(self
+                .segments
+                .iter()
+                .flat_map(|s| &s.words)
+                .map(|w| json!({"word": w.word, "start": round3(w.start), "end": round3(w.end)}))
+                .collect::<Vec<_>>());
+        }
+        v
     }
+}
+
+/// Text for an ASS dialogue line: a line break is `\N`, and braces (which open override codes) become parentheses.
+fn ass_text(s: &str) -> String {
+    s.replace("\r\n", "\\N")
+        .replace(['\n', '\r'], "\\N")
+        .replace('{', "(")
+        .replace('}', ")")
+}
+
+/// `H:MM:SS.cc` (ass: centiseconds, one digit of hours).
+pub fn ass_time(seconds: f64) -> String {
+    let cs = (seconds.max(0.0) * 100.0).round() as u64;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        cs / 360_000,
+        cs / 6000 % 60,
+        cs / 100 % 60,
+        cs % 100
+    )
 }
 
 fn round3(v: f64) -> f64 {
@@ -659,12 +789,14 @@ mod tests {
                     end: 3.5,
                     text: " Hello there.".into(),
                     no_speech_prob: 0.01,
+                    words: vec![],
                 },
                 Segment {
                     start: 3.5,
                     end: 3723.456,
                     text: " General Kenobi.".into(),
                     no_speech_prob: 0.02,
+                    words: vec![],
                 },
             ],
         }
@@ -693,6 +825,118 @@ mod tests {
         assert_eq!(v["segments"][1]["id"], 1);
         assert_eq!(v["segments"][1]["end"], 3723.456);
         assert_eq!(v["segments"][0]["text"], " Hello there.");
+    }
+
+    fn tokens(list: &[(&str, f64, f64)]) -> Vec<(String, f64, f64)> {
+        list.iter().map(|(t, a, b)| (t.to_string(), *a, *b)).collect()
+    }
+
+    #[test]
+    fn tokens_make_words_and_punctuation_sticks_to_the_word_before() {
+        let w = group_words(&tokens(&[
+            ("[_BEG_]", 0.0, 0.0),
+            (" Hel", 0.10, 0.30),
+            ("lo", 0.30, 0.52),
+            (",", 0.52, 0.55),
+            (" wor", 0.80, 1.0),
+            ("ld", 1.0, 1.2),
+            (".", 1.2, 1.2),
+            (" ", 1.2, 1.2),
+            ("<|endoftext|>", 1.2, 1.2),
+        ]));
+        let got: Vec<_> = w.iter().map(|w| (w.word.as_str(), w.start, w.end)).collect();
+        assert_eq!(got, [("Hello,", 0.10, 0.55), ("world.", 0.80, 1.2)]);
+        assert!(group_words(&[]).is_empty());
+        // a first token with no space still opens a word, and an end before a start is not negative
+        let w = group_words(&tokens(&[("Hi", 2.0, 1.0)]));
+        assert_eq!((w[0].word.as_str(), w[0].start, w[0].end), ("Hi", 2.0, 2.0));
+    }
+
+    fn timed() -> Transcript {
+        let mut t = transcript();
+        t.segments[0].words = vec![
+            Word {
+                start: 0.0,
+                end: 0.4,
+                word: "Hello".into(),
+            },
+            Word {
+                start: 0.5,
+                end: 1.2,
+                word: "there.".into(),
+            },
+        ];
+        t
+    }
+
+    #[test]
+    fn ass_subtitles_have_a_header_and_one_line_per_segment() {
+        let ass = transcript().render(ResponseFormat::Ass);
+        assert!(ass.starts_with("[Script Info]\n"), "{ass}");
+        for want in [
+            "[V4+ Styles]",
+            "Style: Default,",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name",
+        ] {
+            assert!(ass.contains(want), "{want}");
+        }
+        assert!(
+            ass.contains("Dialogue: 0,0:00:00.00,0:00:03.50,Default,,0,0,0,,Hello there.\n"),
+            "{ass}"
+        );
+        assert!(
+            ass.contains("Dialogue: 0,0:00:03.50,1:02:03.46,Default,,0,0,0,,General Kenobi.\n"),
+            "{ass}"
+        );
+        assert_eq!(ass_time(3723.456), "1:02:03.46");
+        assert_eq!(ass_time(-1.0), "0:00:00.00");
+        // line breaks and braces cannot break a line
+        assert_eq!(ass_text("a\nb {\\an8}"), "a\\Nb (\\an8)");
+        assert_eq!(ResponseFormat::parse("ASS").unwrap(), ResponseFormat::Ass);
+        assert_eq!(ResponseFormat::Ass.content_type(), "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn timed_words_become_karaoke_and_a_words_list() {
+        let t = timed();
+        let ass = t.render(ResponseFormat::Ass);
+        // each word lasts until the next begins; the last one to its own end
+        assert!(ass.contains(",,{\\k50}Hello {\\k70}there.\n"), "{ass}");
+        let v = t.verbose();
+        assert_eq!(v["words"][0], json!({"word": "Hello", "start": 0.0, "end": 0.4}));
+        assert_eq!(v["words"][1]["word"], "there.");
+        assert_eq!(v["words"].as_array().unwrap().len(), 2);
+        // no words asked: no list
+        assert!(transcript().verbose().get("words").is_none());
+    }
+
+    #[test]
+    fn words_are_asked_for_by_granularity() {
+        let (ct, body) = multipart(&[
+            ("file", Some("a.wav"), b"x"),
+            ("timestamp_granularities[]", None, b"segment"),
+            ("timestamp_granularities[]", None, b"word"),
+        ]);
+        assert!(parse_request(&ct, &body).unwrap().words);
+        let (ct, body) = multipart(&[
+            ("file", Some("a.wav"), b"x"),
+            ("timestamp_granularities[]", None, b"segment"),
+        ]);
+        assert!(!parse_request(&ct, &body).unwrap().words);
+        let (ct, body) = multipart(&[("file", Some("a.wav"), b"x"), ("response_format", None, b"ass")]);
+        assert_eq!(parse_request(&ct, &body).unwrap().format, ResponseFormat::Ass);
+    }
+
+    #[test]
+    fn the_hub_reads_wav_and_mp3_itself_and_leaves_the_rest_to_ffmpeg() {
+        assert!(is_native(&wav16(16_000, 1, &[0; 4]), "x"));
+        assert!(is_native(b"ID3\x04", "x"));
+        assert!(is_native(&[0xFF, 0xFB, 0x90], "x"));
+        assert!(is_native(b"", "talk.MP3"));
+        assert!(!is_native(b"\0\0\0\x20ftypisom", "a.mp4"));
+        assert!(!is_native(b"OggS", "a.ogg"));
+        assert!(!is_native(b"", ""));
     }
 
     #[test]

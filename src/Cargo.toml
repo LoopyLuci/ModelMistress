@@ -99,6 +99,10 @@ rocm = ["gpu-backend"]
 # Built-in speech to text: POST /v1/audio/transcriptions and /v1/audio/translations through whisper.cpp (needs CMake
 # and a C++ compiler to build, and libclang for the bindings; run time needs nothing).
 whisper = ["whisper-rs", "symphonia"]
+# The same on the GPU through Vulkan (whisper.cpp's ggml-vulkan; needs the Vulkan SDK, glslc, to build). Measured on
+# the owner's card: 59.8 times real time against 0.9 on the CPU (docs/media-plan.md). The Vulkan build of whisper-rs-sys
+# fails when the build path is long (the shader compile): use a short CARGO_TARGET_DIR.
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
 # Built-in image recognition: POST /v1/vision/classify, /detect and /embed through ONNX Runtime (downloads or finds its
 # runtime library at build time; see docs/vision.md).
 vision = ["ort"]

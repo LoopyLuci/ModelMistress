@@ -6,6 +6,7 @@
 //!
 //!   ffmpeg    where ffmpeg and ffprobe are, the pinned build and its install, and what each reports
 //!   probe     `media.probe`: container, streams and duration of a file, from ffprobe's JSON
+//!   decode    any container to 16 kHz mono samples, for speech to text
 //!   caps      what a model takes (image, video, audio), from its projector and the ffmpeg component
 //!   serve     the arguments llama-server needs for media: `--media-path`, `--video-ffmpeg-dir`
 //!   ops       the `media.*` operations
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod caps;
+pub mod decode;
 pub mod ffmpeg;
 pub mod ops;
 pub mod probe;

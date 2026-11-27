@@ -10,6 +10,16 @@ use crate::engine::{Fail, Result};
 /// Whether this build can transcribe.
 pub const AVAILABLE: bool = cfg!(feature = "whisper");
 
+/// What runs whisper in this build: `vulkan` (the GPU: measured 59.8 times real time against 0.9 on the CPU for the same
+/// model, docs/media-plan.md), `cpu`, or `none` (no speech to text built in).
+pub const BUILD: &str = if cfg!(feature = "whisper-vulkan") {
+    "vulkan"
+} else if cfg!(feature = "whisper") {
+    "cpu"
+} else {
+    "none"
+};
+
 /// Name given to the models in the API: the file name without `ggml-` and `.bin` (`ggml-base.en.bin` is `base.en`).
 pub fn model_name(path: &Path) -> Option<String> {
     let f = path.file_name()?.to_string_lossy().to_lowercase();
@@ -168,6 +178,8 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
         params.set_initial_prompt(p);
     }
     params.set_temperature(req.temperature);
+    // a time for every token, which `audio::group_words` turns into words (the estimates cost little)
+    params.set_token_timestamps(req.words);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -184,6 +196,7 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
             end: s.end_timestamp() as f64 / 100.0,
             text: s.to_str_lossy().map(|t| t.into_owned()).unwrap_or_default(),
             no_speech_prob: s.no_speech_probability(),
+            words: if req.words { segment_words(&s) } else { vec![] },
         })
         .collect();
     Ok(Transcript {
@@ -197,6 +210,23 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
         segments,
         temperature: req.temperature,
     })
+}
+
+/// The timed words of one segment, from its tokens (their times are in centiseconds).
+#[cfg(feature = "whisper")]
+fn segment_words(s: &whisper_rs::WhisperSegment) -> Vec<crate::audio::Word> {
+    let tokens: Vec<(String, f64, f64)> = (0..s.n_tokens())
+        .filter_map(|i| s.get_token(i))
+        .filter_map(|t| {
+            let d = t.token_data();
+            Some((
+                t.to_str_lossy().ok()?.into_owned(),
+                d.t0 as f64 / 100.0,
+                d.t1 as f64 / 100.0,
+            ))
+        })
+        .collect();
+    crate::audio::group_words(&tokens)
 }
 
 #[cfg(not(feature = "whisper"))]
