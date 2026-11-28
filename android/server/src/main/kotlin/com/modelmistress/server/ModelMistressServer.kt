@@ -1,8 +1,14 @@
 package com.modelmistress.server
 
+import com.modelmistress.core.agent.AgentEvent
+import com.modelmistress.core.agent.AgentRequest
+import com.modelmistress.core.agent.AgentService
 import com.modelmistress.core.chat.ApiException
 import com.modelmistress.core.chat.ChatMessage
+import com.modelmistress.core.chat.ChatRequest
+import com.modelmistress.core.chat.FinishReason
 import com.modelmistress.core.chat.GenerationOptions
+import com.modelmistress.core.chat.GenerationStats
 import com.modelmistress.core.chat.ModelRouter
 import com.modelmistress.core.chat.OpenAi
 import com.modelmistress.core.images.ImageApi
@@ -12,6 +18,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -21,6 +28,17 @@ import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+
+/** The route a device is sent a model on, from the desktop's Models page: the body is the model file, raw. */
+const val UPLOAD_PATH = "/mm/v1/models/upload"
+
+/**
+ * Takes a model file that another ModelMistress sent to this device. The bytes are streamed from [body] into storage,
+ * so a model of many gigabytes is never held in memory. Returns the id the model is listed under.
+ */
+interface ModelUploads {
+    fun receive(name: String, body: InputStream, bytes: Long): String
+}
 
 data class ServerConfig(
     val host: String = "127.0.0.1",
@@ -41,10 +59,18 @@ class ModelMistressServer(
     private val router: ModelRouter,
     private val config: ServerConfig,
     private val images: ImageCatalog? = null,
+    /**
+     * The router's own features: the agent that answers chats and Misty, and the `/mm/v1` routes. Without them the server
+     * answers the OpenAI routes only, as a plain chat.
+     */
+    private val services: RouterServices? = null,
     private val log: (String) -> Unit = {},
+    /** Takes the model files that devices are sent (see [ModelUploads]). Without it the upload route is not served. */
+    private val uploads: ModelUploads? = null,
 ) : Closeable {
     private var listener: ServerSocket? = null
     private var workers: ExecutorService? = null
+    private val mmRoutes = services?.let { MmRoutes(it, ::nowSeconds) }
 
     /** The port the server listens on; zero until [start]. Pass port 0 to let the system choose one. */
     @Volatile
@@ -106,8 +132,14 @@ class ModelMistressServer(
             val output = BufferedOutputStream(socket.getOutputStream())
             val writer = HttpResponseWriter(output)
             try {
-                val request = HttpReader.read(BufferedInputStream(socket.getInputStream()), config.maxBodyBytes)
-                route(request, writer)
+                val input = BufferedInputStream(socket.getInputStream())
+                val head = HttpReader.readRequestHead(input)
+                if (uploads != null && head.method == "POST" && head.path == UPLOAD_PATH) {
+                    // a model file is far bigger than any body held in memory: it is streamed, not read first
+                    upload(head, input, writer, uploads)
+                } else {
+                    route(HttpReader.withBody(head, input, config.maxBodyBytes), writer)
+                }
             } catch (error: HttpException) {
                 fail(writer, error.status, "invalid_request", error.message.orEmpty())
             } catch (error: ApiException) {
@@ -130,8 +162,25 @@ class ModelMistressServer(
         }
     }
 
+    /** Takes one model file a device was sent. The key is checked before any byte is stored. */
+    private fun upload(head: HttpRequest, input: InputStream, writer: HttpResponseWriter, store: ModelUploads) {
+        authorize(head)
+        val length = head.header("content-length")?.toLongOrNull()
+            ?: throw ApiException(411, "length_required", "Send the model with its Content-Length.")
+        val name = parseQuery(head.query)["name"].orEmpty()
+        val id = store.receive(name, input, length)
+        writer.json(200, Json.write(mapOf("id" to id, "bytes" to length)))
+    }
+
     private fun route(request: HttpRequest, writer: HttpResponseWriter) {
-        when (request.path) {
+        val path = request.path
+        if (path == MM_PREFIX || path.startsWith("$MM_PREFIX/")) {
+            val routes = mmRoutes ?: throw ApiException(404, "route_not_found", "This server has no router API.")
+            authorize(request)
+            routes.handle(request, path, parseQuery(request.query), writer)
+            return
+        }
+        when (path) {
             "/v1/health", "/health" -> {
                 requireMethod(request, "GET")
                 val body = Json.write(
@@ -189,6 +238,11 @@ class ModelMistressServer(
 
     private fun chat(request: HttpRequest, writer: HttpResponseWriter) {
         val parsed = OpenAi.parseChatRequest(String(request.body, Charsets.UTF_8))
+        val agent = services
+        if (agent != null) {
+            agentChat(parsed, request, writer, agent)
+            return
+        }
         val route = router.resolve(parsed.model)
         val id = OpenAi.newId()
         val created = nowSeconds()
@@ -202,6 +256,96 @@ class ModelMistressServer(
             }
             writer.json(200, OpenAi.completion(id, route.modelId, created, text.toString(), stats))
         }
+    }
+
+    /**
+     * A chat through the router's agent. `misty` or `misty:<model>` asks for Misty; any other name is a model as usual. Tools
+     * follow the owner's settings, and are offered to chats and to Misty unless `mm.tools` says otherwise.
+     */
+    private fun agentChat(parsed: ChatRequest, request: HttpRequest, writer: HttpResponseWriter, services: RouterServices) {
+        val requested = parsed.model?.trim().orEmpty()
+        val misty = requested == MISTY || requested.startsWith("$MISTY:")
+        val modelName = if (misty) requested.removePrefix(MISTY).removePrefix(":").ifEmpty { null } else requested
+        val route = router.resolve(modelName)
+        val agentRequest = AgentRequest(
+            modelId = route.modelId,
+            model = route.backend,
+            messages = parsed.messages,
+            options = parsed.options,
+            client = request.header(CLIENT_HEADER).orEmpty(),
+            chatId = parsed.mm.chatId,
+            sandboxId = parsed.mm.sandboxId,
+            misty = misty,
+            toolsAllowed = parsed.mm.toolsAllowed ?: (misty || parsed.mm.chatId != null),
+        )
+        services.agent.preflight(agentRequest)
+        val id = OpenAi.newId()
+        val created = nowSeconds()
+        if (parsed.stream) {
+            streamAgentReply(services.agent, agentRequest, id, created, writer)
+        } else {
+            val result = services.agent.run(agentRequest) { true }
+            val extra = mapOf(
+                "mm" to mapOf(
+                    "chat" to result.chatId,
+                    "misty" to result.misty,
+                    "tool_calls" to result.toolCalls,
+                    "offered" to result.offered,
+                    "calls" to result.calls,
+                ),
+            )
+            val stats = GenerationStats(promptTokens = 0, completionTokens = 0, finishReason = FinishReason.STOP)
+            writer.json(200, OpenAi.completion(id, route.modelId, created, result.answer, stats, extra))
+        }
+    }
+
+    private fun streamAgentReply(
+        agent: AgentService,
+        request: AgentRequest,
+        id: String,
+        created: Long,
+        writer: HttpResponseWriter,
+    ) {
+        val model = request.modelId
+        writer.startEventStream()
+        writer.event(OpenAi.chunk(id, model, created, mapOf("role" to "assistant", "content" to ""), null))
+        var clientGone = false
+        try {
+            agent.run(request) { event ->
+                try {
+                    writer.event(OpenAi.chunk(id, model, created, deltaOf(event), null))
+                    true
+                } catch (error: IOException) {
+                    clientGone = true
+                    false
+                }
+            }
+            if (!clientGone) {
+                writer.event(OpenAi.chunk(id, model, created, emptyMap(), FinishReason.STOP.wire))
+            }
+        } catch (error: ApiException) {
+            writer.event(OpenAi.error(error.message.orEmpty(), "invalid_request_error", error.code))
+        } catch (error: IllegalArgumentException) {
+            writer.event(OpenAi.error(error.message.orEmpty(), "invalid_request_error", "invalid_request"))
+        } catch (error: RuntimeException) {
+            log("Stream failed: ${error.message}")
+            writer.event(OpenAi.error("The reply failed on this device.", "server_error", "internal_error"))
+        }
+        if (!clientGone) writer.event("[DONE]")
+    }
+
+    /**
+     * The stream's delta for one agent event. Text is `content`, as in OpenAI. Everything the router adds is under `mm_event`,
+     * which a standard client ignores: tool starts and finishes, Misty's notes, and a reply the router had to replace.
+     */
+    private fun deltaOf(event: AgentEvent): Map<String, Any?> = when (event) {
+        is AgentEvent.Text -> mapOf("content" to event.piece)
+        is AgentEvent.ToolStarted -> mapOf("mm_event" to mapOf("type" to "tool_started", "name" to event.name))
+        is AgentEvent.ToolFinished -> mapOf(
+            "mm_event" to mapOf("type" to "tool_finished", "name" to event.name, "outcome" to event.outcome),
+        )
+        is AgentEvent.Note -> mapOf("mm_event" to mapOf("type" to "note", "text" to event.line))
+        is AgentEvent.Replaced -> mapOf("mm_event" to mapOf("type" to "replaced", "text" to event.text))
     }
 
     private fun streamReply(
@@ -255,5 +399,8 @@ class ModelMistressServer(
     private companion object {
         const val BACKLOG = 16
         const val READ_TIMEOUT_MS = 60_000
+        const val MM_PREFIX = "/mm/v1"
+        const val MISTY = "misty"
+        const val CLIENT_HEADER = "x-mm-client"
     }
 }

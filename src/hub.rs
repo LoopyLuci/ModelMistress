@@ -522,6 +522,49 @@ fn core_operations() -> Vec<Value> {
             &["job"],
         ),
         op(
+            "job.restart",
+            "Start a stopped or failed download again; it resumes from the part it already has",
+            true,
+            false,
+            json!({"job": {"type": "string"}}),
+            &["job"],
+        ),
+        op(
+            "bots.status",
+            "The bots that answer chats through this hub (Telegram): whether each is running, how many chats it answered or refused, and its last error",
+            false,
+            false,
+            json!({}),
+            &[],
+        ),
+        op(
+            "device.send",
+            "Send a model from this hub to a device (another ModelMistress, such as the Android app): it runs as a job with progress; job.cancel stops it. Single .gguf files only",
+            true,
+            false,
+            json!({
+                "model": {"type": "string", "description": "a model id from model.list"},
+                "device": {"type": "string", "description": "a device's name, as in config.get"}
+            }),
+            &["model", "device"],
+        ),
+        op(
+            "device.check",
+            "Ask a device whether it answers (its health route). Its key is not sent",
+            false,
+            false,
+            json!({"device": {"type": "string", "description": "a device's name, as in config.get"}}),
+            &["device"],
+        ),
+        op(
+            "bots.check",
+            "Check a bot's token with its service (Telegram getMe, or Discord users/@me): returns the bot's username. The token itself is never returned",
+            false,
+            false,
+            json!({"bot": {"type": "string", "description": "a bot's name, as in config.get"}}),
+            &["bot"],
+        ),
+        op(
             "chat.complete",
             "Chat with a model and wait for the whole answer",
             false,
@@ -1196,6 +1239,57 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             let id = s(a, "job")?;
             json!({"job": id, "cancelled": hub.jobs.cancel(id)})
         }
+        "job.restart" => hub.jobs.restart(e.clone(), s(a, "job")?)?.describe(),
+        "bots.status" => json!(crate::bots::statuses(hub)),
+        "device.send" => {
+            let name = s(a, "device")?;
+            let device = e
+                .settings()
+                .devices
+                .into_iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| Fail::not_found(format!("no device named {name:?}")))?;
+            let (path, file) = crate::devices::sendable(e, s(a, "model")?)?;
+            crate::devices::send(hub, device, path, file).describe()
+        }
+        "device.check" => {
+            let name = s(a, "device")?;
+            let device = e
+                .settings()
+                .devices
+                .into_iter()
+                .find(|d| d.name == name)
+                .ok_or_else(|| Fail::not_found(format!("no device named {name:?}")))?;
+            let url = format!("{}/v1/health", device.url.trim().trim_end_matches('/'));
+            let answer = e
+                .http
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|x| Fail::unavailable(format!("{name} did not answer: {}", x.without_url())))?;
+            let status = answer.status().as_u16();
+            let body: Value = answer.json().await.unwrap_or(Value::Null);
+            json!({"device": name, "reachable": (200..300).contains(&status), "status": status, "answer": body})
+        }
+        "bots.check" => {
+            // the token the form has (even for a bot not saved yet), else the saved token of the bot named
+            let saved = match a.get("bot").and_then(Value::as_str) {
+                Some(name) => Some(
+                    e.settings()
+                        .bots
+                        .into_iter()
+                        .find(|b| b.name == name)
+                        .ok_or_else(|| Fail::not_found(format!("no bot named {name:?}")))?,
+                ),
+                None => None,
+            };
+            let kind = a.get("kind").and_then(Value::as_str);
+            let typed = a.get("token").and_then(Value::as_str);
+            let bot = crate::bots::check_target(saved, kind, typed).map_err(Fail::invalid)?;
+            let username = crate::bots::token_user(&bot).await.map_err(Fail::unavailable)?;
+            json!({"bot": a.get("bot").and_then(Value::as_str).unwrap_or(""), "username": username})
+        }
         "speech.transcribe" => {
             let path = s(a, "file")?;
             let file = std::fs::read(path).map_err(|x| Fail::invalid(format!("{path}: {x}")))?;
@@ -1271,14 +1365,29 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
                 if cur.get(k).is_none() {
                     return Err(Fail::invalid(format!("no setting {k}")).into());
                 }
+                if k == "bots" {
+                    // a token sent back as (set) keeps the one the bot has now
+                    cur[k] = crate::bots::keep_tokens(v, &e.settings().bots);
+                    continue;
+                }
+                if k == "devices" {
+                    // a key sent back as (set) keeps the one the device has now
+                    cur[k] = crate::devices::keep_keys(v, &e.settings().devices);
+                    continue;
+                }
                 cur[k] = v.clone();
             }
             let new: Settings = serde_json::from_value(cur).map_err(|x| Fail::invalid(x.to_string()))?;
+            crate::bots::check(&new.bots).map_err(Fail::invalid)?;
+            crate::devices::check(&new.devices).map_err(Fail::invalid)?;
             let engine = e.clone();
             let saved = new.clone();
             tokio::task::spawn_blocking(move || engine.set_settings(saved))
                 .await
                 .map_err(|x| Fail::new(500, "io", x.to_string()))??;
+            if patch.contains_key("bots") {
+                crate::bots::reconcile(hub);
+            }
             shown_settings(&new)
         }
         id if id.starts_with("trace.") => crate::trace::api::call(hub, id, a).await?,
@@ -1769,6 +1878,8 @@ fn shown_settings(st: &Settings) -> Value {
     if st.hf_token.as_deref().is_some_and(|t| !t.is_empty()) {
         v["hf_token"] = json!("(set)");
     }
+    v["bots"] = crate::bots::shown(&st.bots);
+    v["devices"] = crate::devices::shown(&st.devices);
     if !st.warnings.is_empty() {
         v["config_warnings"] = json!(st.warnings);
     }
@@ -2141,6 +2252,18 @@ async fn chat(
     chat_to_model(hub, who, headers, body).await
 }
 
+/// A chat as the owner, for the bots (see `bots`): the same route as POST /v1/chat/completions, so the router and the
+/// models apply, answered in full as JSON. Not a peer's request: it carries no key and no quota.
+pub(crate) async fn owner_chat(hub: Hub, body: Value) -> std::result::Result<Value, String> {
+    let resp = chat(State(hub), Extension(Caller(None)), HeaderMap::new(), Json(body))
+        .await
+        .map_err(|e| e.0.message)?;
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
 /// A chat for one model of the catalog (or Ollama): traced when the owner asks, then forwarded.
 async fn chat_to_model(hub: Hub, who: Caller, headers: HeaderMap, mut body: Value) -> ApiResult<Response> {
     // the owner's requests can be traced (src/trace); a peer's never are
@@ -2464,7 +2587,10 @@ pub fn router(hub: Hub) -> Router {
             post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
         )
         // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
-        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/v1/models/import",
+            post(model_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))
@@ -2524,6 +2650,8 @@ pub async fn serve(hub: Hub, o: ServeOpts) -> std::io::Result<()> {
     hub.keys.refresh();
     // A batch that was running when the hub last stopped runs again for the items it has no answer for.
     crate::batch::resume(&hub);
+    // the bots that are on answer from now on (see `bots`)
+    crate::bots::reconcile(&hub);
     if let Some(problem) = hub.keys.unreadable() {
         eprintln!("model-mistress: {problem}; key changes are refused until it can be read");
     }
@@ -2673,6 +2801,87 @@ unrelated line
         assert_eq!(o["enabled"], false);
         assert!(o.get("url").is_none() && o.get("available").is_none(), "{o}");
         assert!(o["note"].as_str().unwrap().contains("ollama_discovery"));
+    }
+
+    #[tokio::test]
+    async fn a_bot_or_device_that_does_not_check_is_not_saved_and_its_secret_stays_hidden() {
+        let home = crate::testing::temp_home();
+        let h = hub(&home);
+        // a bot of a kind that does not exist is refused, and nothing is saved
+        let bot =
+            json!({"settings": {"bots": [{"name": "b1", "kind": "slack", "token": "123:SECRET", "enabled": false}]}});
+        let err = call(&h, "config.set", &bot)
+            .await
+            .expect_err("a bot of an unknown kind is refused");
+        assert_eq!((err.0.status, err.0.code), (400, "invalid"));
+        assert!(h.engine.settings().bots.is_empty());
+        // a device with a key is saved; config.get shows the key only as (set)
+        let phone = json!({"settings": {"devices": [{"name": "phone", "url": "http://192.168.1.20:8080", "key": "KEY-SECRET"}]}});
+        let saved = match call(&h, "config.set", &phone).await {
+            Ok(v) => v,
+            Err(e) => panic!("the device must save: {}", e.0.message),
+        };
+        assert_eq!(saved["devices"][0]["key"], "(set)");
+        assert!(!saved.to_string().contains("KEY-SECRET"));
+        assert_eq!(h.engine.settings().devices[0].key, "KEY-SECRET");
+        // sent back as (set), the device keeps the key it has
+        let back =
+            json!({"settings": {"devices": [{"name": "phone", "url": "http://192.168.1.20:8080", "key": "(set)"}]}});
+        assert!(call(&h, "config.set", &back).await.is_ok());
+        assert_eq!(h.engine.settings().devices[0].key, "KEY-SECRET");
+        // an address that is not http or https is refused, and the saved device stays as it was
+        let no_scheme = json!({"settings": {"devices": [{"name": "phone", "url": "ftp://x", "key": "(set)"}]}});
+        let err = call(&h, "config.set", &no_scheme)
+            .await
+            .expect_err("the address is refused");
+        assert_eq!(err.0.code, "invalid");
+        assert_eq!(h.engine.settings().devices[0].url, "http://192.168.1.20:8080");
+        // sending a model the catalog does not hold is refused by name, after the device is found
+        let unknown = call(&h, "device.send", &json!({"device": "phone", "model": "no-such-model"})).await;
+        assert_eq!(unknown.expect_err("an unknown model is refused").0.code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_bot_keeps_its_token_and_a_check_with_no_token_says_so() {
+        let home = crate::testing::temp_home();
+        let h = hub(&home);
+        // saved off, so nothing starts and no network is touched
+        let first = json!({"settings": {"bots": [{"name": "b1", "kind": "telegram", "token": "123:SECRET", "enabled": false}]}});
+        assert!(call(&h, "config.set", &first).await.is_ok());
+        // the form renames it and sends the token back as (set): the token moves with the name
+        let renamed = json!({"settings": {"bots": [{"name": "b2", "previous_name": "b1", "kind": "telegram", "token": "(set)", "enabled": false}]}});
+        assert!(call(&h, "config.set", &renamed).await.is_ok());
+        let bots = h.engine.settings().bots;
+        assert_eq!((bots[0].name.as_str(), bots[0].token.as_str()), ("b2", "123:SECRET"));
+        // a check with no token typed and nothing saved under that name is refused before any network call
+        let err = call(&h, "bots.check", &json!({"kind": "telegram", "token": ""}))
+            .await
+            .expect_err("there is no token to check");
+        assert_eq!(err.0.code, "invalid");
+        assert!(err.0.message.contains("type one"), "{}", err.0.message);
+    }
+
+    #[tokio::test]
+    async fn the_device_bot_and_restart_ops_name_what_they_cannot_find() {
+        let home = crate::testing::temp_home();
+        let h = hub(&home);
+        let statuses = match call(&h, "bots.status", &json!({})).await {
+            Ok(v) => v,
+            Err(e) => panic!("bots.status failed: {}", e.0.message),
+        };
+        assert!(statuses.is_array(), "{statuses}");
+        for (op, args) in [
+            ("device.send", json!({"device": "nobody", "model": "x"})),
+            ("device.check", json!({"device": "nobody"})),
+            ("bots.check", json!({"bot": "nobody"})),
+            ("job.restart", json!({"job": "nope"})),
+        ] {
+            let err = call(&h, op, &args)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{op} must fail"));
+            assert_eq!(err.0.code, "not_found", "{op}: {}", err.0.message);
+        }
     }
 
     fn wav(samples: &[i16]) -> Vec<u8> {

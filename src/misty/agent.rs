@@ -1123,7 +1123,7 @@ pub mod tests {
         assert_eq!(o.status, "done", "{:?}", o.error);
         let seen = r.llm.seen.lock();
         assert!(
-            seen[0].1["tools"].as_array().map_or(true, |a| a.is_empty()),
+            seen[0].1["tools"].as_array().is_none_or(|a| a.is_empty()),
             "{}",
             seen[0].1
         );

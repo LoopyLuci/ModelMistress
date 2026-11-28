@@ -24,6 +24,7 @@ data class DownloadState(
     val done: Long = 0L,
     val total: Long = 0L,
     val message: String? = null,
+    val repo: String? = null,
 )
 
 /**
@@ -47,17 +48,26 @@ class ModelDownloads(private val library: ModelLibrary, private val settings: Ru
      */
     fun start(spec: HfSpec, revision: String, file: HfFile): Boolean {
         if (state.value.phase == DownloadPhase.DOWNLOADING) return false
+        last = Request(spec, revision, file)
         val stem = file.name.removeSuffix(".gguf")
         if (library.targetFor(stem).exists()) {
             state.value = DownloadState(
                 phase = DownloadPhase.FAILED,
                 file = file.name,
                 message = "${library.targetFor(stem).nameWithoutExtension} is already in the library.",
+                repo = spec.repo,
             )
             return true
         }
         stopRequested = false
-        state.value = DownloadState(DownloadPhase.DOWNLOADING, file.name, 0L, file.sizeBytes, "Starting the download.")
+        state.value = DownloadState(
+            DownloadPhase.DOWNLOADING,
+            file.name,
+            0L,
+            file.sizeBytes,
+            "Starting the download.",
+            repo = spec.repo,
+        )
         scope.launch {
             try {
                 val partial = library.partialFor(stem)
@@ -85,6 +95,7 @@ class ModelDownloads(private val library: ModelLibrary, private val settings: Ru
                     done = file.sizeBytes,
                     total = file.sizeBytes,
                     message = "Installed ${model.id}.",
+                    repo = spec.repo,
                 )
             } catch (stopped: DownloadStopped) {
                 state.update { it.copy(phase = DownloadPhase.STOPPED, message = stopped.message) }
@@ -99,6 +110,23 @@ class ModelDownloads(private val library: ModelLibrary, private val settings: Ru
     fun stop() {
         stopRequested = true
     }
+
+    /**
+     * Starts the last download again, after it was stopped or failed. Its part on disk is resumed, so only the rest is
+     * fetched. Returns false, and starts nothing, when there is no such download or one is running.
+     */
+    fun restart(): Boolean {
+        val request = last ?: return false
+        val phase = state.value.phase
+        if (phase != DownloadPhase.STOPPED && phase != DownloadPhase.FAILED) return false
+        return start(request.spec, request.revision, request.file)
+    }
+
+    /** The request of the last download, so that [restart] can make it again. */
+    private class Request(val spec: HfSpec, val revision: String, val file: HfFile)
+
+    @Volatile
+    private var last: Request? = null
 
     private companion object {
         const val ROOM_TO_SPARE = 512L shl 20

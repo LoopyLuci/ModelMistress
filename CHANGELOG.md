@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Connect software, phones and chat bots
+
+- **Connect software** (a tab on Models): a key made for a peer name and shown once, and a snippet for each tool: the
+  OpenAI-compatible `/v1` and Ollama-compatible `/api` addresses, OpenCode, Continue, Hermes Agent, OpenClaw, and
+  environment variables. The snippets use the hub's own address and the chosen model (`frontend/src/connect.ts`, five tests).
+- **Downloads.** A progress bar, and Stop and Restart buttons, on the desktop. A stopped or failed download restarts from
+  the part on disk (`job.restart`, the Downloads tab, and the phone). The downloads in progress show above every Models tab,
+  and a model being sent to a phone shows there too.
+- **Send to phone** (Models, Installed). The row's "Send to phone..." lists the devices from Connect software. `device.send`
+  streams the `.gguf` to the phone's model store at `/mm/v1/models/upload` in 1 MiB chunks, checks the key first, and
+  reports a full phone as `507`. It runs as a job with progress and Stop. An Ollama model, a model split into parts, and a
+  file that is not `.gguf` are refused (`src/devices.rs`, three tests).
+- **Phones and other devices** (Connect software): a name, an address and a key. **Check** asks the device's `/v1/health`
+  (`device.check`). The key is kept by the hub and shown as `(set)`.
+- **Chat bots** (Connect software). A Telegram or Discord bot answers the people allowed to it through the hub's own chat
+  route, so the router and the models apply. Telegram long-polls. Discord holds a gateway connection (identify, heartbeats,
+  reconnect), and a server message counts only when it mentions the bot. The allow-list holds Telegram chat ids or Discord
+  user ids; nobody is allowed by default. `bots.check` proves a token, and `bots.status` shows answers and refusals.
+  `/reset` starts a conversation again. Conversations are kept in memory, so a restart forgets them (`src/bots.rs`,
+  `src/discord.rs`).
+- **Bot settings in the GUI** (Connect software, Chat bots). Each bot has its own token, allowed people, model, instructions
+  and memory, and **Save bots** applies them all. A token is checked before it is saved: **Check token** tests what you typed
+  (`bots.check` takes `kind` and `token`), so a bot not saved yet can be checked too. A saved token is never shown; it can be
+  replaced or removed. Renaming a saved bot keeps its token (`previous_name`). The model is a choice from the hub's chat models
+  or the router. Instructions go to the model as a system message; **Messages remembered** sets how many messages of a
+  conversation it keeps (2 to 200, default 20). The status shows the last error of the service, which it did not before.
+  Removing a saved bot asks first. The form's logic is in `frontend/src/bots.ts` (13 tests); `src/bots.rs` has tests for
+  the check target, the instructions and memory, and the rename, and `src/hub.rs` has one for a rename and a check with no token.
+- **Phone side.** The streamed upload route, the receiving library (it refuses a model when less than 512 MiB would be
+  left), and Restart for a phone download. `UploadTest` (four) and `HttpTest` (four) pass under `:server:test`, and
+  `:runtime:compileDebugKotlin` compiles.
+- Not done: Telegram and Discord bots on the phone.
+- Tested: `cargo test -p model-mistress --lib` passes (690 tests, 6 ignored). That covers the Discord module (three
+  tests against a fake gateway and REST API), the Telegram tests in `src/bots.rs`, the device send and its refusals,
+  the hub's bot, device and restart operations, and the restart of a stopped download. `cargo clippy` reports no
+  warning from these files. The frontend passes: 245 tests and a clean typecheck. The pipeline's rustfmt and clippy steps pass.
+  In a browser against a scratch hub (a fake token, nothing saved to the owner's hub): a new bot's token was checked before
+  saving, the saved bot kept its token through a rename, and a removed token was refused on save with the reason.
+  Tested on a phone: `device.send` sent an 84 MB embedding model from the hub to the ModelMistress app's server on a
+  phone. The copy's SHA-256 matched the source, and the app lists it. A request without the phone's key is refused before
+  any bytes are stored. Not tried: a real Telegram or Discord bot, and a model answer through a bot.
+
 ### Batch jobs: prompts in order, answers written as they finish
 
 - `batch.submit` with `model`, `prompts` (up to 10,000), and optionally `system`, `name`, `max_tokens` (1 to 8192, default

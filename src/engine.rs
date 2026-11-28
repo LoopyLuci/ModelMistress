@@ -180,6 +180,11 @@ pub struct Settings {
     pub download_dir: Option<PathBuf>,
     /// A Hugging Face token for gated or private repos (else HF_TOKEN). config.get never shows it.
     pub hf_token: Option<String>,
+    /// Bots that answer chats through this hub (Telegram so far). Each is off until it is enabled with a token; see
+    /// `bots`. config.get shows the tokens only as set.
+    pub bots: Vec<crate::bots::BotConfig>,
+    /// Other machines that run ModelMistress (the Android app), to which a model is sent (see `devices`).
+    pub devices: Vec<crate::devices::DeviceConfig>,
     /// The whisper model (`base.en` for `ggml-base.en.bin`) that speech to text uses when a request names none or
     /// says `whisper-1`. Unset: the only whisper model found, else the first of small, base, tiny.
     pub whisper_model: Option<String>,
@@ -244,6 +249,8 @@ impl Default for Settings {
             extra_args: vec![],
             download_dir: None,
             hf_token: None,
+            bots: vec![],
+            devices: vec![],
             whisper_model: None,
             tts_model: None,
             tts_voice: None,

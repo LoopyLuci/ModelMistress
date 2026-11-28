@@ -3,7 +3,7 @@
 Two apps built from one codebase. Both run GGUF models on the device, offline, and serve them over an OpenAI-compatible API.
 
 - **ModelMistress** (`com.modelmistress.app`): chat with a model on the phone, manage models, and optionally run the server.
-- **ModelMistress Router** (`com.modelmistress.router`): headless. Only the server and the model library. Other apps on the device, or on the network if you allow it, send requests to it.
+- **ModelMistress Router** (`com.modelmistress.router`): the phone's ModelMistress features for other apps. It runs the same server, models, chats, sandboxes, Misty and tool policy as the app, with a small screen for the server, the owner's approvals and the models. Other apps on the device, or on the network if you allow it, send requests to it; an app without the key pairs through the router's pairing screen. The API is in [docs/ROUTER_API.md](docs/ROUTER_API.md).
 
 Status and gaps against the desktop app are in [docs/FEATURE_MAP.md](docs/FEATURE_MAP.md).
 
@@ -18,7 +18,7 @@ Status and gaps against the desktop app are in [docs/FEATURE_MAP.md](docs/FEATUR
 | `sd` | Android library. stable-diffusion.cpp through JNI (arm64-v8a only). The source is `engines/stable-diffusion.cpp`, built with hidden symbols. | Native build passes in the gate. Not run on device yet. |
 | `runtime` | Android library. Model library, engine hub, image hub, server lifecycle, foreground service, Compose panels for models, desktops and server. | Tested on device |
 | `app` | The chat app: Chat, Models and Server tabs. | Tested on device |
-| `router` | The headless router app: server and models only. | Tested on device |
+| `router` | The router app: the server, the owner's approvals, the models, and the pairing screen for other apps. | Built, not yet run on device |
 
 Dependency direction: `app` and `router` depend on `runtime`. `runtime` depends on `core`, `server`, `engine`, `litert`, `sd` and `cactus`. `server` depends on `core`.
 

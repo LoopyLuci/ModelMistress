@@ -103,7 +103,10 @@ mod tests {
 
     #[test]
     fn a_plain_gguf_name_is_accepted_and_a_path_or_other_file_is_not() {
-        assert_eq!(file_name(" Llama-3.2-1B-Q4_K_M.gguf ").unwrap(), "Llama-3.2-1B-Q4_K_M.gguf");
+        assert_eq!(
+            file_name(" Llama-3.2-1B-Q4_K_M.gguf ").unwrap(),
+            "Llama-3.2-1B-Q4_K_M.gguf"
+        );
         assert!(file_name("model.GGUF").is_ok());
         assert!(file_name("../escape.gguf").unwrap_err().contains("plain name"));
         assert!(file_name("sub/model.gguf").unwrap_err().contains("plain name"));
@@ -132,12 +135,17 @@ mod tests {
         assert!(!dir.join("good.gguf.part").exists());
 
         let bad = dir.join("bad.gguf");
-        let e = save(Body::from(b"PK\x03\x04 not a model".to_vec()), &bad).await.unwrap_err();
+        let e = save(Body::from(b"PK\x03\x04 not a model".to_vec()), &bad)
+            .await
+            .unwrap_err();
         assert!(e.contains("not a GGUF"), "{e}");
         assert!(!bad.exists() && !dir.join("bad.gguf.part").exists());
 
         let empty = dir.join("empty.gguf");
-        assert!(save(Body::from(Vec::new()), &empty).await.unwrap_err().contains("too short"));
+        assert!(save(Body::from(Vec::new()), &empty)
+            .await
+            .unwrap_err()
+            .contains("too short"));
         assert!(!empty.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

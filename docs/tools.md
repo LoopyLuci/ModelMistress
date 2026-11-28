@@ -41,6 +41,31 @@ The operation `quantize` takes `model` (an id) or `input` (a `.gguf` path), `typ
 - Errors: `404` no such model or file, `409` the output exists, `501` `llama-quantize` not found, `500` it failed
   (the job's message has the end of its output).
 
+## Restart, phones and chat bots
+
+- `job.restart` (`{"job": id}`) starts a stopped or failed download again. The part already on disk is kept, so only the
+  rest is fetched. A running job, or one that is not a download, is refused with `400`; an unknown id is `404`.
+- `device.send` (`{"model", "device"}`) sends a `.gguf` model the hub holds to a device set under `devices`. It runs as a
+  job of kind `send`: `job.get` shows its progress and `job.cancel` stops it. An Ollama model, a model split into parts
+  and a file that is not `.gguf` are refused with `400`; an unknown device is `404`. A device that refuses the model fails
+  the job and says why. The key is never shown.
+- `device.check` (`{"device"}`) asks the device's `/v1/health` (10 seconds) and returns `{device, reachable, status, answer}`.
+- `bots.status` lists the bots with whether each one runs, how many messages it answered and refused, and its last error.
+  `bots.check` takes `kind` (`telegram` or `discord`), an optional `token` (the one typed in the form, which is checked
+  before anything is saved), and an optional `bot` (a saved bot's name, whose saved token is checked when no token is typed).
+  It asks the service whether the token works (Telegram `getMe`, Discord `users/@me`) and returns the bot's username. The
+  token is never returned.
+
+Settings: `bots` holds each bot's `name`, `kind` (`telegram` or `discord`), `token`, `model` (empty: the router chooses),
+`allowed_chats` (Telegram chat ids, or Discord user ids), `enabled`, `instructions` (sent to the model as a system message at
+the start of each conversation, not kept in the history), `remember` (messages of a conversation the model sees, 2 to 200;
+0 means 20), `api_base` and `gateway` (empty for the services' own addresses). A bot sent with `previous_name` is renamed,
+and keeps the token it had. `devices` holds each device's `name`, `url` and `key`. `config.get` shows a token or key as
+`(set)`, and sending `(set)` back keeps the saved one. A Discord bot needs its Message Content intent turned on, or a
+server message has no text.
+
+See [connect.md](connect.md) for the steps.
+
 ## LoRA adapters
 
 A LoRA adapter is a small GGUF file made for one base model (`convert_lora_to_gguf.py` in llama.cpp makes them from

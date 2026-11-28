@@ -355,7 +355,7 @@ pub fn list(hub: &Hub, state: &str) -> Result<Value, Fail> {
         .filter_map(|bytes| serde_json::from_slice::<Job>(&bytes).ok())
         .filter(|job| want.is_none_or(|s| job.state == s))
         .collect();
-    jobs.sort_by(|a, b| b.created.cmp(&a.created));
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.created));
     let rows: Vec<Value> = jobs
         .iter()
         .map(|job| {
@@ -547,7 +547,10 @@ mod tests {
         assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": 2.5})).is_err());
         assert!(spec(json!({"model": "m", "prompts": ["p"], "max_tokens": -1})).is_err());
         assert!(spec(json!({"model": "m", "prompts": ["p"], "name": 3})).is_err());
-        assert!(spec(json!({"model": "m", "prompts": ["p"], "concurrency": null})).is_ok(), "null is the default");
+        assert!(
+            spec(json!({"model": "m", "prompts": ["p"], "concurrency": null})).is_ok(),
+            "null is the default"
+        );
         let ok =
             spec(json!({"model": " m ", "prompts": ["a", "b"], "name": " nightly ", "system": " be brief "})).unwrap();
         assert_eq!(

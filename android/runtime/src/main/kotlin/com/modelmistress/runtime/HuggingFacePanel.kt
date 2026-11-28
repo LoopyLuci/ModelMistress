@@ -149,6 +149,12 @@ fun HuggingFacePanel(runtime: ModelRuntime, onInstalled: () -> Unit, modifier: M
             )
             OutlinedButton(onClick = runtime.downloads::stop) { Text("Stop") }
         }
+        if (download.phase == DownloadPhase.STOPPED || download.phase == DownloadPhase.FAILED) {
+            // the part already downloaded is kept, so this resumes it
+            OutlinedButton(onClick = {
+                message = if (runtime.downloads.restart()) null else "The download cannot start again from here."
+            }) { Text("Restart") }
+        }
         (message ?: download.message.takeIf { download.phase != DownloadPhase.DOWNLOADING })?.let {
             Text(it, style = MaterialTheme.typography.bodySmall)
         }

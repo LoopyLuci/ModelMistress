@@ -2,6 +2,11 @@ package com.modelmistress.runtime
 
 import android.content.Context
 import android.util.Log
+import com.modelmistress.core.agent.AgentService
+import com.modelmistress.core.agent.AgentSettings
+import com.modelmistress.core.agent.Approval
+import com.modelmistress.core.agent.Approvals
+import com.modelmistress.core.chat.ApiException
 import com.modelmistress.core.chat.ChatStore
 import com.modelmistress.core.chat.FileChatStore
 import com.modelmistress.core.chat.ModelCatalog
@@ -12,9 +17,12 @@ import com.modelmistress.core.remote.CombinedCatalog
 import com.modelmistress.core.environment.EnvironmentStore
 import com.modelmistress.runtime.overlay.TransferdOverlay
 import com.modelmistress.server.ModelMistressServer
+import com.modelmistress.server.ModelUploads
+import com.modelmistress.server.RouterServices
 import com.modelmistress.server.ServerConfig
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
@@ -77,18 +85,71 @@ class ModelRuntime private constructor(context: Context) {
     /** The latest device benchmark: the stress test and each model's speed on this phone. */
     val benchmarks = BenchmarkStore(File(context.filesDir, "benchmark/latest.json"))
 
+    private val approvalState = MutableStateFlow<List<Approval>>(emptyList())
+
+    /** The owner's OK for what other apps ask to do here. A request waits in this list until the owner answers or it times out. */
+    val approvals = Approvals(onChange = { waiting -> approvalState.value = waiting })
+
+    /** The requests waiting for the owner, oldest first. The router's screen shows them. */
+    val pendingApprovals: StateFlow<List<Approval>> = approvalState.asStateFlow()
+
+    /** The chat and Misty answers the router gives other apps, with the owner's tool policy and each chat's sandbox. */
+    val agent = AgentService(
+        chats = chats,
+        environments = environments,
+        feedback = feedback,
+        approvals = approvals,
+        settings = { AgentSettings(settings.toolUse, settings.fileWrites, settings.mistyEnabled) },
+        reflex = { if (misty.reflexReady(settings.mistyReflex)) NeedleReflex(needle) else null },
+        deviceStatus = { misty.status() },
+        installedModels = { misty.installedModels() },
+    )
+
+    /** What the router's `/mm/v1` API reads and changes on this phone. */
+    val host = RouterHost(context, settings, library, hub, catalog, downloads, needle, benchmarks)
+
     private val state = MutableStateFlow(ServerState())
     val serverState: StateFlow<ServerState> = state.asStateFlow()
 
     private var server: ModelMistressServer? = null
 
+    /** The model files another ModelMistress sends this phone, stored in the library (see ModelUploads). */
+    private fun receivedModels(): ModelUploads = object : ModelUploads {
+        override fun receive(name: String, body: InputStream, bytes: Long): String = try {
+            library.receive(name, body, bytes).id
+        } catch (error: NoRoom) {
+            throw ApiException(507, "no_space", error.message.orEmpty())
+        } catch (error: IllegalArgumentException) {
+            throw ApiException(400, "invalid_model", error.message.orEmpty())
+        } catch (error: IOException) {
+            throw ApiException(500, "upload_failed", "The model could not be saved on this device: ${error.message}")
+        }
+    }
+
     /** Starts the server with the current settings and returns the state it is in afterwards. */
     @Synchronized
     fun startServer(): ServerState {
         if (server?.isRunning == true) return state.value
-        val host = if (settings.allowNetwork) "0.0.0.0" else "127.0.0.1"
-        val config = ServerConfig(host = host, port = settings.port, apiKey = settings.apiKey)
-        val created = ModelMistressServer(ModelRouter(catalog), config, imageHub) { line -> Log.i(TAG, line) }
+        val address = if (settings.allowNetwork) "0.0.0.0" else "127.0.0.1"
+        val config = ServerConfig(host = address, port = settings.port, apiKey = settings.apiKey)
+        val services = RouterServices(
+            agent = agent,
+            host = this.host,
+            approvals = approvals,
+            chats = chats,
+            environments = environments,
+            feedback = feedback,
+            version = ROUTER_VERSION,
+            images = imageHub.models().isNotEmpty(),
+        )
+        val created = ModelMistressServer(
+            router = ModelRouter(catalog),
+            config = config,
+            images = imageHub,
+            services = services,
+            log = { line -> Log.i(TAG, line) },
+            uploads = receivedModels(),
+        )
         try {
             val port = created.start()
             server = created
@@ -128,6 +189,9 @@ class ModelRuntime private constructor(context: Context) {
 
     companion object {
         private const val TAG = "ModelMistress"
+
+        /** The router's version, as its API reports it. */
+        const val ROUTER_VERSION = "0.1.0"
 
         @Volatile
         private var instance: ModelRuntime? = null
