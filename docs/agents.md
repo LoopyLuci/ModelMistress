@@ -22,7 +22,7 @@ whether the hub or an offline command made it. **Done now:** an MCP server that 
 
 - **MCP stdio hang (fixed).** A hub started by `mcp --start` inherited the MCP process's stdout pipe, so an MCP client
   would have waited for the hub to exit. The standard handles are now made non-inheritable before the hub starts.
-- **Tool count (done).** The MCP server offers the twelve core tools by default (`CORE_OPS` in `src/client.rs`). Every hub
+- **Tool count (done).** The MCP server offers the thirteen core tools by default (`CORE_OPS` in `src/client.rs`). Every hub
   operation (about 94) needs `mcp --all-tools`. A tool outside the core set is refused by name, as a tool that does not
   exist.
 - **Stale skill.** `skills/mcp-server-development/SKILL.md` describes a `McpServer` struct that the working server does

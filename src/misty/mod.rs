@@ -13,6 +13,7 @@
 //!   state     sessions, finished runs and environments
 //!   env       environments: a working folder, folders, variables and a tool policy a session works in
 //!   feedback  the owner's verdicts on replies: routing taught by them, corrections, training export
+//!   inject    text from outside is data: tags neutralised, order-like wording flagged
 //!   pipeline  short declarative chains of steps
 //!   setup     what to download, where it goes, and checks that it works
 //!   ops       the `misty.*` operations, REST routes, the OpenAI `misty` model
@@ -25,6 +26,7 @@ pub mod cli;
 pub mod config;
 pub mod env;
 pub mod feedback;
+pub mod inject;
 pub mod ops;
 pub mod pipeline;
 pub mod rag;

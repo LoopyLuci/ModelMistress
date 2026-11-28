@@ -105,6 +105,7 @@
             <strong>Misty wants to use <span class="mono">{{ a.tool }}</span></strong>
             <span class="pill pending">{{ a.class }}</span>
             <pre class="mono args">{{ JSON.stringify(a.args, null, 2) }}</pre>
+            <p v-if="a.warning" class="approval-warning" role="status"><strong>Look twice.</strong> {{ a.warning }}</p>
             <div class="row">
               <button class="btn primary" type="button" @click="answer(a, true)">Allow</button>
               <button class="btn danger" type="button" @click="answer(a, false)">Refuse</button>
@@ -564,6 +565,7 @@ onBeforeUnmount(() => {
 .notes { list-style: none; padding: 0; margin: 4px 0; }
 .cites { margin: 6px 0 0 18px; }
 .approval { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+.approval-warning { margin: 8px 0; color: var(--warn); }
 .args { white-space: pre-wrap; max-height: 200px; overflow: auto; margin: 6px 0; }
 .compose textarea { margin-bottom: 8px; }
 .rate { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }

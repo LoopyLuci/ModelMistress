@@ -36,6 +36,41 @@ backend (29 MB, pinned). A scratch hub on the RX 7900 XTX loaded the 9B `PQ2_0` 
 while the 2B ran on the CPU build (48 tokens/s), both at once, and both answered correctly. `llama-bench` on the 2B: prompt
 3,205 against 211 tokens/s on the CPU, generation 100.7 against 46.8.
 
+## System awareness and data-broker opt-outs (2026-11-27)
+
+The hub reads the PC every two seconds and yields to it: workers the hub started run below normal, go to idle priority with
+efficiency mode when the machine is strained and pause when it stays critical; heavy jobs wait for it to quiet; idle models
+are unloaded when memory is short. SystemWatchdog, when it runs, adds GPU load, temperatures, drive activity, video memory and
+the foreground program. See [system-awareness.md](system-awareness.md). Run on this machine in a scratch hub with real Python
+children and Watchdog's real feed class on a scratch port (priorities lowered, paused, stepped back and restored to normal,
+a heavy job held and released, a stale feed ignored); not run: a real model server or model shed, the installed Watchdog
+feeding live readings, Linux and macOS.
+
+`model-mistress privacy` drives the pinned f*ck_data_brokers tool (letters, sending only on the owner's typed count, replies,
+chasing); see [privacy.md](privacy.md). Run in a scratch home with placeholder details: the install gates, tamper
+refusal, drafting and the send refusals; nothing downloaded or sent. Not run: the registry import, a real send, real replies.
+
+## Media: video and audio in chat, ffmpeg, speech on any container (2026-11-27)
+
+Phase 1 of the media plan ([media.md](media.md)). ffmpeg is a setup component the owner installs (`media.install`,
+`confirm: true`, the archive's SHA-256 checked before it is unpacked and every file's hash before it is used);
+`media.components` says what is there. A chat's `video_url`, `input_video` and `input_audio` parts reach llama-server,
+which is started with `--media-path` and `--video-ffmpeg-dir` for a model that has a projector; the owner's own requests
+may name a local file anywhere (linked or copied to `<home>/media/staged` and passed as `file://`), a peer's request is
+never rewritten. `model.list` and `/v1/models` list `input_modalities`. `media.probe` (ffprobe) is an operation and
+`POST /v1/media/probe`. `speech.transcribe` and the OpenAI routes read any container through ffmpeg and gain the `ass`
+format and word times; the Cargo feature `whisper-vulkan` builds whisper.cpp's Vulkan backend (built and run: the 32 s clip in 1.2 to 1.4 s on the RX 7900 XTX, with the cooperative-matrix kernels off).
+
+Run: the library tests with stand-in ffmpeg, ffprobe and llama-server programs (807 tests, 800 pass, 6 ignored; the one
+failure, `documents::tests::a_pdf_gives_its_text`, is this worktree's checkout of the PDF fixture with Windows line endings,
+and the file is unchanged by this work), and the 35 speech tests with `--features whisper`. Run with real builds and a real
+clip on a scratch hub (see [media.md](media.md)): ffmpeg n8.1.3 (pinned, LGPL) and n9.0.2 installed from their zips and
+behaving the same (decode, `media.probe`, a 32 s MP4 transcribed exactly in 41 to 42 s on the CPU), and a Gemma 4 26B chat
+answering 5 of 5 questions about the MP4 on both, 900 tokens at 82 to 85 tokens/s. Found: that model's projector crashes the
+GPU llama-server (it ran with `--no-mmproj-offload`, first answer 16 minutes), and the default video frame rate overflows a
+32k context (the hub now passes `--video-fps 1`). Not run: a vision model whose projector runs on the GPU, the
+new routes from a browser or a real client.
+
 ## Ollama-compatible API
 
 `src/ollama_api.rs` adds Ollama's server routes under `/api/*` on the hub (the `/v1` routes and CLI are unchanged):

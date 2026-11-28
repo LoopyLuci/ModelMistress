@@ -72,7 +72,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 cc = "1"    # finds MSVC for the bundled llama.cpp build (build.rs)
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -99,6 +99,10 @@ rocm = ["gpu-backend"]
 # Built-in speech to text: POST /v1/audio/transcriptions and /v1/audio/translations through whisper.cpp (needs CMake
 # and a C++ compiler to build, and libclang for the bindings; run time needs nothing).
 whisper = ["whisper-rs", "symphonia"]
+# The same on the GPU through Vulkan (whisper.cpp's ggml-vulkan; needs the Vulkan SDK, glslc, to build). Measured on
+# the owner's card: 59.8 times real time against 0.9 on the CPU (docs/media-plan.md). The Vulkan build of whisper-rs-sys
+# fails when the build path is long (the shader compile): use a short CARGO_TARGET_DIR.
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
 # Built-in image recognition: POST /v1/vision/classify, /detect and /embed through ONNX Runtime (downloads or finds its
 # runtime library at build time; see docs/vision.md).
 vision = ["ort"]

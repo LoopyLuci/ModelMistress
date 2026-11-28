@@ -80,7 +80,8 @@ enum Cmd {
     },
     /// One question, one answer.
     Chat { model: String, prompt: String },
-    /// Speech to text with the built-in whisper.cpp (WAV or MP3): `transcribe talk.wav --model base.en`.
+    /// Speech to text with the built-in whisper.cpp: `transcribe talk.wav --model base.en`. WAV and MP3 are read by the
+    /// hub; any other audio or video file (MP4, MKV, M4A ...) needs ffmpeg (`model-mistress call media.install`).
     Transcribe {
         file: PathBuf,
         /// A whisper model (`base.en` for ggml-base.en.bin); default: the whisper_model setting or what is found.
@@ -95,9 +96,12 @@ enum Cmd {
         /// Translate the speech into English.
         #[arg(long)]
         translate: bool,
-        /// text, json, verbose_json, srt or vtt.
+        /// text, json, verbose_json, srt, vtt or ass.
         #[arg(long, default_value = "text")]
         format: String,
+        /// Time every word (the ass format then lights each word as it is spoken; verbose_json lists them).
+        #[arg(long)]
+        words: bool,
     },
     /// Recognise a picture with an ONNX model in <home>/vision: `vision resnet50 cat.jpg [--top-k 5]`. A classifier
     /// lists its best guesses, a detector the boxes it found, an embedding model prints its vector as JSON.
@@ -229,6 +233,18 @@ enum Cmd {
     /// Misty, the built-in agent: `misty setup`, `misty chat`, `misty ask <text>`, `misty rag add <folder>`, `misty status`
     /// (`misty help` lists them).
     Misty {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// How the machine is doing and what ModelMistress is doing about it: `system` (the level and why), `system watch`,
+    /// `system mode off|gentle|balanced|strict`, `system config [key=value ...]`, `system run-now` (`system help` lists them).
+    System {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Data-broker opt-outs (f*ck_data_brokers, pinned and checked): `privacy status`, `privacy install`, `privacy setup`,
+    /// `privacy letters`, `privacy send` (`privacy help` lists them).
+    Privacy {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -645,10 +661,11 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
             prompt,
             translate,
             format,
+            words,
         } => {
             // The hub reads the file, and its working folder is not ours.
             let file = std::path::absolute(&file)?;
-            let mut a = json!({"file": file, "translate": translate, "format": format});
+            let mut a = json!({"file": file, "translate": translate, "format": format, "words": words});
             for (k, v) in [("model", model), ("language", language), ("prompt", prompt)] {
                 if let Some(v) = v {
                     a[k] = json!(v);
@@ -940,6 +957,8 @@ async fn run(cmd: Cmd, home: PathBuf) -> anyhow::Result<()> {
         Cmd::Km { args } => model_mistress::km::cli::run(&home, args).await?,
         Cmd::Factory { args } => model_mistress::factory::cli::run(&home, args).await?,
         Cmd::Misty { args } => model_mistress::misty::cli::run(&home, args).await?,
+        Cmd::System { args } => model_mistress::sysaware::cli::run(&home, args).await?,
+        Cmd::Privacy { args } => model_mistress::privacy::cli::run(&home, args).await?,
         Cmd::Forge { cmd } => {
             let c = client().await?;
             match cmd {

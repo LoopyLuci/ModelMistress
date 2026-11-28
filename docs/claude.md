@@ -2,7 +2,7 @@
 
 Claude can use the models ModelMistress serves on this machine through its MCP server. By default the server offers the
 core tools (`model_list`, `model_info`, `model_loaded`, `model_plan`, `model_load`, `model_unload`, `chat_complete`,
-`service_status`, `logs_tail`, and the approval queue: `request_list`, `request_approve`, `request_deny`).
+`service_status`, `system_status` (how pressed this PC is and what the hub is doing about it), `logs_tail`, and the approval queue: `request_list`, `request_approve`, `request_deny`).
 `model-mistress mcp --all-tools` offers every hub operation as a tool: downloads, deletes,
 settings, Misty and the fabric. The Claude Code plugin adds slash commands on top.
 

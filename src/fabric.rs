@@ -298,6 +298,8 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Res<Value> {
                 "commit_headroom_mib": e.commit_headroom_mib(),
                 "loaded": loaded.len(),
                 "in_flight": loaded.iter().map(|i| i.inflight()).sum::<usize>(),
+                // how the machine is doing and what the hub is doing about it (`system.status` has the detail)
+                "pressure": crate::sysaware::shared().map(|s| s.summary()),
             })
         }
         "fabric.status" => {

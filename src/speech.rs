@@ -10,6 +10,16 @@ use crate::engine::{Fail, Result};
 /// Whether this build can transcribe.
 pub const AVAILABLE: bool = cfg!(feature = "whisper");
 
+/// What runs whisper in this build: `vulkan` (the GPU: measured 59.8 times real time against 0.9 on the CPU for the same
+/// model, docs/media-plan.md), `cpu`, or `none` (no speech to text built in).
+pub const BUILD: &str = if cfg!(feature = "whisper-vulkan") {
+    "vulkan"
+} else if cfg!(feature = "whisper") {
+    "cpu"
+} else {
+    "none"
+};
+
 /// Name given to the models in the API: the file name without `ggml-` and `.bin` (`ggml-base.en.bin` is `base.en`).
 pub fn model_name(path: &Path) -> Option<String> {
     let f = path.file_name()?.to_string_lossy().to_lowercase();
@@ -99,6 +109,56 @@ huggingface.co/ggerganov/whisper.cpp) in <home>/whisper or a folder listed in mo
     })
 }
 
+/// The Vulkan build of whisper.cpp ends the whole process (exit code 0xC0000409, no message) at the first encode on the
+/// RX 7900 XTX when ggml uses the card's KHR cooperative-matrix kernels. ggml reads `GGML_VK_DISABLE_COOPMAT` when the
+/// device is set up, which is while the model loads: the variable is set for that moment only (not for the llama-server
+/// programs the hub starts later) and only when the owner has not set it. The CPU build does nothing here.
+#[cfg(feature = "whisper")]
+struct NoCoopmat(bool);
+
+#[cfg(feature = "whisper")]
+impl NoCoopmat {
+    const VAR: &'static str = "GGML_VK_DISABLE_COOPMAT";
+
+    fn new() -> Self {
+        let set = BUILD == "vulkan" && std::env::var_os(Self::VAR).is_none();
+        if set {
+            Self::put("1");
+        }
+        Self(set)
+    }
+
+    /// ggml reads the variable with C's `getenv`; on Windows that is the C runtime's own copy, which Rust's `set_var`
+    /// does not reach, so `_putenv_s` sets it (an empty value removes it).
+    #[cfg(windows)]
+    fn put(value: &str) {
+        extern "C" {
+            fn _putenv_s(name: *const std::ffi::c_char, value: *const std::ffi::c_char) -> i32;
+        }
+        let (name, value) = (format!("{}\0", Self::VAR), format!("{value}\0"));
+        // SAFETY: both strings are NUL-terminated and live for the call
+        unsafe { _putenv_s(name.as_ptr().cast(), value.as_ptr().cast()) };
+    }
+
+    #[cfg(not(windows))]
+    fn put(value: &str) {
+        if value.is_empty() {
+            std::env::remove_var(Self::VAR);
+        } else {
+            std::env::set_var(Self::VAR, value);
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+impl Drop for NoCoopmat {
+    fn drop(&mut self) {
+        if self.0 {
+            Self::put("");
+        }
+    }
+}
+
 /// Run `req` on already decoded 16 kHz mono `samples`. `translate` turns the speech into English text.
 #[cfg(feature = "whisper")]
 pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool) -> Result<Transcript> {
@@ -109,7 +169,12 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
     type Slot = Mutex<Option<(PathBuf, Arc<WhisperContext>)>>;
     static LOADED: OnceLock<Slot> = OnceLock::new();
     static QUIET: std::sync::Once = std::sync::Once::new();
-    QUIET.call_once(whisper_rs::install_logging_hooks);
+    // whisper.cpp and ggml are quiet unless MM_WHISPER_LOG is set (then they print to stderr: which GPU, why a load fails)
+    QUIET.call_once(|| {
+        if std::env::var_os("MM_WHISPER_LOG").is_none() {
+            whisper_rs::install_logging_hooks();
+        }
+    });
 
     let ctx = {
         let mut slot = LOADED
@@ -119,10 +184,13 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
         match slot.as_ref().filter(|(p, _)| p == model) {
             Some((_, c)) => c.clone(),
             None => {
-                let c = Arc::new(
-                    WhisperContext::new_with_params(model, WhisperContextParameters::default())
-                        .map_err(|e| Fail::new(500, "model_error", format!("{}: {e}", model.display())))?,
-                );
+                let c = {
+                    let _quirk = NoCoopmat::new();
+                    Arc::new(
+                        WhisperContext::new_with_params(model, WhisperContextParameters::default())
+                            .map_err(|e| Fail::new(500, "model_error", format!("{}: {e}", model.display())))?,
+                    )
+                };
                 *slot = Some((model.to_path_buf(), c.clone()));
                 c
             }
@@ -168,6 +236,8 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
         params.set_initial_prompt(p);
     }
     params.set_temperature(req.temperature);
+    // a time for every token, which `audio::group_words` turns into words (the estimates cost little)
+    params.set_token_timestamps(req.words);
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -184,6 +254,7 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
             end: s.end_timestamp() as f64 / 100.0,
             text: s.to_str_lossy().map(|t| t.into_owned()).unwrap_or_default(),
             no_speech_prob: s.no_speech_probability(),
+            words: if req.words { segment_words(&s) } else { vec![] },
         })
         .collect();
     Ok(Transcript {
@@ -197,6 +268,23 @@ pub fn transcribe(model: &Path, samples: &[f32], req: &Request, translate: bool)
         segments,
         temperature: req.temperature,
     })
+}
+
+/// The timed words of one segment, from its tokens (their times are in centiseconds).
+#[cfg(feature = "whisper")]
+fn segment_words(s: &whisper_rs::WhisperSegment) -> Vec<crate::audio::Word> {
+    let tokens: Vec<(String, f64, f64)> = (0..s.n_tokens())
+        .filter_map(|i| s.get_token(i))
+        .filter_map(|t| {
+            let d = t.token_data();
+            Some((
+                t.to_str_lossy().ok()?.into_owned(),
+                d.t0 as f64 / 100.0,
+                d.t1 as f64 / 100.0,
+            ))
+        })
+        .collect();
+    crate::audio::group_words(&tokens)
 }
 
 #[cfg(not(feature = "whisper"))]
@@ -291,5 +379,19 @@ mod tests {
         let f = d.0.join("mine.bin");
         std::fs::write(&f, b"x").unwrap();
         assert_eq!(find_model(&[], f.to_str().unwrap(), None).unwrap(), f);
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn the_cooperative_matrix_switch_is_set_for_a_vulkan_load_only_and_taken_back() {
+        let var = NoCoopmat::VAR;
+        if std::env::var_os(var).is_some() {
+            return; // the owner's own setting: the guard leaves it alone, and the test must not disturb it
+        }
+        {
+            let _g = NoCoopmat::new();
+            assert_eq!(std::env::var_os(var).is_some(), BUILD == "vulkan");
+        }
+        assert!(std::env::var_os(var).is_none(), "it is gone once the model is loaded");
     }
 }

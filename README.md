@@ -16,9 +16,13 @@ runs on its own.
 - **Brings its own llama.cpp.** Built with `--features bundled-engine`, the binary carries `llama-server`, `llama-quantize` and `llama-tts` (Vulkan by
   default) and needs nothing else installed but the GPU driver.
 - **Speech to text, built in.** With `--features whisper` it runs whisper.cpp itself: OpenAI's
-  `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in; json, text, verbose_json, srt or vtt out)
+  `/v1/audio/transcriptions` and `/v1/audio/translations` (WAV or MP3 in, any other audio or video container once ffmpeg
+  is installed; json, text, verbose_json, srt, vtt or ass out, with word times on request)
   and `model-mistress transcribe talk.wav`. A whisper model is a `ggml-*.bin` file in a model folder
   ([docs/speech.md](docs/speech.md)).
+- **Video and audio in chat.** `video_url`, `input_video` and `input_audio` parts reach the model's llama-server, which
+  decodes the video with ffmpeg; ffmpeg is a setup component the owner installs on purpose (`media.install`), and
+  `media.probe` says what a media file holds ([docs/media.md](docs/media.md)).
 - **Text to speech, built in.** `POST /v1/audio/speech` (OpenAI's route; WAV or raw PCM out) and
   `model-mistress speak "Hello" --out hello.wav` run llama.cpp's own `llama-tts`, built from the vendored llama.cpp
   ([docs/text-to-speech.md](docs/text-to-speech.md)).
@@ -63,6 +67,15 @@ runs on its own.
   (a loaded model is preferred), in the Chat page, the Qt window and any OpenAI client, and says which answered. Choose
   the models on the Models page, Router tab, which also edits each model's serving profile and checks a load will fit
   before it starts. See [docs/misty/USER_GUIDE.md](docs/misty/USER_GUIDE.md#the-model-router-auto-in-any-chat).
+- **Aware of the PC it runs on.** The hub reads how pressed the machine is (other programs' CPU, memory, video memory and, with
+  [SystemWatchdog](https://github.com/LoopyLuci/SystemWatchdog), GPU load, temperatures and the program in front) and adjusts
+  itself live: workers it started run below normal and yield further when the PC is strained, heavy jobs wait for it to
+  quiet, idle models are unloaded when memory is short, and all of it is undone when the pressure lifts or you switch it
+  off (`model-mistress system`). See [docs/system-awareness.md](docs/system-awareness.md).
+- **Data-broker opt-outs.** `model-mistress privacy` drives the pinned
+  [f*ck_data_brokers](https://github.com/gary23w/f-ck_data_brokers) tool: letters to data brokers in your name, replies read,
+  silent brokers chased. Nothing is downloaded until you say so and nothing is sent without you typing the count
+  ([docs/privacy.md](docs/privacy.md)).
 - **Passes `ollama/<name>` through** to a running Ollama, if you still have one, so both show up in one model list.
 - **One token.** The hub's token is also the OpenAI API key.
 - **All-in-one item listing & sales platform** — **ItemForge** (`itemforge/`): auto-organize photos into item folders,

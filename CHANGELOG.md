@@ -2,6 +2,182 @@
 
 ## Unreleased
 
+### Misty: the optimal-agents spec applied (budgets, a stronger gate, a context that fits, notes)
+
+The spec is `docs/misty/optimal-agents-spec.md` (written from the owner's notes on agent design); the mapping of each
+requirement to what Misty does, with the tests, is `docs/misty/optimal-agents-map.md`. Checked with a scripted model, not
+yet with the real Bonsai models.
+
+- **A run that runs out ends with an answer, not an error.** At `max_steps` or the new `max_tool_calls` the run makes one
+  last call with no tools and the model says what it found and what is missing; at `run_timeout_s` (the hard limit) no
+  further model call is made and the host writes that note from what the run did. The run is `done` with `partial` set to
+  `steps`, `tools` or `time` (in `misty.ask`'s result and the `final` event), and its text starts "(Stopped early: ...)".
+  A pipeline step that ends this way fails, so a later step does not build on it. Before, the run was an error with no
+  summary.
+- **The gate counts tool calls.** A reply may carry `max_calls_per_reply` calls (default 4) and a run may make
+  `max_tool_calls` (default 16, refused calls included); the rest are not run and the model is told. Cancel is now also
+  checked between the calls of one reply. A caller that names its tools (`tools` on a request) gets a refusal for any
+  other, even when the policy would allow it.
+- **The prompt fits the context.** Nothing used to trim a run's messages, so a few large tool results could push a
+  8192-token context over its limit. Before each call the prompt is brought under `context_tokens` (default 8192, less
+  the reply and the tool definitions): earlier tool results become a note, then the oldest turns go, then the latest
+  results are cut. A `context` event says so.
+- **Text from outside cannot close its own label, and order-like text is shown to the owner.** A tool result can no
+  longer contain `<tool_result` or `</tool_result`. Wording that reads as orders ("ignore your instructions", a fake
+  `system:` line, "do not tell the user", "run the following command") is named in the tool event (`flags`), in a warning
+  after the result the model reads, and as a "Look twice" line beside every approval the run asks for afterwards
+  (dashboard and CLI; the approval event and `misty.approvals` carry `warning`). It is a heuristic list and never blocks;
+  the approvals still stop a write, a hub change or a network call.
+- **Per-tool policy.** `policy.tools` (in Misty's settings and in an environment) gives one tool its own `auto`, `ask` or
+  `deny`, which wins over its class; a name that is not a tool is refused when saved. An environment that sets a class
+  replaces Misty's per-tool entries for it. `misty.tools.list` shows each tool's own policy. (The `denied` message names the
+  tool when its own entry is what refused it.)
+- **The bigger model is told why.** When an answer is rejected and the run retries one role up, the system prompt says why
+  ("rejected: empty answer").
+- **`remember`**, a tool of class `write` (so the owner approves each one by default), keeps one short fact in the document
+  index; it comes back by retrieval. A note that gives orders is refused.
+- **Ask first when it matters.** The system prompt tells the model to ask one short question when a request is unclear and
+  a wrong guess would change, delete or run something, and otherwise to work and say what it assumed. A prompt rule only.
+- Docs: `DESIGN.md` section 3.3 and 3.4 follow the code; it said network tools default to `ask`, and the code (and now the
+  document) says `deny`.
+
+### Media: video and audio in chat, an ffmpeg component, speech to text on any container
+
+- ffmpeg is a setup component, not a download that happens by itself. `media.components` (and `GET /v1/media/components`)
+  says where ffmpeg and ffprobe are (the `ffmpeg_dir` setting, `MM_FFMPEG_DIR`, `<home>/engines/ffmpeg/`, then PATH), their
+  version and licence (a GPL or nonfree build is reported, not refused), and what each projector model can be given.
+  `media.install` (owner only) puts a build into `<home>/engines/ffmpeg/`: without `confirm: true` it answers what it would
+  fetch, from where, how big, and the SHA-256 it must have; the archive's hash is checked before it is unpacked, the
+  programs are run once (`-version`) before they replace anything, every installed file's size and hash go into
+  `install.json` and are checked before the file is used (a swapped file or a folder with no record is an error that names
+  the fix, never a silent use), and an earlier install is kept as `ffmpeg.old-<time>`. Runs as a job; `wait: true` waits.
+  New setting `ffmpeg_dir`. See `docs/media.md`.
+- **The pinned build** (Windows x64) is BtbN's FFmpeg-Builds n8.1, LGPL, shared: `ffmpeg-n8.1.3-41-ga8029b6528-win64-lgpl-shared-8.1.zip`,
+  81,544,084 bytes, SHA-256 `bb633136…f9558`. Its download address is a daily-build page that keeps files 14 days, so
+  keep the zip and install with `file` + `sha256`, or pin another build in `pin()`. `url` + `sha256` and `file` + `sha256`
+  install any build. Installed from the zip in this change, and n9.0.2 beside it; the hub never downloads by itself.
+- Video and audio in chat. A chat message's `video_url`, `input_video`, `input_audio` and `image_url` parts reach the
+  model's llama-server. A model that has a projector is started with `--media-path <home>/media` and, when ffmpeg is there,
+  `--video-ffmpeg-dir <folder>`, each only if that llama-server lists the flag and unless the owner's own arguments set it.
+  A llama-server reads a local file only as `file://<name>` under `--media-path` (a bare path fails with HTTP 500, measured),
+  so the owner's own requests (`/v1/chat/completions`, `chat.complete`) may name a file anywhere on the machine
+  (`file:///C:/clips/a.mp4`, a plain path, `%20` decoded): the hub links or copies it to `<home>/media/staged/` and passes
+  `file://staged/<name>`. Copies nobody asked for in a day are removed. A peer key's request is never rewritten, so a peer
+  cannot read a file of the owner's machine through chat. `/v1/chat/completions` takes up to 128 MB of body (axum's 2 MB
+  refused a short clip as base64).
+- `model.list` and `/v1/models` carry `input_modalities` (`text`, `image`, `audio`, `video`): image and audio from the
+  projector's own flags (`clip.has_vision_encoder`, `clip.has_audio_encoder`), video when the model sees images, ffmpeg is
+  there and the server takes `--video-ffmpeg-dir`; `video_note` says what is missing when video is possible but not ready.
+- `media.probe` (and `POST /v1/media/probe`, JSON `{"file"}` or a multipart upload up to 512 MB): what ffprobe says about a
+  file, as the container (format, duration, size, bit rate) and every video, audio and subtitle stream (codec, size, frame
+  rate, rotation, sample rate, channels, language, cover art). Owner only; ffprobe gets `-protocol_whitelist file`.
+- Speech to text reads any container. `/v1/audio/transcriptions`, `/v1/audio/translations` and `speech.transcribe` keep
+  reading WAV and MP3 themselves; any other audio or video file goes through ffmpeg when it is installed (the first audio
+  stream, 16 kHz mono), and `speech.transcribe` leaves a file named by path on disk for ffmpeg (a long recording is not held
+  in memory). Only plain audio and video containers are decoded (not playlists, `concat`, image sequences, devices or raw
+  streams), ffmpeg gets only the `file` protocol, at most 4 hours are decoded, and every process has a time limit. Without
+  ffmpeg the answer says how to get it (`501` for a path; the usual `400` for an upload).
+- New response format `ass` (Advanced SubStation Alpha) and word times: `timestamp_granularities[]=word` on the OpenAI
+  route, `words: true` / `--words` on `speech.transcribe` / `model-mistress transcribe`. `verbose_json` then has OpenAI's
+  top-level `words`; `ass` writes each word as a karaoke tag. The times are whisper.cpp's token times grouped into words:
+  estimates, good to a fraction of a second.
+- Cargo feature `whisper-vulkan` (whisper.cpp's Vulkan backend; implies `whisper`); `media.components` and
+  `speech::BUILD` say which build runs (`vulkan`, `cpu`, `none`). The Vulkan build of whisper-rs-sys fails when the build
+  path is long: use a short `CARGO_TARGET_DIR`. Built and run on the RX 7900 XTX: the 32 s MP4 transcribes in 1.2 to 1.4 s
+  once the model is loaded (same text as the CPU). The card's cooperative-matrix kernels end the process at the first encode
+  (exit code 0xC0000409, no message), so the hub sets `GGML_VK_DISABLE_COOPMAT=1` while the model loads (unless the owner
+  set it); `MM_WHISPER_LOG=1` makes whisper.cpp and ggml print to stderr.
+- Measured before this was built (the media plan's spikes, not repeated with this code): a 74 s screen recording of a meeting
+  was answered correctly (5 of 5 questions) by Qwen3-VL-4B, Qwen3-VL-8B and Gemma 4 E4B through llama-server's native video
+  input, at about one second of compute per second of video; whisper.cpp through whisper-rs 0.16 with Vulkan ran 59.8 times
+  real time against 0.9 on the CPU on the RX 7900 XTX.
+- Run on this machine with real builds, a real model and a real clip (a scratch hub, the owner's hub untouched): ffmpeg
+  n8.1.3 and n9.0.2 installed from their zips, both read as LGPL; `media.probe`, decoding (322 frames of 720p in 0.12 s) and the
+  16 kHz audio the same on both; `speech.transcribe` of a 32 s MP4 (whisper large-v3-turbo-q5_0 on the CPU) gave the spoken
+  script exactly in 41 to 42 s; a Gemma 4 26B chat with `video_url` of the local MP4 answered 5 of 5 questions on both builds
+  (900 generated tokens at 82 and 85 tokens/s). Two findings: that model's projector crashes the pinned llama-server on the
+  GPU (for a single picture too), so it ran with `--no-mmproj-offload` and the first video answer took 16 minutes; and
+  llama-server's default frame rate gave 52,595 tokens for the 32 s clip, over a 32k context, so `--video-fps 1` was given
+  in `extra_args`. The hub now passes `--video-fps 1` itself (with ffmpeg present, to a server that lists the flag; the
+  owner's own `--video-fps` wins).
+- Tests for this change: with `--features whisper` the 35 speech, audio and media tests pass too (the test binary links
+  only against the MSVC 14.51 libraries here: whisper.cpp was compiled with its headers). `cargo test --lib` (807 tests: 800 pass, 6 ignored, and `documents::tests::a_pdf_gives_its_text`
+  fails in this worktree because its PDF fixture was checked out with Windows line endings, which breaks the file's byte
+  offsets; the file is not touched here and `*.pdf` is not marked binary in `.gitattributes`), `rustfmt`, and clippy with
+  `-D warnings` on this change's files (three other lints, in `misty/ops.rs`, `batch.rs` and `misty/agent.rs`, come from the
+  newer toolchain and are not touched). The tests use stand-in ffmpeg, ffprobe and llama-server programs (the install from a stored
+  zip with a right and a wrong hash, a swapped file, the listings, the chat path through a stand-in server that records what
+  it was sent, a peer's request left alone, the ass and words formats). Not run: a vision model whose projector runs on the GPU
+  (Qwen3-VL and Gemma 4 E4B are not on the machine), the new routes with a browser or a real client.
+
+### System awareness: the hub watches the PC and yields to it, live
+
+- Every two seconds the hub reads how pressed the machine is: CPU used by *other* programs (the machine's total less the hub's
+  own tree), free memory, Windows commit headroom, free video memory, temperatures, GPU and drive load, and whether a game, a
+  full-screen program or a presentation has the screen. Level: `calm`, `busy`, `strained` or `critical`; it rises after two
+  looks and falls one step after five, so a flicker changes nothing. `system.status` lists every reason with its numbers.
+- What the governor does, by mode (`off`, `gentle`, `balanced` (default), `strict`): workers the hub started (Forge, image,
+  quantize, ffmpeg and the like) run below normal always, go to idle priority plus Windows efficiency mode when strained,
+  and are paused after `pause_after_s` of critical (at most `max_pause_s`); a model server drops to below normal when strained
+  and is never paused; any other process the hub started is lowered a step later. It only lowers, only touches descendants of
+  the hub (named by pid *and* start time), puts back exactly what it changed (level falls, mode off, hub stops) and does not
+  fight a priority someone else changed. Console hosts and other helpers the OS starts for a child are left alone. A process
+  counts as the hub's child only when its start time is known and not older than its parent's: Windows reuses a parent pid
+  after the parent exits, and on the live hub an `adb.exe` that predates the hub was lowered through such a pid (found there,
+  fixed, four tests).
+- Heavy jobs (`forge`, `factory`, `quantize`, `image`) do not start while the machine is strained or worse: the job exists
+  at once, says why it waits, can be cancelled, and `system.run_now` starts it anyway. `max_wait_s` (default 0: as long as it
+  takes) gives up waiting. Downloads, installs and Misty's own jobs never wait.
+- When memory, commit or video memory is the short resource and the machine is strained, the hub unloads the model that has
+  been idle longest (`shed_idle_s`, default 120 s, one per ten seconds, never one with a request in progress; a `keep_alive:
+  -1` model only at critical). `shed = false` turns it off.
+- `system.status`, `system.config.get`, `system.config.set`, `system.run_now` (owner only; `system.status` is also a core MCP
+  tool, so the core set is thirteen); `model-mistress system [status|watch|mode|config|run-now]`; settings in
+  `<home>/system.toml`, taken in on edit; `machine.status` carries a short `pressure` block. See `docs/system-awareness.md`.
+- SystemWatchdog is optional and adds GPU load, temperatures, drive activity, video memory and the foreground program, read
+  from Watchdog's new loopback feed (`GET http://127.0.0.1:7781/pressure`, read-only, Host-checked). A feed that is absent
+  costs nothing (the hub backs off to one look per 30 s); one that stops publishing is reported `stale` and its readings are
+  dropped. In return Watchdog's own action engine and core balancer skip processes descended from the hub. Watchdog changes
+  are in its repository, uncommitted.
+- Not done: no CPU affinity or thread budget; no per-process GPU priority (Windows has none; the hub can only hold heavy
+  jobs back and shed models); on Linux and macOS the hub looks, waits and sheds but changes no process priority.
+- Run on this machine: a scratch hub (own home and port, the live hubs untouched) with a real `forge.run` job through a
+  stand-in worker, a real CPU-burning Python child. Calm: below normal. Critical: idle plus efficiency mode, paused after 20 s,
+  resumed after 121 s; stepped down critical, strained, calm; mode off put both processes back to normal while they ran; a
+  heavy job waited at strained, was cancelled while waiting, and another was started with `run-now`; Watchdog's real feed class
+  on a scratch port served synthetic readings (hot GPU made the hub strained, a silent feed went stale, a changed URL connected
+  at once). The scratch run also found two faults, both fixed with tests: a console host was lowered like a program, and a
+  changed `watchdog_url` waited out the old address's backoff.
+- Not run: a real model server being lowered or a real model being shed (the scratch hub had no model; the tests use
+  stand-in instances); a Forge run on the GPU; the installed Watchdog feeding real readings (its code is changed but the
+  running program was not restarted); the live hubs.
+- `src/sysaware/` (`level`, `policy`, `probe`, `feed`, `actuate`, `governor`, `ops`, `cli`, `mod`), `Engine::shed_one`, the
+  admission gate in `Jobs::start_task`; 71 tests including a real-process loop test.
+
+### Data-broker opt-outs: f*ck_data_brokers, pinned and driven from the hub
+
+- `model-mistress privacy …` and the `privacy.*` operations drive [f*ck_data_brokers](https://github.com/gary23w/f-ck_data_brokers)
+  (MIT): public broker registries in, legal deletion and opt-out letters out (CCPA, GDPR, UK GDPR, PIPEDA, Quebec Law 25,
+  LGPD), replies read, silent brokers chased. It never sends an ID, clicks a link or solves a CAPTCHA.
+- The tool is **pinned**: commit `528fb023`, SHA-256 `dce00f90…aa093`, 85,839 bytes. `privacy install` downloads that one
+  file only when told to (`confirm: true`; or installs a copy you fetched with `--file`), keeps it only if the hash matches, and
+  checks the hash again before every call. It runs as `python -I` with a cleared environment (none of the hub's tokens reach
+  it) and its state under `<home>/privacy/`, one call at a time.
+- Nothing is sent without the owner's count: `privacy send` first lists who would get an email, and sends only when called
+  again with `confirm_count` equal to that number (the CLI asks you to type it); a queue that changed in between is refused.
+  Sending from the hub needs `FDB_SMTP_PASS` (an app password) in the hub's environment, handed to the tool for that one call
+  and never stored, logged or returned; without it the send page (one button per letter, your own mail program) needs no password.
+- Owner only: a peer key cannot reach it and Misty has no tool for it. See `docs/privacy.md`.
+- Not done: no page in `/ui`; the count `privacy send` confirms is read from the tool's state file in the pinned version's
+  format, so moving the pin means checking that reader.
+- Run on this machine, in a scratch home with a placeholder identity and `.invalid` addresses: install refused without
+  confirm and for a wrong file (hash mismatch, nothing written), installed from a local copy of the pinned file, refused after
+  the file was altered until `--force` put it back, setup, two brokers added, two letters drafted, the send preview listed both,
+  a wrong count and a missing password were refused. Nothing was sent and nothing was downloaded.
+- Not run: `brokers import` (it reads the public registries over the network), a real send through a mail server, reply
+  parsing on a real broker's mail, forms.
+- `src/privacy/` (`mod`, `ops`, `cli`, `tests`), 14 tests.
+
 ### Batch jobs: prompts in order, answers written as they finish
 
 - `batch.submit` with `model`, `prompts` (up to 10,000), and optionally `system`, `name`, `max_tokens` (1 to 8192, default
@@ -29,7 +205,7 @@
 
 ### MCP: a core tool profile
 
-- The owner's MCP session (`model-mistress mcp`) offers twelve core tools: `service_status`, `model_list`, `model_loaded`,
+- The owner's MCP session (`model-mistress mcp`) offers thirteen core tools: `service_status`, `system_status` (how pressed the machine is, see "System awareness" above), `model_list`, `model_loaded`,
   `model_info`, `model_plan`, `model_load`, `model_unload`, `chat_complete`, `logs_tail` and the approval queue (`request.list`, `request.approve`, `request.deny`). Before, it offered every hub
   operation (about 94), which cost an agent context on every turn. A tool outside the set is refused as a tool that does not
   exist.

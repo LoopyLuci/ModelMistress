@@ -163,21 +163,54 @@ The embedder and reranker are kept on the CPU, so that the card is left to the l
 5. **Generate** with the chosen brain through the hub's own chat path (so loading, VRAM planning, quotas, metrics all
    apply), with the toolset as OpenAI `tools`.
 6. **Act.** Tool calls pass the policy (section 3.4). A call that needs approval pauses the run and emits an
-   `approval` event; the run resumes when the owner answers.
+   `approval` event; the run resumes when the owner answers. A reply may carry at most `max_calls_per_reply` calls
+   (default 4; the rest are not run and the model is told), and a run may make `max_tool_calls` (default 16, refused
+   calls included). Both are counted by the gate, which the model cannot reach.
 7. **Verify and escalate.** If the answer looks weak (empty, refusal pattern, malformed call, runaway thinking), retry
-   one role up, once per run, and say so in the event stream.
+   one role up, once per run, and say so in the event stream. The bigger model is told why the first try was rejected.
 8. **Finish.** Final text with citations; the run, its route, tool calls and token counts are stored.
 
-A run is bounded by steps, wall time, and tokens, and can be cancelled. Everything a model reads from a tool or a
-document is passed as data, wrapped and labelled, never as instructions.
+A run is bounded by steps (`max_steps`), tool calls, wall time (`run_timeout_s`) and tokens, and can be cancelled. When
+a run runs out of steps or tool calls it makes one last call with no tools, which asks the model to say what it found,
+what it did not finish and what the owner could do; when it runs out of time, which is the owner's hard limit, no
+further model call is made and the note is written from what the run did. Either way the run ends `done` with
+`partial` set to `steps`, `tools` or `time`, and the text starts with a line saying it stopped early. (A pipeline step
+that ends this way fails instead, so a later step does not build on it.)
+
+Everything a model reads from a tool or a document is passed as data, wrapped and labelled, never as instructions, and
+the host adds two defences that do not depend on the model behaving (`inject.rs`): a tool result cannot contain a
+`<tool_result` or `</tool_result` tag, so it cannot close its label early or open a fake one; and wording that reads
+as orders ("ignore your instructions", a fake `system:` line, "do not tell the user", "run the following command") is
+named in the tool event's `flags`, in a warning after the result the model reads, and beside every approval the run
+asks for afterwards, so the owner sees why before saying yes. The list is a heuristic: a flag never blocks anything, and
+the approvals are what stop a hostile text from writing a file or changing the hub.
+
+A conversation that outgrows the context (`context_tokens`, default 8192, the context the roster runs at) is trimmed
+before each call, never the system prompt or the last question: first the results of earlier tool rounds become a note
+the model can act on by calling the tool again, then the oldest turns go, then the latest results are cut. The log has a
+`context` event when that happened.
+
+If a request is unclear and a wrong guess would change, delete or run something, the model asks one short question and
+does nothing else (the answer is the run's final text, and the session carries on from it); otherwise it works and says
+what it assumed. This is a rule in the system prompt, so it is only as reliable as the model that reads it.
 
 ### 3.4 Tools and approvals
 
 Every tool declares a class: `read` (files inside allowed roots, the RAG index, hub status), `write` (files inside
 roots, RAG ingest of new sources), `exec` (shell commands), `net` (fetch a URL), `hub` (load or unload a model, pull a
-model). Policy per class is `auto`, `ask` or `deny`; defaults: read and hub-read `auto`, write and hub `ask`, net
-`ask`, exec `deny` until the owner turns it on. Rules enforced in code, not in the prompt:
+model). Policy per class is `auto`, `ask` or `deny`; defaults: read `auto`, write and hub `ask`, net and exec `deny`
+until the owner turns them on. A single tool can have a policy of its own (`policy.tools`, a tool's name to `auto`,
+`ask` or `deny`), which wins over its class: `fs_read` can ask while the rest of `read` runs, or `rag_ingest` can run
+while the rest of `write` asks. An environment sets the same, and an environment that sets a class replaces Misty's own
+per-tool entries for that class, so a per-tool entry in Misty's settings never undoes an environment that turns a
+whole class off. A name that is not a tool is refused when it is saved. Rules enforced in code, not in the prompt:
 
+- when a caller names the tools it allows (`tools` on a request, as an OpenAI client or a pipeline step does), a call to
+  any other is refused even when the model names it and the policy would allow it; every call, refused ones too, counts
+  against the run's budget (section 3.3). When no list was named the request is only narrowed to the tools it is
+  about, for the model's sake, and the policy alone decides;
+- `remember` (class `write`, so the owner approves each note) keeps one short fact in the document index so it comes
+  back by retrieval later. A note that gives orders is refused, so text Misty read today cannot steer her tomorrow;
 - file tools resolve the real path and refuse anything outside the configured roots, and always refuse the hub's own
   secrets (`control.json`, `keys.json`, `.env`, `*.pem`, `*.key`) wherever they are;
 - `exec` runs with a timeout, no inherited secrets, in a root, and only when enabled;

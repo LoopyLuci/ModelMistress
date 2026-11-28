@@ -22,13 +22,16 @@ pub mod image;
 pub mod km;
 pub mod loadlog;
 pub mod machine;
+pub mod media;
 pub mod misty;
 pub mod ollama_api;
+pub mod privacy;
 pub mod pull;
 pub mod requests;
 pub mod batch;
 pub mod serving;
 pub mod speech;
+pub mod sysaware;
 pub mod testing;
 pub mod tools;
 pub mod trace;
@@ -40,6 +43,8 @@ pub mod watchdog;
 mod ollama_tests;
 #[cfg(test)]
 mod tests_hosting;
+#[cfg(test)]
+mod tests_media;
 #[cfg(test)]
 mod tests_upstream;
 
