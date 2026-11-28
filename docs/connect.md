@@ -22,6 +22,10 @@ or environment variables. A key can chat with the models; it cannot load or dele
 
 Only `.gguf` files the hub holds are sent. Ollama models, models split into parts, and other files are not offered.
 
+**Port clash.** The phone's network server and the ModelMistress Router app both default to port 8080. While the Router
+runs, the phone's server cannot bind 8080 and must use another port (set it in the phone app, and use the same port in
+the device's address here). Until the owner decides the default, check which app holds the port before you start a server.
+
 ## A Telegram bot
 
 1. In Telegram, message @BotFather, send `/newbot`, and copy the token it gives you.

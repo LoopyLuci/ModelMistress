@@ -2800,10 +2800,7 @@ unrelated line
         // a bot of a kind that does not exist is refused, and nothing is saved
         let bot =
             json!({"settings": {"bots": [{"name": "b1", "kind": "slack", "token": "123:SECRET", "enabled": false}]}});
-        let err = call(&h, "config.set", &bot)
-            .await
-            .err()
-            .expect("a bot of an unknown kind is refused");
+        let err = call(&h, "config.set", &bot).await.expect_err("a bot of an unknown kind is refused");
         assert_eq!((err.0.status, err.0.code), (400, "invalid"));
         assert!(h.engine.settings().bots.is_empty());
         // a device with a key is saved; config.get shows the key only as (set)
@@ -2822,15 +2819,12 @@ unrelated line
         assert_eq!(h.engine.settings().devices[0].key, "KEY-SECRET");
         // an address that is not http or https is refused, and the saved device stays as it was
         let no_scheme = json!({"settings": {"devices": [{"name": "phone", "url": "ftp://x", "key": "(set)"}]}});
-        let err = call(&h, "config.set", &no_scheme)
-            .await
-            .err()
-            .expect("the address is refused");
+        let err = call(&h, "config.set", &no_scheme).await.expect_err("the address is refused");
         assert_eq!(err.0.code, "invalid");
         assert_eq!(h.engine.settings().devices[0].url, "http://192.168.1.20:8080");
         // sending a model the catalog does not hold is refused by name, after the device is found
         let unknown = call(&h, "device.send", &json!({"device": "phone", "model": "no-such-model"})).await;
-        assert_eq!(unknown.err().expect("an unknown model is refused").0.code, "not_found");
+        assert_eq!(unknown.expect_err("an unknown model is refused").0.code, "not_found");
     }
 
     #[tokio::test]

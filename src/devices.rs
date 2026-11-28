@@ -229,11 +229,14 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
+    /// What the phone recorded for each upload: the file name, its size and the key it was sent with.
+    type Received = Arc<Mutex<Vec<(String, usize, Option<String>)>>>;
+
     /// A stand-in for the device's upload route: it checks the key and records what arrived.
     #[derive(Clone, Default)]
     struct Phone {
         key: String,
-        got: Arc<Mutex<Vec<(String, usize, Option<String>)>>>,
+        got: Received,
     }
 
     async fn upload_route(
