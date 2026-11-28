@@ -78,7 +78,8 @@ impl Offloaded {
         if let Some(n) = self.node.as_deref().and_then(|n| HeaderValue::from_str(n).ok()) {
             out.headers_mut().insert("x-mm-node", n);
         }
-        out.headers_mut().insert("x-mm-offloaded", HeaderValue::from_static("1"));
+        out.headers_mut()
+            .insert("x-mm-offloaded", HeaderValue::from_static("1"));
         out
     }
 }

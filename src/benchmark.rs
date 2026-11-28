@@ -41,7 +41,9 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> Result<Value> {
 /// Models that are not chat models (their names say so): embedders, rerankers, speech and image models.
 fn is_chat_model(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
-    !["embed", "rerank", "whisper", "tts", "clip", "stable-diffusion"].iter().any(|w| id.contains(w))
+    !["embed", "rerank", "whisper", "tts", "clip", "stable-diffusion"]
+        .iter()
+        .any(|w| id.contains(w))
 }
 
 fn round1(v: f64) -> f64 {
@@ -115,7 +117,9 @@ async fn run(hub: &Hub, a: &Value) -> Result<Value> {
                 id: r["model"].as_str()?.to_string(),
                 size_gb: r["size_gb"].as_f64()?,
                 // a cold start includes loading the model, so only a warm run says how fast it is
-                tok_s: r["tokens_per_s"].as_f64().filter(|_| !r["cold_start"].as_bool().unwrap_or(false)),
+                tok_s: r["tokens_per_s"]
+                    .as_f64()
+                    .filter(|_| !r["cold_start"].as_bool().unwrap_or(false)),
             })
         })
         .collect();
@@ -261,7 +265,11 @@ mod tests {
     use super::*;
 
     fn c(id: &str, size_gb: f64, tok_s: Option<f64>) -> Candidate {
-        Candidate { id: id.into(), size_gb, tok_s }
+        Candidate {
+            id: id.into(),
+            size_gb,
+            tok_s,
+        }
     }
 
     #[test]
@@ -275,7 +283,10 @@ mod tests {
         let s = suggest(&models, Some(16.0), None);
         assert_eq!(s["fastest"], "tiny");
         assert_eq!(s["balanced"], "mid", "the largest that keeps up with reading, and fits");
-        assert_eq!(s["best"], "big", "the largest that fits: huge needs more than 80% of 16 GB");
+        assert_eq!(
+            s["best"], "big",
+            "the largest that fits: huge needs more than 80% of 16 GB"
+        );
     }
 
     #[test]

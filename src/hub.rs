@@ -2580,7 +2580,10 @@ pub fn router(hub: Hub) -> Router {
             post(document_text).layer(DefaultBodyLimit::max(MAX_DOCUMENT_BODY)),
         )
         // a model file is many gigabytes: it is streamed to disk, so no body limit applies to this route
-        .route("/v1/models/import", post(model_import).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/v1/models/import",
+            post(model_import).layer(DefaultBodyLimit::disable()),
+        )
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/images/edits", post(image_edits))

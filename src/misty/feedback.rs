@@ -28,8 +28,8 @@ const NOTE_ANSWER_CHARS: usize = 300;
 const NOTE_LIMIT: usize = 2;
 
 const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "is", "are", "it", "to", "of", "in", "on", "for", "and", "or", "my", "me", "i", "you", "do", "does",
-    "can", "please", "what", "that", "this", "with",
+    "the", "a", "an", "is", "are", "it", "to", "of", "in", "on", "for", "and", "or", "my", "me", "i", "you", "do",
+    "does", "can", "please", "what", "that", "this", "with",
 ];
 
 /// The owner's verdict on one reply. The wire names match the Android app's export.
@@ -59,9 +59,15 @@ impl Label {
     }
 
     pub fn of(wire: &str) -> Option<Label> {
-        [Label::Good, Label::Bad, Label::NoTools, Label::NeedsTools, Label::Corrected]
-            .into_iter()
-            .find(|l| l.wire() == wire)
+        [
+            Label::Good,
+            Label::Bad,
+            Label::NoTools,
+            Label::NeedsTools,
+            Label::Corrected,
+        ]
+        .into_iter()
+        .find(|l| l.wire() == wire)
     }
 
     /// The verdicts that say what tools a question needs. A good or a bad reply says nothing about tools, so it routes nothing.
@@ -127,7 +133,10 @@ impl Verdict {
 
 /// The current time in unix seconds.
 pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn cut(text: &str, max: usize) -> String {
@@ -166,7 +175,11 @@ fn similar<'a>(question: &str, all: &'a [Verdict], keep: impl Fn(&Verdict) -> bo
         .map(|v| (v, similarity(question, &v.question)))
         .filter(|(_, s)| *s >= SIMILAR)
         .collect();
-    found.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(b.0.at.cmp(&a.0.at)));
+    found.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(b.0.at.cmp(&a.0.at))
+    });
     found.into_iter().map(|(v, _)| v).collect()
 }
 
@@ -253,7 +266,15 @@ mod tests {
     use super::*;
 
     fn v(question: &str, label: Label, tools: &[&str], correction: Option<&str>, at: i64) -> Verdict {
-        Verdict::new(question, "an answer", label, tools.iter().map(|t| t.to_string()).collect(), correction, at).unwrap()
+        Verdict::new(
+            question,
+            "an answer",
+            label,
+            tools.iter().map(|t| t.to_string()).collect(),
+            correction,
+            at,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -278,7 +299,10 @@ mod tests {
             v("what time is it", Label::NoTools, &[], None, 1),
             v("what time is it", Label::Corrected, &[], Some("noon"), 5),
         ];
-        assert_eq!(taught("what time is it", &all).expect("a routing verdict").label, Label::NoTools);
+        assert_eq!(
+            taught("what time is it", &all).expect("a routing verdict").label,
+            Label::NoTools
+        );
         assert!(taught("who wrote hamlet", &all).is_none());
     }
 
@@ -312,7 +336,13 @@ mod tests {
         };
         let all = vec![
             v("capital of france", Label::Corrected, &[], Some("Paris"), 1),
-            v("capital of france paris", Label::Corrected, &[], Some("It is Paris."), 2),
+            v(
+                "capital of france paris",
+                Label::Corrected,
+                &[],
+                Some("It is Paris."),
+                2,
+            ),
             blank,
             v("capital of france", Label::Good, &[], None, 4),
         ];
@@ -368,7 +398,13 @@ mod tests {
 
     #[test]
     fn labels_have_stable_wire_names() {
-        for label in [Label::Good, Label::Bad, Label::NoTools, Label::NeedsTools, Label::Corrected] {
+        for label in [
+            Label::Good,
+            Label::Bad,
+            Label::NoTools,
+            Label::NeedsTools,
+            Label::Corrected,
+        ] {
             assert_eq!(Label::of(label.wire()), Some(label));
         }
         assert_eq!(Label::of("nope"), None);

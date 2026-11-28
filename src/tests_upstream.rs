@@ -281,7 +281,10 @@ async fn call_with(h: &Hub, path: &str, body: Value, extra: &[(&str, &str)]) -> 
     for (k, v) in extra {
         r = r.header(*k, *v);
     }
-    let resp = hub::router(h.clone()).oneshot(r.body(axum::body::Body::from(body.to_string())).unwrap()).await.unwrap();
+    let resp = hub::router(h.clone())
+        .oneshot(r.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
     let (status, headers) = (resp.status(), resp.headers().clone());
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 22).await.unwrap();
     (status, headers, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
@@ -310,8 +313,15 @@ async fn a_busy_hub_passes_the_request_to_the_fabric() {
     let (st, headers, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(headers["x-mm-offloaded"].to_str().unwrap(), "1");
-    assert_eq!(v["choices"][0]["message"]["content"], "fabric", "the answer is the fabric's: {v}");
-    assert_eq!(busy.seen.load(Ordering::SeqCst), 0, "this hub's own server never saw it");
+    assert_eq!(
+        v["choices"][0]["message"]["content"], "fabric",
+        "the answer is the fabric's: {v}"
+    );
+    assert_eq!(
+        busy.seen.load(Ordering::SeqCst),
+        0,
+        "this hub's own server never saw it"
+    );
     assert_eq!(fabric.seen.load(Ordering::SeqCst), 1);
     // the hub counts what it passed on, by the node that served it (the stand-in does not name one)
     let (_, _, v) = call(&h, "POST", "/v1/call/fabric.status", json!({})).await;
@@ -340,7 +350,11 @@ async fn an_offloaded_request_is_charged_to_the_callers_key_with_the_tokens_the_
     let (_, _, u) = call(&h, "POST", "/v1/call/usage.get", json!({"key": "alice"})).await;
     let row = &u["result"][0];
     assert_eq!(
-        (row["requests"].as_u64(), row["prompt_tokens"].as_u64(), row["completion_tokens"].as_u64()),
+        (
+            row["requests"].as_u64(),
+            row["prompt_tokens"].as_u64(),
+            row["completion_tokens"].as_u64()
+        ),
         (Some(1), Some(3), Some(5)),
         "{u}"
     );
@@ -379,7 +393,13 @@ async fn an_unreachable_fabric_leaves_the_hubs_own_error() {
     let busy = full_stand_in("local").await;
     let h = serving(&home, &busy, true).await;
     // nothing listens on port 9
-    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"endpoint": "http://127.0.0.1:9"})).await;
+    let (st, _, v) = call(
+        &h,
+        "POST",
+        "/v1/call/fabric.set",
+        json!({"endpoint": "http://127.0.0.1:9"}),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let (st, _, v) = call(&h, "POST", "/v1/chat/completions", chat()).await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
@@ -392,11 +412,23 @@ async fn fabric_set_checks_its_input_and_leave_removes_the_settings() {
     let h = testing::hub(&home, &["tiny"]);
     let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"endpoint": "ftp://x"})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"offload": "sometimes", "api": "http://127.0.0.1:7878"})).await;
+    let (st, _, v) = call(
+        &h,
+        "POST",
+        "/v1/call/fabric.set",
+        json!({"offload": "sometimes", "api": "http://127.0.0.1:7878"}),
+    )
+    .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "an empty set joins nothing: {v}");
-    let (st, _, v) = call(&h, "POST", "/v1/call/fabric.set", json!({"api": "http://127.0.0.1:9/", "endpoint": "http://127.0.0.1:9"})).await;
+    let (st, _, v) = call(
+        &h,
+        "POST",
+        "/v1/call/fabric.set",
+        json!({"api": "http://127.0.0.1:9/", "endpoint": "http://127.0.0.1:9"}),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["result"]["api"], "http://127.0.0.1:9", "a trailing slash is dropped");
     assert_eq!(v["result"]["offload"], "when_full", "the default");
@@ -424,6 +456,12 @@ async fn machine_status_reports_the_room_a_load_has() {
     assert_eq!(r["loaded"], 0);
     assert!(r["gpus"].is_array());
     let (_, _, ops) = call(&h, "GET", "/v1/operations", json!({})).await;
-    let ids: Vec<&str> = ops["operations"].as_array().map(|a| a.iter().filter_map(|o| o["id"].as_str()).collect()).unwrap_or_default();
-    assert!(ids.contains(&"machine.status") && ids.contains(&"fabric.set"), "{ids:?}");
+    let ids: Vec<&str> = ops["operations"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|o| o["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        ids.contains(&"machine.status") && ids.contains(&"fabric.set"),
+        "{ids:?}"
+    );
 }

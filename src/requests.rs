@@ -288,7 +288,8 @@ mod tests {
         }
         let refused = q.ask("k1", "agent", "one-more", "", 2).unwrap_err();
         assert_eq!((refused.status, refused.code), (429, "too_many_requests"));
-        q.ask("k2", "other", "one-more", "", 2).expect("another key is not held up");
+        q.ask("k2", "other", "one-more", "", 2)
+            .expect("another key is not held up");
     }
 
     #[test]
@@ -320,9 +321,14 @@ mod tests {
             "approval_in_progress",
             "a deny during the load must not land"
         );
-        q.decide(r.id, RequestState::Approved, "loaded", 3).expect("the approval itself is recorded");
+        q.decide(r.id, RequestState::Approved, "loaded", 3)
+            .expect("the approval itself is recorded");
         q.release(r.id);
-        assert_eq!(q.claim(r.id).unwrap_err().code, "not_pending", "decided, so it cannot be claimed");
+        assert_eq!(
+            q.claim(r.id).unwrap_err().code,
+            "not_pending",
+            "decided, so it cannot be claimed"
+        );
 
         let again = q.ask("k1", "agent", "beta", "", 4).unwrap();
         q.claim(again.id).unwrap();
@@ -345,7 +351,11 @@ mod tests {
         assert!(q.get(waiting.id).is_some(), "a pending request is never dropped");
         let reopened = Queue::open(&dir);
         assert_eq!(reopened.get(waiting.id).unwrap().model, "keep-me");
-        assert_eq!(reopened.get(waiting.id).unwrap().key, "k1", "the key id is kept across a restart");
+        assert_eq!(
+            reopened.get(waiting.id).unwrap().key,
+            "k1",
+            "the key id is kept across a restart"
+        );
         assert_eq!(reopened.list(None).len(), KEEP + 1);
     }
 

@@ -397,14 +397,16 @@ fn rate(misty: &Misty, a: &Value) -> Res<Value> {
         .map_err(io)?
         .ok_or_else(|| Fail::not_found(format!("no finished run {run_id} (misty.run.list shows them)")))?;
     let name = s(a, "label")?;
-    let label = feedback::Label::of(name)
-        .ok_or_else(|| Fail::invalid(format!("label {name:?} is not one of good, bad, no_tools, needs_tools, corrected")))?;
+    let label = feedback::Label::of(name).ok_or_else(|| {
+        Fail::invalid(format!(
+            "label {name:?} is not one of good, bad, no_tools, needs_tools, corrected"
+        ))
+    })?;
     let offered: Vec<String> = run["events"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|e| e["type"] == "offer")
-        .last()
+        .rfind(|e| e["type"] == "offer")
         .and_then(|e| e["tools"].as_array())
         .map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
         .unwrap_or_default();
@@ -1190,14 +1192,27 @@ mod tests {
         let v = c(&r, "misty.ask", json!({"input": "capital of france"})).await.unwrap();
         let run = v["run"].as_str().unwrap().to_string();
         // no tool was offered for this reply, so none can be the one it should have used
-        let e = c(&r, "misty.rate", json!({"run": run, "label": "needs_tools"})).await.unwrap_err();
-        assert!(e.message.contains("no tool was offered"), "{}", e.message);
-        assert!(c(&r, "misty.rate", json!({"run": run, "label": "corrected"})).await.is_err(), "a correction needs the answer");
-        assert!(c(&r, "misty.rate", json!({"run": "nope", "label": "good"})).await.is_err());
-        assert!(c(&r, "misty.rate", json!({"run": run, "label": "fine"})).await.is_err());
-        let rated = c(&r, "misty.rate", json!({"run": run, "label": "corrected", "correction": "Paris"}))
+        let e = c(&r, "misty.rate", json!({"run": run, "label": "needs_tools"}))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(e.message.contains("no tool was offered"), "{}", e.message);
+        assert!(
+            c(&r, "misty.rate", json!({"run": run, "label": "corrected"}))
+                .await
+                .is_err(),
+            "a correction needs the answer"
+        );
+        assert!(c(&r, "misty.rate", json!({"run": "nope", "label": "good"}))
+            .await
+            .is_err());
+        assert!(c(&r, "misty.rate", json!({"run": run, "label": "fine"})).await.is_err());
+        let rated = c(
+            &r,
+            "misty.rate",
+            json!({"run": run, "label": "corrected", "correction": "Paris"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(rated["counts"]["corrected"], 1, "{rated}");
         let id = rated["id"].as_i64().unwrap();
         let list = c(&r, "misty.feedback.list", json!({})).await.unwrap();
@@ -1207,23 +1222,57 @@ mod tests {
         let train = c(&r, "misty.training.export", json!({})).await.unwrap();
         assert_eq!(train["count"], 1);
         assert!(train["jsonl"].as_str().unwrap().contains("Paris"));
-        assert!(c(&r, "misty.feedback.forget", json!({})).await.is_err(), "say which verdict, or all");
-        assert_eq!(c(&r, "misty.feedback.forget", json!({"id": id})).await.unwrap()["removed"], 1);
-        assert_eq!(c(&r, "misty.feedback.list", json!({})).await.unwrap()["counts"]["total"], 0);
+        assert!(
+            c(&r, "misty.feedback.forget", json!({})).await.is_err(),
+            "say which verdict, or all"
+        );
+        assert_eq!(
+            c(&r, "misty.feedback.forget", json!({"id": id})).await.unwrap()["removed"],
+            1
+        );
+        assert_eq!(
+            c(&r, "misty.feedback.list", json!({})).await.unwrap()["counts"]["total"],
+            0
+        );
 
         // a correction given by voice on a reply that was not a run: no run to look up, but the same kind of verdict
-        let taught = c(&r, "misty.teach", json!({"question": "capital of spain", "answer": "Lyon.", "correction": "Madrid"}))
-            .await
-            .unwrap();
+        let taught = c(
+            &r,
+            "misty.teach",
+            json!({"question": "capital of spain", "answer": "Lyon.", "correction": "Madrid"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(taught["label"], "corrected", "{taught}");
         assert_eq!(taught["counts"]["corrected"], 1);
-        assert!(c(&r, "misty.teach", json!({"question": "x", "answer": "y", "correction": "  "})).await.is_err(), "a blank correction is refused");
-        assert!(c(&r, "misty.teach", json!({"question": " ", "answer": "y", "correction": "z"})).await.is_err(), "a question is needed");
+        assert!(
+            c(
+                &r,
+                "misty.teach",
+                json!({"question": "x", "answer": "y", "correction": "  "})
+            )
+            .await
+            .is_err(),
+            "a blank correction is refused"
+        );
+        assert!(
+            c(
+                &r,
+                "misty.teach",
+                json!({"question": " ", "answer": "y", "correction": "z"})
+            )
+            .await
+            .is_err(),
+            "a question is needed"
+        );
         let list = c(&r, "misty.feedback.list", json!({})).await.unwrap();
         assert_eq!(list["verdicts"][0]["question"], "capital of spain");
         assert_eq!(list["verdicts"][0]["answer"], "Lyon.");
         assert_eq!(list["verdicts"][0]["correction"], "Madrid");
-        assert_eq!(c(&r, "misty.feedback.forget", json!({"all": true})).await.unwrap()["removed"], 1);
+        assert_eq!(
+            c(&r, "misty.feedback.forget", json!({"all": true})).await.unwrap()["removed"],
+            1
+        );
     }
 
     #[tokio::test]

@@ -365,7 +365,17 @@ impl Store {
             let (id, question, answer, label, tools, correction, at) = row.map_err(|e| e.to_string())?;
             let Some(label) = Label::of(&label) else { continue };
             let tools: Vec<String> = serde_json::from_str(&tools).unwrap_or_default();
-            out.push((id, Verdict { question, answer, label, tools, correction, at }));
+            out.push((
+                id,
+                Verdict {
+                    question,
+                    answer,
+                    label,
+                    tools,
+                    correction,
+                    at,
+                },
+            ));
         }
         Ok(out)
     }
@@ -551,8 +561,15 @@ mod tests {
         let s = Store::memory().unwrap();
         let v = Verdict::new("what time is it", "noon", Label::NoTools, vec![], None, 1).unwrap();
         let id = s.save_feedback(&v).unwrap();
-        let fix = Verdict::new("capital of france", "Lyon", Label::Corrected, vec!["calc".into()], Some("Paris"), 2)
-            .unwrap();
+        let fix = Verdict::new(
+            "capital of france",
+            "Lyon",
+            Label::Corrected,
+            vec!["calc".into()],
+            Some("Paris"),
+            2,
+        )
+        .unwrap();
         s.save_feedback(&fix).unwrap();
         let rows = s.feedback().unwrap();
         assert_eq!(rows.len(), 2);
