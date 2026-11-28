@@ -29,7 +29,8 @@ the device's address here). Until the owner decides the default, check which app
 ## A Telegram bot
 
 1. In Telegram, message @BotFather, send `/newbot`, and copy the token it gives you.
-2. Under **Chat bots**, add a bot, choose the service Telegram, paste the token, and **Check token**.
+2. Under **Chat bots**, add a bot, choose the service Telegram, paste the token, and **Check token**. The check tests the token
+   you typed, so you can check before you save.
 3. Send the bot a message from the chat you want to allow. It replies with that chat's id. Put the id under
    **Chats allowed** (a group has a negative id), turn the bot **On**, and **Save bots**.
 4. `/reset` starts a new conversation. Conversations are kept in memory, so restarting the hub forgets them.
@@ -43,6 +44,23 @@ the device's address here). Until the owner decides the default, check which app
 5. Under **People allowed**, add your own user id (Discord's Developer Mode copies it). Turn the bot **On** and **Save bots**.
 
 A direct message to the bot is answered. In a server, the bot answers only a message that mentions it.
+
+## Each bot's settings
+
+Every bot has its own settings, and **Save bots** applies them all. A bot that is on restarts when its settings change.
+
+- **Token.** A saved token is never shown: the field stays empty and says it is saved. Type a token to replace it, use
+  **Show token** to check what you typed, and **Remove saved token** to delete it when you save. A bot that is on needs a token.
+- **Name.** Renaming a saved bot keeps its token.
+- **Allowed.** The chat ids (Telegram) or user ids (Discord) that may talk to the bot. Someone not on the list is told their id.
+- **Model.** The router's choice (Auto), or one of the hub's chat models. A model the hub no longer has stays in the list,
+  marked, so the setting is not lost.
+- **Messages remembered.** How many messages of each conversation the model sees, from 2 to 200; the default is 20. A question
+  and its answer are two messages.
+- **Instructions.** Optional. They are sent to the model at the start of every conversation, and are not kept in the history.
+- **Status.** The line under the name says whether the bot runs, how many messages it answered and refused, and the last
+  error its service gave (for example, a token the service refused).
+- **Remove this bot** asks first when the bot is saved, and its token is removed when you save bots.
 
 ## Where the secrets are
 

@@ -51,13 +51,18 @@ The operation `quantize` takes `model` (an id) or `input` (a `.gguf` path), `typ
   the job and says why. The key is never shown.
 - `device.check` (`{"device"}`) asks the device's `/v1/health` (10 seconds) and returns `{device, reachable, status, answer}`.
 - `bots.status` lists the bots with whether each one runs, how many messages it answered and refused, and its last error.
-  `bots.check` (`{"bot"}`) asks the service whether the token works (Telegram `getMe`, Discord `users/@me`) and returns the
-  bot's username. The token is never returned.
+  `bots.check` takes `kind` (`telegram` or `discord`), an optional `token` (the one typed in the form, which is checked
+  before anything is saved), and an optional `bot` (a saved bot's name, whose saved token is checked when no token is typed).
+  It asks the service whether the token works (Telegram `getMe`, Discord `users/@me`) and returns the bot's username. The
+  token is never returned.
 
 Settings: `bots` holds each bot's `name`, `kind` (`telegram` or `discord`), `token`, `model` (empty: the router chooses),
-`allowed_chats` (Telegram chat ids, or Discord user ids), `enabled`, `api_base` and `gateway` (empty for the services' own
-addresses). `devices` holds each device's `name`, `url` and `key`. `config.get` shows a token or key as `(set)`, and sending
-`(set)` back keeps the saved one. A Discord bot needs its Message Content intent turned on, or a server message has no text.
+`allowed_chats` (Telegram chat ids, or Discord user ids), `enabled`, `instructions` (sent to the model as a system message at
+the start of each conversation, not kept in the history), `remember` (messages of a conversation the model sees, 2 to 200;
+0 means 20), `api_base` and `gateway` (empty for the services' own addresses). A bot sent with `previous_name` is renamed,
+and keeps the token it had. `devices` holds each device's `name`, `url` and `key`. `config.get` shows a token or key as
+`(set)`, and sending `(set)` back keeps the saved one. A Discord bot needs its Message Content intent turned on, or a
+server message has no text.
 
 See [connect.md](connect.md) for the steps.
 

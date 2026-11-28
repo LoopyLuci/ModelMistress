@@ -1273,15 +1273,22 @@ pub async fn call(hub: &Hub, id: &str, a: &Value) -> ApiResult<Value> {
             json!({"device": name, "reachable": (200..300).contains(&status), "status": status, "answer": body})
         }
         "bots.check" => {
-            let name = s(a, "bot")?;
-            let bot = e
-                .settings()
-                .bots
-                .into_iter()
-                .find(|b| b.name == name)
-                .ok_or_else(|| Fail::not_found(format!("no bot named {name:?}")))?;
+            // the token the form has (even for a bot not saved yet), else the saved token of the bot named
+            let saved = match a.get("bot").and_then(Value::as_str) {
+                Some(name) => Some(
+                    e.settings()
+                        .bots
+                        .into_iter()
+                        .find(|b| b.name == name)
+                        .ok_or_else(|| Fail::not_found(format!("no bot named {name:?}")))?,
+                ),
+                None => None,
+            };
+            let kind = a.get("kind").and_then(Value::as_str);
+            let typed = a.get("token").and_then(Value::as_str);
+            let bot = crate::bots::check_target(saved, kind, typed).map_err(Fail::invalid)?;
             let username = crate::bots::token_user(&bot).await.map_err(Fail::unavailable)?;
-            json!({"bot": name, "username": username})
+            json!({"bot": a.get("bot").and_then(Value::as_str).unwrap_or(""), "username": username})
         }
         "speech.transcribe" => {
             let path = s(a, "file")?;
@@ -2832,6 +2839,26 @@ unrelated line
         // sending a model the catalog does not hold is refused by name, after the device is found
         let unknown = call(&h, "device.send", &json!({"device": "phone", "model": "no-such-model"})).await;
         assert_eq!(unknown.expect_err("an unknown model is refused").0.code, "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_bot_keeps_its_token_and_a_check_with_no_token_says_so() {
+        let home = crate::testing::temp_home();
+        let h = hub(&home);
+        // saved off, so nothing starts and no network is touched
+        let first = json!({"settings": {"bots": [{"name": "b1", "kind": "telegram", "token": "123:SECRET", "enabled": false}]}});
+        assert!(call(&h, "config.set", &first).await.is_ok());
+        // the form renames it and sends the token back as (set): the token moves with the name
+        let renamed = json!({"settings": {"bots": [{"name": "b2", "previous_name": "b1", "kind": "telegram", "token": "(set)", "enabled": false}]}});
+        assert!(call(&h, "config.set", &renamed).await.is_ok());
+        let bots = h.engine.settings().bots;
+        assert_eq!((bots[0].name.as_str(), bots[0].token.as_str()), ("b2", "123:SECRET"));
+        // a check with no token typed and nothing saved under that name is refused before any network call
+        let err = call(&h, "bots.check", &json!({"kind": "telegram", "token": ""}))
+            .await
+            .expect_err("there is no token to check");
+        assert_eq!(err.0.code, "invalid");
+        assert!(err.0.message.contains("type one"), "{}", err.0.message);
     }
 
     #[tokio::test]

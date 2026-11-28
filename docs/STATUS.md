@@ -71,6 +71,8 @@ in `src/tests_upstream.rs`.
 - **Connect, phones and chat bots.** The Connect software tab makes a key per peer, and a snippet for each tool. A model
   goes from the desktop to a phone with `device.send`, as a job with progress and Stop. A stopped or failed download
   starts again (`job.restart`). Telegram and Discord bots answer the people allowed to them through the hub's chat route.
+  Each bot's token, allowed people, model, instructions and memory are set in the Connect software tab, and a token is
+  checked before it is saved. Not tried: a live Telegram or Discord bot with a real token.
   The Rust side, the frontend and the phone's server code are tested (685 library tests); a model sent to a phone was
   checked by SHA-256. A live bot is not tried yet (see the CHANGELOG).
 - The catalog: 13 models found across an Ollama store and a Hugging Face cache, with GGUF metadata; the vision

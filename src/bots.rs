@@ -21,8 +21,11 @@ use crate::hub::Hub;
 const TELEGRAM_API: &str = "https://api.telegram.org";
 /// Telegram takes 4096 characters a message; a little less, so the limit is never reached by accident.
 const MAX_MESSAGE_CHARS: usize = 4000;
-/// Messages of conversation kept per chat: a question and its answer are two.
-const MAX_MESSAGES: usize = 20;
+/// Messages of conversation kept per chat when a bot does not say otherwise: a question and its answer are two.
+const DEFAULT_REMEMBER: usize = 20;
+/// The most messages a bot may be told to remember, and the longest instructions it may carry.
+const MAX_REMEMBER: usize = 200;
+const MAX_INSTRUCTIONS_CHARS: usize = 4000;
 const POLL_SECONDS: u64 = 25;
 const RETRY_AFTER: Duration = Duration::from_secs(10);
 const HELP: &str = "Send a message and the model answers. /reset starts a new conversation.";
@@ -47,6 +50,10 @@ pub struct BotConfig {
     pub api_base: String,
     /// The Discord gateway address, a WebSocket. Empty means Discord's own; a test points it at a local server.
     pub gateway: String,
+    /// What the model is told at the start of every conversation with this bot, as a system message. Empty: nothing.
+    pub instructions: String,
+    /// How many messages of a conversation the bot keeps for the model (a question and its answer are two). 0 means 20.
+    pub remember: usize,
 }
 
 impl BotConfig {
@@ -55,6 +62,14 @@ impl BotConfig {
             "auto"
         } else {
             self.model.trim()
+        }
+    }
+
+    fn remember_or_default(&self) -> usize {
+        if self.remember == 0 {
+            DEFAULT_REMEMBER
+        } else {
+            self.remember
         }
     }
 }
@@ -78,6 +93,14 @@ pub fn check(bots: &[BotConfig]) -> Result<(), String> {
         }
         if b.enabled && b.token.trim().is_empty() {
             return Err(format!("bot {name:?} is on but has no token"));
+        }
+        if b.remember > MAX_REMEMBER {
+            return Err(format!("bot {name:?}: it can remember at most {MAX_REMEMBER} messages"));
+        }
+        if b.instructions.chars().count() > MAX_INSTRUCTIONS_CHARS {
+            return Err(format!(
+                "bot {name:?}: the instructions are longer than {MAX_INSTRUCTIONS_CHARS} characters"
+            ));
         }
         let who = if b.kind == "discord" {
             "a Discord user id"
@@ -110,7 +133,8 @@ pub fn shown(bots: &[BotConfig]) -> Value {
         .collect::<Vec<_>>())
 }
 
-/// The `bots` list a config.set sends back: a token shown as `(set)` keeps the token the bot of that name has now.
+/// The `bots` list a config.set sends back: a token shown as `(set)` keeps the token the bot has now. The bot is found by
+/// its `previous_name` when the form renamed it, so a rename keeps the token; else by its name.
 pub fn keep_tokens(incoming: &Value, current: &[BotConfig]) -> Value {
     let Some(list) = incoming.as_array() else {
         return incoming.clone();
@@ -120,7 +144,11 @@ pub fn keep_tokens(incoming: &Value, current: &[BotConfig]) -> Value {
         .map(|b| {
             let mut b = b.clone();
             if b.get("token").and_then(Value::as_str) == Some("(set)") {
-                let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                let name = b
+                    .get("previous_name")
+                    .or_else(|| b.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let kept = current
                     .iter()
                     .find(|c| c.name == name)
@@ -131,6 +159,35 @@ pub fn keep_tokens(incoming: &Value, current: &[BotConfig]) -> Value {
             b
         })
         .collect::<Vec<_>>())
+}
+
+/// The bot a check uses, for `bots.check`: the form's token when it has one, else the saved token of `saved` (the bot as
+/// the settings hold it, which keeps its address). The service is the one the form names, else the saved bot's. `(set)` is
+/// not a token. A bot that is not saved yet has no saved token, so it needs one typed.
+pub fn check_target(saved: Option<BotConfig>, kind: Option<&str>, typed: Option<&str>) -> Result<BotConfig, String> {
+    let kind = match kind.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => saved
+            .as_ref()
+            .map(|b| b.kind.clone())
+            .ok_or("say which service the token is for: telegram or discord")?,
+    };
+    if kind != "telegram" && kind != "discord" {
+        return Err(format!("kind {kind:?} is not known (telegram and discord are)"));
+    }
+    let typed = typed.map(str::trim).filter(|t| !t.is_empty() && *t != "(set)");
+    let token = match (typed, &saved) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(b)) => b.token.trim().to_string(),
+        (None, None) => String::new(),
+    };
+    if token.is_empty() {
+        return Err("there is no token to check: type one".into());
+    }
+    let mut bot = saved.unwrap_or_default();
+    bot.kind = kind;
+    bot.token = token;
+    Ok(bot)
 }
 
 /// A Telegram Bot API client for one bot. Errors never include the token (`without_url` drops the address they name).
@@ -233,6 +290,9 @@ pub enum Replier {
     Fixed(String),
     #[cfg(test)]
     Failing(String),
+    /// Keeps the messages each request carried, and answers "ok".
+    #[cfg(test)]
+    Recorded(Arc<Mutex<Vec<Vec<Value>>>>),
 }
 
 impl Replier {
@@ -256,6 +316,11 @@ impl Replier {
             Replier::Fixed(text) => Ok(text.clone()),
             #[cfg(test)]
             Replier::Failing(why) => Err(why.clone()),
+            #[cfg(test)]
+            Replier::Recorded(seen) => {
+                seen.lock().push(messages);
+                Ok("ok".to_string())
+            }
         }
     }
 }
@@ -288,6 +353,8 @@ pub struct Session {
     kind: String,
     allowed: HashSet<String>,
     model: String,
+    instructions: String,
+    remember: usize,
     histories: HashMap<String, Vec<Value>>,
 }
 
@@ -297,6 +364,8 @@ impl Session {
             kind: config.kind.clone(),
             allowed: config.allowed_chats.iter().map(|c| c.trim().to_string()).collect(),
             model: config.model_or_auto().to_string(),
+            instructions: config.instructions.trim().to_string(),
+            remember: config.remember_or_default(),
             histories: HashMap::new(),
         }
     }
@@ -329,13 +398,20 @@ impl Session {
                 answered("Started a new conversation.".to_string())
             }
             text => {
+                let remember = self.remember;
                 let history = self.histories.entry(incoming.conversation.clone()).or_default();
                 history.push(json!({"role": "user", "content": text}));
-                match replier.answer(&self.model, history.clone()).await {
+                // the instructions lead every request, and are not part of the history they trim
+                let mut messages = Vec::with_capacity(history.len() + 1);
+                if !self.instructions.is_empty() {
+                    messages.push(json!({"role": "system", "content": self.instructions}));
+                }
+                messages.extend(history.iter().cloned());
+                match replier.answer(&self.model, messages).await {
                     Ok(answer) => {
                         history.push(json!({"role": "assistant", "content": answer}));
-                        if history.len() > MAX_MESSAGES {
-                            let extra = history.len() - MAX_MESSAGES;
+                        if history.len() > remember {
+                            let extra = history.len() - remember;
                             history.drain(..extra);
                         }
                         answered(answer)
@@ -628,7 +704,7 @@ mod tests {
         }
         assert_eq!(
             session.histories["42"].len(),
-            MAX_MESSAGES,
+            DEFAULT_REMEMBER,
             "the oldest turns are dropped"
         );
         session.handle(&message(99, 42, "/reset"), &replier, &tg).await.unwrap();
@@ -636,6 +712,131 @@ mod tests {
             !session.histories.contains_key("42"),
             "/reset starts a new conversation"
         );
+    }
+
+    #[tokio::test]
+    async fn the_instructions_lead_every_request_and_the_history_keeps_the_chosen_length() {
+        let (_fake, tg, mut config) = fake_api("123:SECRET").await;
+        config.instructions = "  Answer in one sentence.  ".into();
+        config.remember = 4;
+        let mut session = Session::new(&config);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let replier = Replier::Recorded(seen.clone());
+        for i in 0..3 {
+            session.handle(&message(i, 42, "again"), &replier, &tg).await.unwrap();
+        }
+        let asked = seen.lock();
+        // the first request: the instructions (trimmed), then the question
+        assert_eq!(
+            asked[0],
+            vec![
+                json!({"role": "system", "content": "Answer in one sentence."}),
+                json!({"role": "user", "content": "again"}),
+            ]
+        );
+        // the third request: the instructions, then the history of two questions and their answers, and the new question
+        assert_eq!(asked[2].len(), 1 + 5);
+        assert_eq!(asked[2][0]["role"], "system");
+        assert_eq!(asked[2][1]["role"], "user");
+        // after the answer, only the last four messages are kept, and the instructions are not among them
+        assert_eq!(session.histories["42"].len(), 4);
+        assert!(session.histories["42"].iter().all(|m| m["role"] != "system"));
+    }
+
+    #[test]
+    fn remember_and_instructions_are_checked_for_each_bot() {
+        let mut bot = BotConfig {
+            name: "b1".into(),
+            kind: "telegram".into(),
+            ..Default::default()
+        };
+        assert_eq!(BotConfig::default().remember_or_default(), DEFAULT_REMEMBER);
+        assert!(check(std::slice::from_ref(&bot)).is_ok(), "0 means the default");
+        bot.remember = MAX_REMEMBER;
+        assert!(check(std::slice::from_ref(&bot)).is_ok());
+        bot.remember = MAX_REMEMBER + 1;
+        assert!(check(std::slice::from_ref(&bot))
+            .unwrap_err()
+            .contains("remember at most 200"));
+        bot.remember = 0;
+        bot.instructions = "x".repeat(MAX_INSTRUCTIONS_CHARS + 1);
+        assert!(check(std::slice::from_ref(&bot))
+            .unwrap_err()
+            .contains("longer than 4000"));
+    }
+
+    #[test]
+    fn a_renamed_bot_keeps_the_token_it_had() {
+        let current = vec![BotConfig {
+            name: "old".into(),
+            kind: "telegram".into(),
+            token: "123:SECRET".into(),
+            ..Default::default()
+        }];
+        // the form renamed the bot: (set) with its previous name keeps the token
+        let renamed = json!([{"name": "new", "previous_name": "old", "token": "(set)"}]);
+        assert_eq!(keep_tokens(&renamed, &current)[0]["token"], "123:SECRET");
+        // a bot that kept its name is found by it
+        let same = json!([{"name": "old", "token": "(set)"}]);
+        assert_eq!(keep_tokens(&same, &current)[0]["token"], "123:SECRET");
+        // a token typed in the form is used as it is
+        let typed = json!([{"name": "new", "previous_name": "old", "token": "999:NEW"}]);
+        assert_eq!(keep_tokens(&typed, &current)[0]["token"], "999:NEW");
+        // a previous name nobody had keeps nothing
+        let nobody = json!([{"name": "x", "previous_name": "gone", "token": "(set)"}]);
+        assert_eq!(keep_tokens(&nobody, &current)[0]["token"], "");
+    }
+
+    #[test]
+    fn a_check_uses_the_typed_token_or_the_saved_one_and_says_what_is_missing() {
+        let saved = BotConfig {
+            name: "b1".into(),
+            kind: "telegram".into(),
+            token: "111:SAVED".into(),
+            api_base: "http://local".into(),
+            ..Default::default()
+        };
+        // the typed token is used, and the saved bot keeps its address
+        let typed = check_target(Some(saved.clone()), None, Some(" 222:TYPED ")).unwrap();
+        assert_eq!(typed.token, "222:TYPED");
+        assert_eq!(typed.kind, "telegram");
+        assert_eq!(typed.api_base, "http://local");
+        // nothing typed, or (set): the saved token
+        assert_eq!(
+            check_target(Some(saved.clone()), None, None).unwrap().token,
+            "111:SAVED"
+        );
+        assert_eq!(
+            check_target(Some(saved.clone()), None, Some("(set)")).unwrap().token,
+            "111:SAVED"
+        );
+        // the service the form names wins over the saved one
+        assert_eq!(
+            check_target(Some(saved.clone()), Some("discord"), None).unwrap().kind,
+            "discord"
+        );
+        // a bot not saved yet has no saved token, so it needs one typed
+        assert_eq!(
+            check_target(None, Some("telegram"), Some("333:NEW")).unwrap().token,
+            "333:NEW"
+        );
+        assert!(check_target(None, Some("telegram"), None)
+            .unwrap_err()
+            .contains("type one"));
+        assert!(check_target(None, None, Some("333:NEW"))
+            .unwrap_err()
+            .contains("which service"));
+        assert!(check_target(None, Some("slack"), Some("1"))
+            .unwrap_err()
+            .contains("not known"));
+        // a saved bot whose token was cleared, and nothing typed
+        let cleared = BotConfig {
+            token: String::new(),
+            ..saved.clone()
+        };
+        assert!(check_target(Some(cleared), None, None)
+            .unwrap_err()
+            .contains("type one"));
     }
 
     #[tokio::test]

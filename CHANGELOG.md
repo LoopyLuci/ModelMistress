@@ -22,14 +22,24 @@
   user ids; nobody is allowed by default. `bots.check` proves a token, and `bots.status` shows answers and refusals.
   `/reset` starts a conversation again. Conversations are kept in memory, so a restart forgets them (`src/bots.rs`,
   `src/discord.rs`).
+- **Bot settings in the GUI** (Connect software, Chat bots). Each bot has its own token, allowed people, model, instructions
+  and memory, and **Save bots** applies them all. A token is checked before it is saved: **Check token** tests what you typed
+  (`bots.check` takes `kind` and `token`), so a bot not saved yet can be checked too. A saved token is never shown; it can be
+  replaced or removed. Renaming a saved bot keeps its token (`previous_name`). The model is a choice from the hub's chat models
+  or the router. Instructions go to the model as a system message; **Messages remembered** sets how many messages of a
+  conversation it keeps (2 to 200, default 20). The status shows the last error of the service, which it did not before.
+  Removing a saved bot asks first. The form's logic is in `frontend/src/bots.ts` (13 tests); `src/bots.rs` has tests for
+  the check target, the instructions and memory, and the rename, and `src/hub.rs` has one for a rename and a check with no token.
 - **Phone side.** The streamed upload route, the receiving library (it refuses a model when less than 512 MiB would be
   left), and Restart for a phone download. `UploadTest` (four) and `HttpTest` (four) pass under `:server:test`, and
   `:runtime:compileDebugKotlin` compiles.
 - Not done: Telegram and Discord bots on the phone.
-- Tested: `cargo test -p model-mistress --lib` passes (685 tests, 6 ignored). That covers the Discord module (three
+- Tested: `cargo test -p model-mistress --lib` passes (690 tests, 6 ignored). That covers the Discord module (three
   tests against a fake gateway and REST API), the Telegram tests in `src/bots.rs`, the device send and its refusals,
   the hub's bot, device and restart operations, and the restart of a stopped download. `cargo clippy` reports no
-  warning from these files. The frontend passes: 235 tests and a clean typecheck.
+  warning from these files. The frontend passes: 245 tests and a clean typecheck. The pipeline's rustfmt and clippy steps pass.
+  In a browser against a scratch hub (a fake token, nothing saved to the owner's hub): a new bot's token was checked before
+  saving, the saved bot kept its token through a rename, and a removed token was refused on save with the reason.
   Tested on a phone: `device.send` sent an 84 MB embedding model from the hub to the ModelMistress app's server on a
   phone. The copy's SHA-256 matched the source, and the app lists it. A request without the phone's key is refused before
   any bytes are stored. Not tried: a real Telegram or Discord bot, and a model answer through a bot.
