@@ -18,6 +18,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.Closeable
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -27,6 +28,17 @@ import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+
+/** The route a device is sent a model on, from the desktop's Models page: the body is the model file, raw. */
+const val UPLOAD_PATH = "/mm/v1/models/upload"
+
+/**
+ * Takes a model file that another ModelMistress sent to this device. The bytes are streamed from [body] into storage,
+ * so a model of many gigabytes is never held in memory. Returns the id the model is listed under.
+ */
+interface ModelUploads {
+    fun receive(name: String, body: InputStream, bytes: Long): String
+}
 
 data class ServerConfig(
     val host: String = "127.0.0.1",
@@ -53,6 +65,8 @@ class ModelMistressServer(
      */
     private val services: RouterServices? = null,
     private val log: (String) -> Unit = {},
+    /** Takes the model files that devices are sent (see [ModelUploads]). Without it the upload route is not served. */
+    private val uploads: ModelUploads? = null,
 ) : Closeable {
     private var listener: ServerSocket? = null
     private var workers: ExecutorService? = null
@@ -118,8 +132,14 @@ class ModelMistressServer(
             val output = BufferedOutputStream(socket.getOutputStream())
             val writer = HttpResponseWriter(output)
             try {
-                val request = HttpReader.read(BufferedInputStream(socket.getInputStream()), config.maxBodyBytes)
-                route(request, writer)
+                val input = BufferedInputStream(socket.getInputStream())
+                val head = HttpReader.readRequestHead(input)
+                if (uploads != null && head.method == "POST" && head.path == UPLOAD_PATH) {
+                    // a model file is far bigger than any body held in memory: it is streamed, not read first
+                    upload(head, input, writer, uploads)
+                } else {
+                    route(HttpReader.withBody(head, input, config.maxBodyBytes), writer)
+                }
             } catch (error: HttpException) {
                 fail(writer, error.status, "invalid_request", error.message.orEmpty())
             } catch (error: ApiException) {
@@ -140,6 +160,16 @@ class ModelMistressServer(
                 // Already closed by the client.
             }
         }
+    }
+
+    /** Takes one model file a device was sent. The key is checked before any byte is stored. */
+    private fun upload(head: HttpRequest, input: InputStream, writer: HttpResponseWriter, store: ModelUploads) {
+        authorize(head)
+        val length = head.header("content-length")?.toLongOrNull()
+            ?: throw ApiException(411, "length_required", "Send the model with its Content-Length.")
+        val name = parseQuery(head.query)["name"].orEmpty()
+        val id = store.receive(name, input, length)
+        writer.json(200, Json.write(mapOf("id" to id, "bytes" to length)))
     }
 
     private fun route(request: HttpRequest, writer: HttpResponseWriter) {

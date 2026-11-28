@@ -6,6 +6,7 @@ import com.modelmistress.core.agent.AgentService
 import com.modelmistress.core.agent.AgentSettings
 import com.modelmistress.core.agent.Approval
 import com.modelmistress.core.agent.Approvals
+import com.modelmistress.core.chat.ApiException
 import com.modelmistress.core.chat.ChatStore
 import com.modelmistress.core.chat.FileChatStore
 import com.modelmistress.core.chat.ModelCatalog
@@ -16,10 +17,12 @@ import com.modelmistress.core.remote.CombinedCatalog
 import com.modelmistress.core.environment.EnvironmentStore
 import com.modelmistress.runtime.overlay.TransferdOverlay
 import com.modelmistress.server.ModelMistressServer
+import com.modelmistress.server.ModelUploads
 import com.modelmistress.server.RouterServices
 import com.modelmistress.server.ServerConfig
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
@@ -110,6 +113,19 @@ class ModelRuntime private constructor(context: Context) {
 
     private var server: ModelMistressServer? = null
 
+    /** The model files another ModelMistress sends this phone, stored in the library (see ModelUploads). */
+    private fun receivedModels(): ModelUploads = object : ModelUploads {
+        override fun receive(name: String, body: InputStream, bytes: Long): String = try {
+            library.receive(name, body, bytes).id
+        } catch (error: NoRoom) {
+            throw ApiException(507, "no_space", error.message.orEmpty())
+        } catch (error: IllegalArgumentException) {
+            throw ApiException(400, "invalid_model", error.message.orEmpty())
+        } catch (error: IOException) {
+            throw ApiException(500, "upload_failed", "The model could not be saved on this device: ${error.message}")
+        }
+    }
+
     /** Starts the server with the current settings and returns the state it is in afterwards. */
     @Synchronized
     fun startServer(): ServerState {
@@ -126,7 +142,14 @@ class ModelRuntime private constructor(context: Context) {
             version = ROUTER_VERSION,
             images = imageHub.models().isNotEmpty(),
         )
-        val created = ModelMistressServer(ModelRouter(catalog), config, imageHub, services) { line -> Log.i(TAG, line) }
+        val created = ModelMistressServer(
+            router = ModelRouter(catalog),
+            config = config,
+            images = imageHub,
+            services = services,
+            log = { line -> Log.i(TAG, line) },
+            uploads = receivedModels(),
+        )
         try {
             val port = created.start()
             server = created

@@ -11,6 +11,12 @@
       <button v-for="t in tabs" :key="t.id" role="tab" :aria-selected="tab === t.id" @click="tab = t.id">{{ t.label }}<span v-if="t.n" class="pill"> {{ t.n }}</span></button>
     </div>
 
+    <!-- Running downloads, and stopped or failed ones to start again, on every tab (the Downloads tab lists them all) -->
+    <section v-if="tab !== 'downloads' && live.length" class="card" aria-label="Downloads in progress">
+      <h3>Downloads in progress</h3>
+      <DownloadCard v-for="j in live" :key="j.job" :job="j" @stop="cancelJob" @restart="restartJob" />
+    </section>
+
     <!-- Installed ------------------------------------------------------------------------------------------------ -->
     <template v-if="tab === 'installed'">
       <section v-if="loadedList.length" class="card" aria-label="Loaded models">
@@ -70,6 +76,17 @@
             <button v-if="!m.loaded" class="btn primary" type="button" :disabled="busy" @click="openLoad(m)">Load...</button>
             <button v-else class="btn" type="button" :disabled="busy" @click="unload(m.id)">Unload</button>
             <router-link v-if="isChatModel(m)" class="btn" :to="{ path: '/', query: { model: m.id } }">Chat</router-link>
+            <select
+              v-if="phones.length && canSendTo(m)"
+              :id="`send-${m.id}`"
+              :value="''"
+              :disabled="busy"
+              aria-label="Send this model to a phone or other device"
+              @change="sendTo(m, ($event.target as HTMLSelectElement))"
+            >
+              <option value="">Send to phone...</option>
+              <option v-for="p in phones" :key="p" :value="p">{{ p }}</option>
+            </select>
             <button class="btn" type="button" @click="toggleEdit(m)">{{ editFor === m.id ? 'Close settings' : 'Settings' }}</button>
             <button class="btn" type="button" @click="toggleInfo(m)">{{ info[m.id] ? 'Hide details' : 'Details' }}</button>
             <button
@@ -369,21 +386,15 @@
       </section>
     </template>
 
+    <!-- Connect software ----------------------------------------------------------------------------------------- -->
+    <template v-if="tab === 'connect'">
+      <ConnectPanel />
+    </template>
+
     <!-- Downloads ------------------------------------------------------------------------------------------------ -->
     <template v-if="tab === 'downloads'">
       <p v-if="!jobs.length" class="muted">No downloads yet.</p>
-      <div v-for="j in jobs" :key="j.job" class="card">
-        <div class="row">
-          <strong class="grow name">{{ j.model }}</strong>
-          <span class="pill" :class="j.status === 'done' ? 'good' : j.status === 'failed' ? 'bad' : j.status">{{ j.status }}</span>
-          <button v-if="j.status === 'running'" class="btn" type="button" @click="cancelJob(j.job)">Stop</button>
-        </div>
-        <progress v-if="j.status === 'running'" :value="j.percent" max="100" class="prog" :aria-label="`Download progress ${j.percent}%`"></progress>
-        <p class="muted small">
-          <template v-if="j.status === 'running'">{{ j.percent }}% of {{ fmtBytes(j.total_bytes) }}, {{ j.mb_per_s }} MB/s. </template>
-          {{ j.message }}
-        </p>
-      </div>
+      <DownloadCard v-for="j in jobs" :key="j.job" :job="j" @stop="cancelJob" @restart="restartJob" />
     </template>
 
     <ConfirmDialog :open="!!askDelete" title="Delete this model?" action="Delete" @confirm="doDelete" @cancel="askDelete = ''">
@@ -397,6 +408,10 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import ConnectPanel from '@/components/ConnectPanel.vue'
+import DownloadCard from '@/components/DownloadCard.vue'
+import { liveDownloads } from '@/downloads'
+import { canSendTo } from '@/devices'
 import { call } from '@/transport'
 import { fmtBytes } from '@/util'
 import { importModel } from '@/modelImport'
@@ -404,7 +419,8 @@ import { groupModels, isChatModel, listModels, loadedModels, type HubModel, type
 import { BRAIN_ROLES, ROLE_HELP, SOURCE_LABEL, STATUS_TEXT, pickText, routerStatus, setRole, suitsRole, type Pick, type RoleView, type RouterStatus } from '@/chat/router'
 import { FIELDS, describe, isCustom, readProfiles, saveProfile, toForm, toProfile, type Form, type Profile } from '@/chat/profiles'
 
-type TabId = 'installed' | 'router' | 'speed' | 'find' | 'downloads'
+type TabId = 'installed' | 'router' | 'speed' | 'find' | 'connect' | 'downloads'
+const TAB_IDS: string[] = ['installed', 'router', 'speed', 'find', 'connect', 'downloads']
 
 const route = useRoute()
 const models = ref<HubModel[]>([])
@@ -415,7 +431,7 @@ const busy = ref(false)
 const error = ref('')
 const note = ref('')
 const wanted = String(route.query.tab || '')
-const tab = ref<TabId>((['installed', 'router', 'speed', 'find', 'downloads'] as string[]).includes(wanted) ? (wanted as TabId) : 'installed')
+const tab = ref<TabId>(TAB_IDS.includes(wanted) ? (wanted as TabId) : 'installed')
 const loadFor = ref('')
 const loading = ref('')
 const opts = reactive<{ ctx_size: number | null; gpu_layers: number | null; cpu_moe: string; n_cpu_moe: number | null; retry_gpu: boolean }>({
@@ -423,6 +439,8 @@ const opts = reactive<{ ctx_size: number | null; gpu_layers: number | null; cpu_
 })
 const info = reactive<Record<string, any>>({})
 const askDelete = ref('')
+/** The devices a model can be sent to, from the settings. */
+const phones = ref<string[]>([])
 const query = ref('')
 const searching = ref(false)
 const searched = ref(false)
@@ -456,11 +474,13 @@ let fitTimer: number | undefined
 let fitSeq = 0
 
 const running = computed(() => jobs.value.filter((j) => j.status === 'running').length)
+const live = computed(() => liveDownloads(jobs.value))
 const tabs = computed(() => [
   { id: 'installed' as const, label: 'Installed', n: models.value.length },
   { id: 'router' as const, label: 'Router', n: 0 },
   { id: 'speed' as const, label: 'Speed test', n: 0 },
   { id: 'find' as const, label: 'Find and download', n: 0 },
+  { id: 'connect' as const, label: 'Connect software', n: 0 },
   { id: 'downloads' as const, label: 'Downloads', n: running.value },
 ])
 
@@ -717,6 +737,28 @@ async function toggleInfo(m: HubModel) {
     error.value = String(e?.message || e)
   }
 }
+async function loadPhones() {
+  try {
+    const cfg = await call('config.get', {})
+    phones.value = ((cfg.devices || []) as { name: string }[]).map((d) => d.name)
+  } catch (_) {
+    /* the hub is gone for a moment */
+  }
+}
+/** Sends a model to a device. Its progress shows in the strip at the top, as a download's does. */
+async function sendTo(m: HubModel, select: HTMLSelectElement) {
+  const device = select.value
+  select.value = ''
+  if (!device) return
+  error.value = note.value = ''
+  try {
+    await call('device.send', { model: m.id, device })
+    note.value = `${m.id} is being sent to ${device}. Its progress shows at the top of this page.`
+    await pollJobs()
+  } catch (e: any) {
+    error.value = String(e?.message || e)
+  }
+}
 async function doDelete() {
   const id = askDelete.value
   askDelete.value = ''
@@ -852,8 +894,8 @@ async function pull(a: Record<string, unknown>) {
   busy.value = true
   try {
     const r = await call('model.pull', a)
-    note.value = `Downloading ${r.model}; progress is under Downloads.`
-    tab.value = 'downloads'
+    // the progress shows at the top of every tab, so the page stays where the owner is
+    note.value = `Downloading ${r.model}; its progress is shown above.`
     await pollJobs()
   } catch (e: any) {
     error.value = `Could not start the download: ${e?.message || e}`
@@ -919,17 +961,31 @@ async function cancelJob(id: string) {
   }
   await pollJobs()
 }
+/** Starts a stopped or failed download again; it picks up the part it already has. */
+async function restartJob(id: string) {
+  error.value = ''
+  try {
+    const j = await call('job.restart', { job: id })
+    note.value = `Restarted ${j.model}; its progress is shown above.`
+  } catch (e: any) {
+    error.value = `Could not restart the download: ${e?.message || e}`
+  }
+  await pollJobs()
+}
 
 // a link such as /models?tab=router while this page is open
+watch(tab, (t) => {
+  if (t === 'installed') loadPhones()
+})
 watch(
   () => route.query.tab,
   (t) => {
-    if (typeof t === 'string' && (['installed', 'router', 'speed', 'find', 'downloads'] as string[]).includes(t)) tab.value = t as TabId
+    if (typeof t === 'string' && TAB_IDS.includes(t)) tab.value = t as TabId
   },
 )
 
 onMounted(async () => {
-  await Promise.all([reload(), pollJobs()])
+  await Promise.all([reload(), pollJobs(), loadPhones()])
   doneSeen = new Set(jobs.value.filter((j) => j.status === 'done').map((j) => j.job))
   timer = window.setInterval(tick, 2500)
 })

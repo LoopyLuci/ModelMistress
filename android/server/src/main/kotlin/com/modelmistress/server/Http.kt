@@ -13,7 +13,7 @@ class HttpException(val status: Int, message: String) : Exception(message)
 class HttpRequest(
     val method: String,
     val path: String,
-    private val headers: Map<String, String>,
+    val headers: Map<String, String>,
     val body: ByteArray,
     /** The part of the address after '?', as sent. Empty when there is none. */
     val query: String = "",
@@ -28,7 +28,13 @@ object HttpReader {
     private const val MAX_LINE_BYTES = 1024
     private const val CRLF_CRLF = 0x0D0A0D0A
 
-    fun read(input: InputStream, maxBodyBytes: Int): HttpRequest {
+    fun read(input: InputStream, maxBodyBytes: Int): HttpRequest = withBody(readRequestHead(input), input, maxBodyBytes)
+
+    /**
+     * The request line and headers, read now. The body stays on [input]: a route that takes a body too big to hold
+     * reads it itself (see [withBody]).
+     */
+    fun readRequestHead(input: InputStream): HttpRequest {
         val lines = readHead(input).split("\r\n")
         val requestLine = lines.first().split(' ')
         if (requestLine.size != 3 || !requestLine[2].startsWith("HTTP/1.")) {
@@ -40,10 +46,21 @@ object HttpReader {
             if (colon <= 0) throw HttpException(400, "A header line is malformed.")
             headers[line.substring(0, colon).trim().lowercase(Locale.ROOT)] = line.substring(colon + 1).trim()
         }
-        val body = if (headers["transfer-encoding"]?.lowercase(Locale.ROOT)?.contains("chunked") == true) {
+        return HttpRequest(
+            method = requestLine[0],
+            path = requestLine[1].substringBefore('?'),
+            headers = headers,
+            body = ByteArray(0),
+            query = requestLine[1].substringAfter('?', ""),
+        )
+    }
+
+    /** The request with its body read from [input]: sized by Content-Length, or chunked, and at most [maxBodyBytes]. */
+    fun withBody(head: HttpRequest, input: InputStream, maxBodyBytes: Int): HttpRequest {
+        val body = if (head.header("transfer-encoding")?.lowercase(Locale.ROOT)?.contains("chunked") == true) {
             readChunked(input, maxBodyBytes)
         } else {
-            val declared = headers["content-length"]
+            val declared = head.header("content-length")
             val length = if (declared == null) {
                 0
             } else {
@@ -55,13 +72,7 @@ object HttpReader {
             }
             readExactly(input, length)
         }
-        return HttpRequest(
-            method = requestLine[0],
-            path = requestLine[1].substringBefore('?'),
-            headers = headers,
-            body = body,
-            query = requestLine[1].substringAfter('?', ""),
-        )
+        return HttpRequest(head.method, head.path, head.headers, body, head.query)
     }
 
     private fun readHead(input: InputStream): String {

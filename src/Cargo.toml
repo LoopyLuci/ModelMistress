@@ -52,6 +52,8 @@ rayon = "1.10"
 parking_lot = "0.12"
 nix = { version = "0.29", features = ["signal"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# Discord's gateway is a WebSocket; native-tls, the same TLS backend reqwest uses here.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 async-stream = "0.3"
 num_enum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }

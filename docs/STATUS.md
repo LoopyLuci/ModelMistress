@@ -68,6 +68,11 @@ in `src/tests_upstream.rs`.
   both chatting on the GPU; a cancel at 63 % that resumed and passed the checksum. `model.search` and
   `model.files` find what to pull; `model.delete` removes only what ModelMistress downloaded (an Ollama model's
   blobs only when no other manifest uses them).
+- **Connect, phones and chat bots.** The Connect software tab makes a key per peer, and a snippet for each tool. A model
+  goes from the desktop to a phone with `device.send`, as a job with progress and Stop. A stopped or failed download
+  starts again (`job.restart`). Telegram and Discord bots answer the people allowed to them through the hub's chat route.
+  The Rust side, the frontend and the phone's server code are tested (685 library tests); a model sent to a phone was
+  checked by SHA-256. A live bot is not tried yet (see the CHANGELOG).
 - The catalog: 13 models found across an Ollama store and a Hugging Face cache, with GGUF metadata; the vision
   projector attached to the Unsloth Qwen3.5 model.
 - Loading on first use, explicit loads with options, LRU eviction at `max_loaded`, unload, and unload of all models.

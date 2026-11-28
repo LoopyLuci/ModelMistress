@@ -431,9 +431,13 @@ fn safe_rel(p: &str) -> PathBuf {
 
 pub struct Job {
     pub id: String,
+    /// What the job is: `pull` (a download), `send` (a model sent to a device), `quantize`, and so on.
+    pub kind: String,
     pub model: String,
     pub source: &'static str,
     pub started: u64,
+    /// What a download fetches, so a stopped or failed one can be started again. None for a task.
+    plan: Option<Plan>,
     began: Instant,
     pub done_bytes: AtomicU64,
     pub total_bytes: AtomicU64,
@@ -447,7 +451,7 @@ impl Job {
         let done = self.done_bytes.load(Ordering::Relaxed);
         let total = self.total_bytes.load(Ordering::Relaxed);
         let secs = self.began.elapsed().as_secs_f64().max(0.001);
-        json!({"job": self.id, "model": self.model, "source": self.source, "status": status, "message": message,
+        json!({"job": self.id, "kind": self.kind, "model": self.model, "source": self.source, "status": status, "message": message,
                "result": result, "done_bytes": done, "total_bytes": total,
                "percent": if total > 0 { ((done as f64 / total as f64) * 1000.0).round() / 10.0 } else { 0.0 },
                "mb_per_s": ((done as f64 / 1e6 / secs) * 10.0).round() / 10.0, "started": self.started})
@@ -496,6 +500,23 @@ impl Jobs {
         }
     }
 
+    /// Starts a stopped or failed download again. Its part files stay, so it resumes where it stopped. Only a
+    /// download can be restarted, and only once it is no longer running.
+    pub fn restart(self: &Arc<Self>, engine: Arc<Engine>, id: &str) -> Result<Arc<Job>> {
+        let job = self.get(id).ok_or_else(|| Fail::not_found(format!("no job {id}")))?;
+        let plan = job
+            .plan
+            .clone()
+            .ok_or_else(|| Fail::invalid(format!("{id} is not a download")))?;
+        match job.status().as_str() {
+            "cancelled" | "failed" => Ok(self.start(engine, plan)),
+            "running" => Err(Fail::invalid(format!(
+                "{id} is still running; stop it before restarting"
+            ))),
+            _ => Err(Fail::invalid(format!("{id} has finished; there is nothing to restart"))),
+        }
+    }
+
     /// Registers a job; a running one with the same label is returned instead (as the error).
     fn register(
         self: &Arc<Self>,
@@ -503,6 +524,7 @@ impl Jobs {
         label: String,
         source: &'static str,
         total: u64,
+        plan: Option<Plan>,
     ) -> std::result::Result<Arc<Job>, Arc<Job>> {
         let mut map = self.map.lock();
         if let Some(j) = map.values().find(|j| j.model == label && j.status() == "running") {
@@ -511,12 +533,14 @@ impl Jobs {
         let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let job = Arc::new(Job {
             id: format!("{kind}-{n}"),
+            kind: kind.to_string(),
             model: label,
             source,
             started: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            plan,
             began: Instant::now(),
             done_bytes: AtomicU64::new(0),
             total_bytes: AtomicU64::new(total),
@@ -534,7 +558,7 @@ impl Jobs {
         F: FnOnce(Arc<Job>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
-        let job = match self.register(kind, label, "task", 0) {
+        let job = match self.register(kind, label, "task", 0, None) {
             Ok(j) => j,
             Err(running) => return running,
         };
@@ -551,7 +575,7 @@ impl Jobs {
 
     /// Starts a pull. A pull of the same model that is still running is returned instead of a second one.
     pub fn start(self: &Arc<Self>, engine: Arc<Engine>, plan: Plan) -> Arc<Job> {
-        let job = match self.register("pull", plan.id.clone(), plan.source, plan.total()) {
+        let job = match self.register("pull", plan.id.clone(), plan.source, plan.total(), Some(plan.clone())) {
             Ok(j) => j,
             Err(running) => return running,
         };
@@ -1077,6 +1101,78 @@ mod tests {
         assert_eq!(
             (d["status"].as_str(), d["message"].as_str()),
             (Some("failed"), Some("boom"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_starts_again_and_only_a_stopped_one_can_be_restarted() {
+        let home = crate::testing::TestDir::lazy("mm-pull-restart");
+        let engine = Engine::new(
+            home.clone(),
+            crate::engine::Settings {
+                ollama_url: String::new(),
+                model_dirs: vec![],
+                hf_dirs: vec![],
+                ..Default::default()
+            },
+        );
+        let jobs = Arc::new(Jobs::default());
+        let plan = |url: &str| Plan {
+            source: "huggingface",
+            id: "org/M-GGUF:M-Q4_K_M".into(),
+            files: vec![PlanFile {
+                url: url.into(),
+                dest: home.join("hub/M-Q4_K_M.gguf"),
+                size: 0,
+                sha256: None,
+            }],
+            after: vec![],
+        };
+        // nothing listens on port 9, so the download fails at once
+        let first = jobs.start(engine.clone(), plan("http://127.0.0.1:9/M-Q4_K_M.gguf"));
+        while first.status() == "running" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(first.status(), "failed");
+        let again = jobs
+            .restart(engine.clone(), &first.id)
+            .expect("a failed download restarts");
+        assert_ne!(again.id, first.id, "a restart is a new job");
+        while again.status() == "running" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(again.status(), "failed", "the server is still not there");
+
+        // a download that is still running cannot be restarted: its server accepts the connection and never answers
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hang = jobs.start(
+            engine.clone(),
+            plan(&format!("http://{}/M-Q4_K_M.gguf", silent.local_addr().unwrap())),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(hang.status(), "running");
+        let err = jobs
+            .restart(engine.clone(), &hang.id)
+            .err()
+            .expect("a running download is refused");
+        assert_eq!(err.code, "invalid");
+        assert!(err.message.contains("still running"), "{}", err.message);
+
+        // a task is not a download, and an unknown job is not found
+        let task = jobs.start_task("quantize", "t".into(), |_| async {
+            Err(Fail::new(500, "tool_failed", "boom"))
+        });
+        while task.status() == "running" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let err = jobs
+            .restart(engine.clone(), &task.id)
+            .err()
+            .expect("a task is not restarted");
+        assert!(err.message.contains("not a download"), "{}", err.message);
+        assert_eq!(
+            jobs.restart(engine.clone(), "pull-999").err().map(|f| f.code),
+            Some("not_found")
         );
     }
 }
